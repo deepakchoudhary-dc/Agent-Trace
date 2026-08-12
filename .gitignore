@@ -1,0 +1,90 @@
+# ==========================================
+# STRICT EXCLUSIONS - NO LEAKS
+# ==========================================
+
+# Ignore ALL Markdown files everywhere except README.md
+**/*.md
+*.md
+!README.md
+!**/README.md
+
+# Ignore ALL screenshots & image files
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.webp
+**/*.gif
+**/*.bmp
+**/*.tiff
+**/*.ico
+
+# Ignore ALL environment, secret & credential files
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+*.secret
+*.token
+*credentials*
+*secret*
+
+# Python build, cache & bytecode
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Testing, type checking & lint caches
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+**/venv/
+**/.venv/
+
+# Node & frontend build artifacts
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local SQLite databases & AgentTrace runtime data
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.agenttrace/
+**/.agenttrace/
+keys/
+blobs/
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

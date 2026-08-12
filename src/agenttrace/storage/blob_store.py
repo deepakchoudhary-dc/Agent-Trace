@@ -1,0 +1,121 @@
+"""Content-addressed encrypted blob store for large captures.
+
+Blobs are stored as individual encrypted files addressed by their
+SHA-256 content hash. This handles file snapshots, terminal output
+dumps, and other large payloads that don't belong in the SQLite ledger.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+
+
+class BlobStoreError(Exception):
+    """Raised when blob operations fail."""
+
+
+class BlobStore:
+    """Content-addressed file store with optional encryption.
+
+    Files are stored in a flat directory named by their content hash.
+    Encryption is handled by the caller (EncryptionManager) — this
+    layer handles addressing and deduplication only.
+    """
+
+    def __init__(self, store_dir: str | Path) -> None:
+        self._store_dir = Path(store_dir)
+        self._store_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def compute_hash(data: bytes) -> str:
+        """Compute SHA-256 hash of raw data."""
+        return hashlib.sha256(data).hexdigest()
+
+    def _blob_path(self, content_hash: str) -> Path:
+        """Get the filesystem path for a blob.
+
+        Uses two-level directory sharding to avoid filesystem limits:
+        ab/cdef1234... → store_dir/ab/cdef1234...
+        """
+        prefix = content_hash[:2]
+        shard_dir = self._store_dir / prefix
+        shard_dir.mkdir(exist_ok=True)
+        return shard_dir / content_hash
+
+    def store_blob(self, data: bytes) -> str:
+        """Store a blob, returning its content hash.
+
+        If the blob already exists (same hash), this is a no-op.
+        """
+        content_hash = self.compute_hash(data)
+        blob_path = self._blob_path(content_hash)
+
+        if blob_path.exists():
+            return content_hash
+
+        # Write atomically: temp file then rename
+        tmp_path = blob_path.with_suffix(".tmp")
+        try:
+            tmp_path.write_bytes(data)
+            tmp_path.rename(blob_path)
+        except OSError:
+            # On Windows, rename can fail if target exists (race condition)
+            if blob_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            else:
+                raise
+
+        return content_hash
+
+    def retrieve_blob(self, content_hash: str) -> bytes:
+        """Retrieve a blob by its content hash."""
+        blob_path = self._blob_path(content_hash)
+        if not blob_path.exists():
+            raise BlobStoreError(f"Blob not found: {content_hash}")
+        return blob_path.read_bytes()
+
+    def exists(self, content_hash: str) -> bool:
+        """Check if a blob exists."""
+        return self._blob_path(content_hash).exists()
+
+    def delete_blob(self, content_hash: str) -> bool:
+        """Delete a blob. Returns True if it existed."""
+        blob_path = self._blob_path(content_hash)
+        if blob_path.exists():
+            blob_path.unlink()
+            return True
+        return False
+
+    def list_blobs(self) -> list[str]:
+        """List all blob content hashes in the store."""
+        hashes: list[str] = []
+        for shard_dir in self._store_dir.iterdir():
+            if shard_dir.is_dir() and len(shard_dir.name) == 2:
+                for blob_file in shard_dir.iterdir():
+                    if blob_file.is_file() and not blob_file.suffix:
+                        hashes.append(blob_file.name)
+        return hashes
+
+    def total_size_bytes(self) -> int:
+        """Calculate total size of all stored blobs."""
+        total = 0
+        for shard_dir in self._store_dir.iterdir():
+            if shard_dir.is_dir() and len(shard_dir.name) == 2:
+                for blob_file in shard_dir.iterdir():
+                    if blob_file.is_file() and not blob_file.suffix:
+                        total += blob_file.stat().st_size
+        return total
+
+    def gc_orphans(self, referenced_hashes: set[str]) -> int:
+        """Remove blobs not in the referenced set.
+
+        Returns the number of blobs removed.
+        """
+        removed = 0
+        for content_hash in self.list_blobs():
+            if content_hash not in referenced_hashes:
+                self.delete_blob(content_hash)
+                removed += 1
+        return removed

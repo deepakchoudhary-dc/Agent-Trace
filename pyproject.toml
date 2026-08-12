@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agenttrace"
+version = "0.1.0"
+description = "Local-first causal auditor for AI coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.5,<3",
+    "click>=8.1,<9",
+    "uvicorn>=0.30,<1",
+    "fastapi>=0.111,<1",
+    "watchfiles>=0.22,<1",
+    "psutil>=5.9,<8",
+    "cryptography>=42,<46",
+    "networkx>=3.2,<4",
+    "rich>=13.7,<14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-asyncio>=0.23,<1",
+    "mypy>=1.8,<2",
+    "ruff>=0.4,<1",
+    "httpx>=0.27,<1",
+]
+
+[project.scripts]
+agenttrace = "agenttrace.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agenttrace"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+plugins = ["pydantic.mypy"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "TCH"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
