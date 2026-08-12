@@ -10,6 +10,7 @@ Critical safety invariant: NEVER modifies the user's live workspace.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -171,10 +172,14 @@ class ReplayEngine:
 
     def _run_command(self, command: str, worktree: Path) -> dict[str, Any]:
         """Run a verification command in the simulation worktree."""
+        import shlex
+
         try:
+            # Safe tokenization to prevent shell injection vulnerabilities
+            cmd_args = shlex.split(command, posix=os.name != "nt")
             result = subprocess.run(
-                command,
-                shell=True,
+                cmd_args if cmd_args else command,
+                shell=False if cmd_args else True,
                 cwd=str(worktree),
                 capture_output=True,
                 text=True,
