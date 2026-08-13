@@ -3,6 +3,7 @@ import {
   ContextGraphData,
   GraphNode,
   ConfidenceLevel,
+  SessionInfo,
 } from '../types';
 import {
   Search,
@@ -23,18 +24,24 @@ import {
   Grid,
   Share2,
   EyeOff,
+  Activity,
+  Radio,
 } from 'lucide-react';
 
 interface GraphViewProps {
   graphData: ContextGraphData;
   onInspectNode: (node: GraphNode) => void;
   selectedNode: GraphNode | null;
+  currentSession?: SessionInfo | null;
+  livePolling?: boolean;
 }
 
 export const GraphView: React.FC<GraphViewProps> = ({
   graphData,
   onInspectNode,
   selectedNode,
+  currentSession,
+  livePolling = true,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<string>('all');
@@ -67,7 +74,7 @@ export const GraphView: React.FC<GraphViewProps> = ({
     });
   }, [graphData.nodes, searchQuery, filterType, filterConfidence, hideBaselineFiles]);
 
-  // High-fidelity wrapping tiered grid layout engine (Guarantees zero overlapping)
+  // High-fidelity wrapping tiered grid layout engine (Zero overlapping)
   const nodePositions = useMemo(() => {
     const posMap = new Map<string, { x: number; y: number }>();
     if (filteredNodes.length === 0) return posMap;
@@ -89,7 +96,6 @@ export const GraphView: React.FC<GraphViewProps> = ({
       td.types.forEach((t) => typeToTier.set(t, idx));
     });
 
-    // Group nodes into tiers
     const tierBuckets: GraphNode[][] = tierDefs.map(() => []);
     const unclassified: GraphNode[] = [];
 
@@ -130,7 +136,7 @@ export const GraphView: React.FC<GraphViewProps> = ({
         currentY += rowSpacing;
       }
 
-      currentY += 30; // Extra spacing between distinct tiers
+      currentY += 30; // Extra separation between tiers
     });
 
     if (unclassified.length > 0) {
@@ -147,7 +153,7 @@ export const GraphView: React.FC<GraphViewProps> = ({
       });
     }
 
-    // Apply any manually dragged node positions
+    // Apply custom dragged node positions
     Object.entries(customPositions).forEach(([id, pos]) => {
       posMap.set(id, pos);
     });
@@ -220,7 +226,6 @@ export const GraphView: React.FC<GraphViewProps> = ({
 
   const handleMouseMove = (e: React.MouseEvent) => {
     if (draggedNodeIdRef.current) {
-      // Dragging a specific node
       const currentPos = nodePositions.get(draggedNodeIdRef.current) || { x: 500, y: 300 };
       setCustomPositions((prev) => ({
         ...prev,
@@ -246,13 +251,45 @@ export const GraphView: React.FC<GraphViewProps> = ({
     <div style={{ display: 'grid', gridTemplateColumns: selectedNode ? '1fr 390px' : '1fr', gap: '16px', margin: '0 16px 16px 16px', height: 'calc(100vh - 120px)' }}>
       {/* Main Graph Canvas */}
       <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        {/* Session Info & Stream Status Strip */}
+        <div style={{ padding: '8px 16px', background: '#09090b', borderBottom: '1px solid var(--border-dim)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '11.5px', flexWrap: 'wrap', gap: '10px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ color: 'var(--text-dim)' }}>SESSION:</span>
+              <span className="font-mono" style={{ color: '#ffffff', fontWeight: 600 }}>
+                {currentSession ? currentSession.session_id : 'No session selected'}
+              </span>
+            </div>
+            {currentSession && (
+              <span style={{ color: 'var(--text-muted)' }}>
+                — "{currentSession.task_description}"
+              </span>
+            )}
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span className="badge badge-low" style={{ fontSize: '9px' }}>
+              {graphData.nodes.length} Nodes
+            </span>
+            <span className="badge badge-low" style={{ fontSize: '9px' }}>
+              {graphData.edges.length} Causal Links
+            </span>
+            {currentSession?.status === 'active' && livePolling && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '5px', color: '#ffffff', fontSize: '10.5px' }}>
+                <div className="live-dot" />
+                <span style={{ fontWeight: 600 }}>Live Graph Stream</span>
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* Controls Toolbar */}
-        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border-dim)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
+        <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--border-dim)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: '220px' }}>
-            <Search size={15} color="var(--text-muted)" />
+            <Search size={14} color="var(--text-muted)" />
             <input
               type="text"
-              placeholder="Search graph nodes by label, actor, type, or path..."
+              placeholder="Filter graph nodes by label, actor, or type..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               aria-label="Search graph nodes"
@@ -260,9 +297,9 @@ export const GraphView: React.FC<GraphViewProps> = ({
                 background: 'var(--bg-input)',
                 border: '1px solid var(--border-dim)',
                 borderRadius: '6px',
-                padding: '6px 12px',
+                padding: '5px 10px',
                 color: 'var(--text-main)',
-                fontSize: '12px',
+                fontSize: '11.5px',
                 width: '100%',
                 outline: 'none',
               }}
@@ -275,8 +312,8 @@ export const GraphView: React.FC<GraphViewProps> = ({
               onClick={() => setHideBaselineFiles((prev) => !prev)}
               className="btn btn-secondary"
               style={{
-                padding: '5px 9px',
-                fontSize: '11px',
+                padding: '5px 8px',
+                fontSize: '10.5px',
                 background: hideBaselineFiles ? '#ffffff' : 'var(--bg-input)',
                 color: hideBaselineFiles ? '#000000' : 'var(--text-muted)',
               }}
@@ -292,8 +329,8 @@ export const GraphView: React.FC<GraphViewProps> = ({
                 onClick={() => setViewMode('visual')}
                 className="btn"
                 style={{
-                  padding: '4px 8px',
-                  fontSize: '11px',
+                  padding: '4px 7px',
+                  fontSize: '10.5px',
                   background: viewMode === 'visual' ? '#ffffff' : 'transparent',
                   color: viewMode === 'visual' ? '#000000' : 'var(--text-muted)',
                   fontWeight: 600,
@@ -306,8 +343,8 @@ export const GraphView: React.FC<GraphViewProps> = ({
                 onClick={() => setViewMode('cards')}
                 className="btn"
                 style={{
-                  padding: '4px 8px',
-                  fontSize: '11px',
+                  padding: '4px 7px',
+                  fontSize: '10.5px',
                   background: viewMode === 'cards' ? '#ffffff' : 'transparent',
                   color: viewMode === 'cards' ? '#000000' : 'var(--text-muted)',
                   fontWeight: 600,
@@ -320,7 +357,7 @@ export const GraphView: React.FC<GraphViewProps> = ({
 
             {/* Node Type Filter */}
             <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-              <Filter size={13} color="var(--text-muted)" />
+              <Filter size={12} color="var(--text-muted)" />
               <select
                 value={filterType}
                 onChange={(e) => setFilterType(e.target.value)}
@@ -329,13 +366,13 @@ export const GraphView: React.FC<GraphViewProps> = ({
                   background: 'var(--bg-input)',
                   border: '1px solid var(--border-dim)',
                   borderRadius: '6px',
-                  padding: '5px 8px',
+                  padding: '4px 7px',
                   color: 'var(--text-main)',
-                  fontSize: '11px',
+                  fontSize: '10.5px',
                   outline: 'none',
                 }}
               >
-                <option value="all">All Node Types</option>
+                <option value="all">All Types</option>
                 <option value="task_intent">Task Intent</option>
                 <option value="agent_session">Agent Session</option>
                 <option value="command">Commands</option>
@@ -353,27 +390,27 @@ export const GraphView: React.FC<GraphViewProps> = ({
                 <button
                   onClick={() => setZoom((z) => Math.min(2.5, z + 0.15))}
                   className="btn btn-secondary"
-                  style={{ padding: '4px 7px' }}
+                  style={{ padding: '4px 6px' }}
                   aria-label="Zoom in"
                 >
-                  <ZoomIn size={13} />
+                  <ZoomIn size={12} />
                 </button>
                 <button
                   onClick={() => setZoom((z) => Math.max(0.2, z - 0.15))}
                   className="btn btn-secondary"
-                  style={{ padding: '4px 7px' }}
+                  style={{ padding: '4px 6px' }}
                   aria-label="Zoom out"
                 >
-                  <ZoomOut size={13} />
+                  <ZoomOut size={12} />
                 </button>
                 <button
                   onClick={() => { setZoom(0.85); setPan({ x: 50, y: 30 }); setCustomPositions({}); }}
                   className="btn btn-secondary"
-                  style={{ padding: '4px 7px' }}
+                  style={{ padding: '4px 6px' }}
                   aria-label="Reset layout"
                   title="Reset zoom & center"
                 >
-                  <Maximize2 size={13} />
+                  <Maximize2 size={12} />
                 </button>
               </div>
             )}
@@ -381,7 +418,17 @@ export const GraphView: React.FC<GraphViewProps> = ({
         </div>
 
         {/* Visual Graph Viewport */}
-        {viewMode === 'visual' ? (
+        {filteredNodes.length === 0 ? (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '10px', color: 'var(--text-dim)' }}>
+            <Activity size={36} color="var(--border-dim)" />
+            <h3 className="font-heading" style={{ fontSize: '15px', color: 'var(--text-muted)' }}>
+              No Context Graph Nodes Recorded
+            </h3>
+            <p style={{ fontSize: '12px' }}>
+              Start an audit session via terminal or select a different recorded session.
+            </p>
+          </div>
+        ) : viewMode === 'visual' ? (
           <div
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
@@ -648,7 +695,7 @@ export const GraphView: React.FC<GraphViewProps> = ({
             <span style={{ fontSize: '10px', color: 'var(--text-dim)', textTransform: 'uppercase', fontWeight: 600 }}>
               Canonical Label
             </span>
-            <p style={{ fontSize: '12px', marginTop: '4px', color: 'var(--text-main)', background: 'var(--bg-input)', padding: '8px 12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
+            <p style={{ fontSize: '12px', marginTop: '4px', color: 'var(--text-main)', background: '#09090b', padding: '8px 12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
               {selectedNode.label}
             </p>
           </div>

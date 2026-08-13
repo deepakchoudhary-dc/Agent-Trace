@@ -234,6 +234,8 @@ export const App: React.FC = () => {
             graphData={graphData || { session_id: currentSession?.session_id || '', nodes: [], edges: [] }}
             onInspectNode={handleInspectNode}
             selectedNode={selectedNode}
+            currentSession={currentSession}
+            livePolling={livePolling}
           />
         )}
 
