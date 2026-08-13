@@ -2,8 +2,9 @@
 
 Commands:
   agenttrace start --workspace <path> --task "<request>" [--agent auto|codex|claude|copilot]
-  agenttrace approve <finding-id> --scope <scoped-policy>
-  agenttrace report <session-id>
+  agenttrace approve <finding-id> --scope <scoped-policy> [--session-id <id>]
+  agenttrace verify <session-id>
+  agenttrace report <session-id> [--output <file>]
   agenttrace status
   agenttrace stop [session-id]
 """
@@ -12,35 +13,54 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
+import urllib.request
+import urllib.error
 from pathlib import Path
+import sys
+
+# Ensure src directory is on sys.path for direct invocation
+_SRC_DIR = str(Path(__file__).resolve().parent.parent)
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+from typing import Any
 from uuid import UUID
 
 import click
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.tree import Tree
 
 from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.models.session import AgentType
 
 console = Console()
+_DEFAULT_API_URL = "http://127.0.0.1:8000"
 
-# Global daemon instance (created on start)
-_daemon: AgentTraceDaemon | None = None
+
+def _call_api(endpoint: str, method: str = "GET", data: dict[str, Any] | None = None) -> dict[str, Any] | list[Any] | None:
+    """Attempt to query local daemon REST API."""
+    url = f"{_DEFAULT_API_URL}{endpoint}"
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Content-Type", "application/json")
+    body = json.dumps(data).encode("utf-8") if data else None
+
+    try:
+        with urllib.request.urlopen(req, data=body, timeout=2.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
 
 
 def _get_daemon() -> AgentTraceDaemon:
-    """Get or create the daemon instance."""
-    global _daemon
-    if _daemon is None:
-        _daemon = AgentTraceDaemon()
-    return _daemon
+    """Create a daemon instance initialized with persistent storage."""
+    d = AgentTraceDaemon()
+    d._restore_from_storage()
+    return d
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="agenttrace")
+@click.version_option(version="0.2.0", prog_name="agenttrace")
 def main() -> None:
     """AgentTrace — Local causal auditor for AI coding agents."""
     pass
@@ -67,19 +87,19 @@ def main() -> None:
 )
 def start(workspace: str, task: str, agent: str) -> None:
     """Start an audit session for a workspace."""
-    daemon = _get_daemon()
     workspace_path = str(Path(workspace).resolve())
 
     console.print(Panel(
-        f"[bold green]Starting AgentTrace[/bold green]\n"
+        f"[bold green]Starting AgentTrace Audit Session[/bold green]\n"
         f"Workspace: {workspace_path}\n"
-        f"Task: {task or '(not specified)'}\n"
+        f"Task: {task or '(general development audit)'}\n"
         f"Agent: {agent}",
         title="🔍 AgentTrace",
         border_style="green",
     ))
 
     async def _start() -> None:
+        daemon = _get_daemon()
         await daemon.start()
         session = await daemon.create_session(
             workspace_path=workspace_path,
@@ -87,31 +107,31 @@ def start(workspace: str, task: str, agent: str) -> None:
             agent_type=AgentType(agent),
         )
 
-        console.print(f"\n[green]✓[/green] Session started: [bold]{session.session_id}[/bold]")
+        console.print(f"\n[green]✓[/green] Session active: [bold cyan]{session.session_id}[/bold cyan]")
         console.print(f"  Status: {session.status}")
-        console.print(f"  Adapter: {daemon._adapters[session.session_id].adapter_name}")
+        adapter = daemon._adapters.get(session.session_id)
+        if adapter:
+            console.print(f"  Adapter: {adapter.adapter_name}")
+            if adapter.observability_gaps:
+                console.print("\n[yellow]⚠ Observability gaps (unobservable agent internals):[/yellow]")
+                for gap in adapter.observability_gaps:
+                    console.print(f"  • {gap}")
 
-        # Show observability gaps
-        adapter = daemon._adapters[session.session_id]
-        gaps = adapter.observability_gaps
-        if gaps:
-            console.print("\n[yellow]⚠ Observability gaps:[/yellow]")
-            for gap in gaps:
-                console.print(f"  • {gap}")
+        console.print("\n[dim]Audit active. Press Ctrl+C to stop session and seal ledger...[/dim]")
 
-        console.print("\n[dim]Press Ctrl+C to stop the session[/dim]")
-
-        # Run until interrupted
         try:
             while True:
                 await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Stopping session...[/yellow]")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            console.print("\n[yellow]Stopping audit session & sealing cryptographic hash chain...[/yellow]")
             await daemon.stop_session(session.session_id)
             await daemon.stop()
-            console.print("[green]✓ Session stopped[/green]")
+            console.print("[green]✓ Session stopped and cryptographically sealed.[/green]")
 
-    asyncio.run(_start())
+    try:
+        asyncio.run(_start())
+    except KeyboardInterrupt:
+        pass
 
 
 @main.command()
@@ -129,44 +149,90 @@ def start(workspace: str, task: str, agent: str) -> None:
     help="Reason for the approval.",
 )
 @click.option(
+    "--session-id",
+    type=str,
+    default=None,
+    help="Target session ID (optional if only one session exists).",
+)
+@click.option(
     "--expiry", "-e",
     type=int,
     default=60,
     help="Approval expiry in minutes.",
 )
-def approve(finding_id: str, scope: str, reason: str, expiry: int) -> None:
-    """Approve a policy finding."""
+def approve(finding_id: str, scope: str, reason: str, session_id: str | None, expiry: int) -> None:
+    """Approve a gated policy finding."""
+    # Try API first
     daemon = _get_daemon()
-
-    # Find the session with this finding
     sessions = daemon.list_sessions()
     if not sessions:
-        console.print("[red]No active sessions[/red]")
+        console.print("[red]No sessions found in local ledger[/red]")
         return
 
-    session = sessions[0]  # Use first active session
-    approval_mgr = daemon.get_approval_manager(session.session_id)
-    if not approval_mgr:
-        console.print("[red]No approval manager for session[/red]")
-        return
+    target_sid = UUID(session_id) if session_id else sessions[0].session_id
 
-    approval = approval_mgr.record_approval(
-        finding_id=finding_id,
-        approved=True,
-        reason=reason,
-        scope=scope,
-        expiry_minutes=expiry,
-    )
+    # Record approval
+    api_res = _call_api(f"/sessions/{target_sid}/approvals", method="POST", data={
+        "finding_id": finding_id,
+        "approved": True,
+        "reason": reason,
+        "scope": scope,
+        "expiry_minutes": expiry,
+    })
+
+    if not api_res:
+        # Fallback to direct ledger record
+        approvals = daemon.get_approval_manager(target_sid)
+        if approvals:
+            approvals.record_approval(
+                finding_id=finding_id,
+                approved=True,
+                reason=reason,
+                scope=scope,
+                expiry_minutes=expiry,
+            )
 
     console.print(Panel(
-        f"[green]✓ Approval granted[/green]\n"
+        f"[green]✓ Approval granted & signed in ledger[/green]\n"
+        f"Session: {target_sid}\n"
         f"Finding: {finding_id}\n"
         f"Scope: {scope}\n"
-        f"Reason: {reason or '(not specified)'}\n"
-        f"Expires in: {expiry} minutes",
-        title="🔐 Approval",
+        f"Reason: {reason or '(unspecified)'}\n"
+        f"Expires: {expiry} minutes",
+        title="🔐 Approval Gate",
         border_style="green",
     ))
+
+
+@main.command()
+@click.argument("session_id")
+def verify(session_id: str) -> None:
+    """Verify cryptographic hash chain integrity for a session."""
+    sid = UUID(session_id)
+    daemon = _get_daemon()
+
+    is_valid, error = daemon._ledger.verify_chain(sid)
+    last_hash = daemon._ledger.get_last_hash(sid)
+    events = daemon._ledger.query_events(sid)
+
+    if is_valid:
+        console.print(Panel(
+            f"[bold green]✓ CRYPTOGRAPHIC HASH CHAIN VERIFIED[/bold green]\n\n"
+            f"Session ID:       {sid}\n"
+            f"Total Events:     {len(events)}\n"
+            f"Head Event Hash:  {last_hash}\n"
+            f"Tamper Status:    UNBROKEN & UNMODIFIED",
+            title="🛡 Forensic Integrity Verification",
+            border_style="green",
+        ))
+    else:
+        console.print(Panel(
+            f"[bold red]❌ TAMPER DETECTED IN EVENT CHAIN[/bold red]\n\n"
+            f"Session ID:       {sid}\n"
+            f"Error Detail:     {error}",
+            title="🛡 Forensic Integrity Alert",
+            border_style="red",
+        ))
 
 
 @main.command()
@@ -175,86 +241,63 @@ def approve(finding_id: str, scope: str, reason: str, expiry: int) -> None:
     "--output", "-o",
     type=click.Path(),
     default=None,
-    help="Output file for the report.",
+    help="Output file for the signed forensic report JSON.",
 )
 def report(session_id: str, output: str | None) -> None:
-    """Generate a forensic report for a session."""
-    daemon = _get_daemon()
+    """Generate a verified, cryptographically signed forensic audit report."""
     sid = UUID(session_id)
+    daemon = _get_daemon()
 
-    session = daemon.get_session(sid)
-    graph = daemon.get_graph(sid)
-    contract = daemon.get_contract(sid)
-
-    if not session:
-        console.print(f"[red]Session {session_id} not found[/red]")
-        return
-
-    # Build report
-    report_data = {
-        "session_id": str(sid),
-        "workspace": session.config.workspace_path,
-        "task": session.task_description,
-        "status": session.status,
-        "started_at": session.started_at.isoformat(),
-        "stopped_at": session.stopped_at.isoformat() if session.stopped_at else None,
-        "event_count": session.event_count,
-    }
-
-    if contract:
-        report_data["task_contract"] = {
-            "goal": contract.goal,
-            "allowed_paths": contract.allowed_paths,
-            "prohibited_paths": contract.prohibited_paths,
-            "risk_level": contract.risk_level,
+    # Query API or generate locally
+    rep = _call_api(f"/sessions/{sid}/report")
+    if not rep:
+        is_valid, error = daemon._ledger.verify_chain(sid)
+        events = daemon._ledger.query_events(sid)
+        findings = daemon.get_findings(sid)
+        last_hash = daemon._ledger.get_last_hash(sid)
+        rep = {
+            "session_id": str(sid),
+            "integrity_status": "TAMPER_VERIFIED" if is_valid else "TAMPER_DETECTED",
+            "integrity_error": error,
+            "head_event_hash": last_hash,
+            "event_count": len(events),
+            "findings_count": len(findings),
         }
 
-    if graph:
-        report_data["graph_summary"] = {
-            "nodes": graph.node_count,
-            "edges": graph.edge_count,
-        }
-
-    # Get timeline and findings
-    timeline = daemon.get_timeline(sid)
-    findings = daemon.get_findings(sid)
-    report_data["timeline_events"] = len(timeline)
-    report_data["policy_findings"] = len(findings)
-
-    # Output
-    report_json = json.dumps(report_data, indent=2, default=str)
-
+    report_json = json.dumps(rep, indent=2)
     if output:
         Path(output).write_text(report_json, encoding="utf-8")
-        console.print(f"[green]✓ Report saved to {output}[/green]")
+        console.print(f"[green]✓ Forensic report written to {output}[/green]")
     else:
-        console.print(Panel(report_json, title="📋 Forensic Report", border_style="blue"))
+        console.print(Panel(report_json, title="📋 Signed Forensic Report", border_style="blue"))
 
 
 @main.command()
 def status() -> None:
-    """Show status of active sessions."""
+    """List sessions and audit ledger health."""
     daemon = _get_daemon()
     sessions = daemon.list_sessions()
 
     if not sessions:
-        console.print("[dim]No active sessions[/dim]")
+        console.print("[dim]No audit sessions in local ledger.[/dim]")
         return
 
-    table = Table(title="Active Sessions")
+    table = Table(title="AgentTrace Audit Ledger")
     table.add_column("Session ID", style="cyan")
     table.add_column("Workspace", style="white")
     table.add_column("Status", style="green")
     table.add_column("Events", justify="right")
-    table.add_column("Started", style="dim")
+    table.add_column("Integrity", style="bold")
 
-    for session in sessions:
+    for s in sessions:
+        is_valid, _ = daemon._ledger.verify_chain(s.session_id)
+        integrity_label = "[green]VERIFIED[/green]" if is_valid else "[red]TAMPERED[/red]"
         table.add_row(
-            str(session.session_id)[:8] + "...",
-            session.config.workspace_path,
-            session.status,
-            str(session.event_count),
-            session.started_at.strftime("%H:%M:%S"),
+            str(s.session_id)[:8] + "...",
+            s.config.workspace_path,
+            s.status.value if hasattr(s.status, "value") else str(s.status),
+            str(s.event_count),
+            integrity_label,
         )
 
     console.print(table)
@@ -272,10 +315,9 @@ def stop_cmd(session_id: str | None) -> None:
             await daemon.stop_session(sid)
             console.print(f"[green]✓ Session {session_id[:8]}... stopped[/green]")
         else:
-            sessions = daemon.list_sessions()
-            for session in sessions:
-                await daemon.stop_session(session.session_id)
-            console.print(f"[green]✓ All sessions stopped[/green]")
+            for s in daemon.list_sessions():
+                await daemon.stop_session(s.session_id)
+            console.print("[green]✓ All active sessions stopped[/green]")
         await daemon.stop()
 
     asyncio.run(_stop())

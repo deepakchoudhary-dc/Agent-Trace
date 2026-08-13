@@ -1,5 +1,5 @@
 # ==========================================
-# STRICT EXCLUSIONS - NO LEAKS
+# STRICT EXCLUSIONS - ZERO LEAKS
 # ==========================================
 
 # Ignore ALL Markdown files everywhere except README.md
@@ -8,7 +8,7 @@
 !README.md
 !**/README.md
 
-# Ignore ALL screenshots & image files
+# Ignore ALL screenshots, media & graphic assets
 **/*.png
 **/*.jpg
 **/*.jpeg
@@ -17,8 +17,10 @@
 **/*.bmp
 **/*.tiff
 **/*.ico
+**/*.svg
+!dashboard/src/**/*.svg
 
-# Ignore ALL environment, secret & credential files
+# Ignore ALL environment, secret, key & credential files
 .env
 .env.*
 *.env
@@ -32,27 +34,31 @@
 *.token
 *credentials*
 *secret*
+keys/
+**/keys/
 
-# Python build, cache & bytecode
+# Python build, cache, and bytecode
 __pycache__/
 **/__pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
-dist/
-build/
-.eggs/
 *.egg
+build/
+dist/
+.eggs/
 
-# Testing, type checking & lint caches
+# Testing, coverage, lint, and type checking caches
 .pytest_cache/
 **/.pytest_cache/
-.coverage
-htmlcov/
 .mypy_cache/
 **/.mypy_cache/
 .ruff_cache/
 **/.ruff_cache/
+.coverage
+htmlcov/
+.cache/
+**/.cache/
 
 # Virtual environments
 venv/
@@ -61,16 +67,18 @@ env/
 **/venv/
 **/.venv/
 
-# Node & frontend build artifacts
+# Node & frontend build artifacts and caches
 node_modules/
 **/node_modules/
 dist/
 **/dist/
+.vite/
+**/.vite/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Local SQLite databases & AgentTrace runtime data
+# SQLite databases & runtime storage artifacts
 *.db
 *.db-wal
 *.db-shm
@@ -78,13 +86,20 @@ yarn-error.log*
 *.sqlite3
 .agenttrace/
 **/.agenttrace/
-keys/
 blobs/
+**/blobs/
+*.json
+!package.json
+!dashboard/package.json
+!dashboard/tsconfig*.json
+!tsconfig*.json
 
-# System & IDE files
+# OS and IDE configuration files
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 *.swp
 *.swo
+*.tmp
+*.bak

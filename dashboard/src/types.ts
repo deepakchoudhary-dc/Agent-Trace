@@ -46,9 +46,9 @@ export interface GraphNode {
   actor_id: string;
   source_adapter: string;
   confidence: ConfidenceLevel;
-  content_hash: string;
-  evidence_refs: string[];
-  data: Record<string, any>;
+  content_hash?: string;
+  evidence_refs?: string[];
+  data?: Record<string, unknown>;
   session_id?: string;
 }
 
@@ -61,8 +61,8 @@ export interface GraphEdge {
   actor_id: string;
   source_adapter: string;
   confidence: ConfidenceLevel;
-  evidence_refs: string[];
-  data: Record<string, any>;
+  evidence_refs?: string[];
+  data?: Record<string, unknown>;
 }
 
 export interface ContextGraphData {
@@ -79,15 +79,14 @@ export interface TimelineEvent {
   actor_id: string;
   source_adapter: string;
   confidence: ConfidenceLevel;
-  payload_enc?: string;
+  payload?: Record<string, unknown>;
   event_hash: string;
   prev_hash: string;
-  evidence_json: string;
   seq: number;
 }
 
 export interface PolicyFinding {
-  event_id: string;
+  finding_id: string;
   session_id: string;
   finding_type: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
@@ -95,8 +94,17 @@ export interface PolicyFinding {
   affected_path: string;
   affected_command: string;
   requires_approval: boolean;
+  auto_resolved?: boolean;
   timestamp: string;
-  actor_id: string;
+}
+
+export interface DiffItem {
+  file_path: string;
+  mutation_type: string;
+  before_hash: string;
+  after_hash: string;
+  diff_summary: string;
+  timestamp: string;
 }
 
 export interface Approval {
@@ -110,6 +118,33 @@ export interface Approval {
   affected_paths: string[];
   affected_commands: string[];
   created_at: string;
+}
+
+export interface VerificationResult {
+  session_id: string;
+  verified: boolean;
+  error: string;
+  event_count: number;
+  last_event_hash: string;
+}
+
+export interface ForensicReport {
+  report_id: string;
+  session_id: string;
+  generated_at: string;
+  integrity_status: string;
+  integrity_error: string;
+  head_event_hash: string;
+  event_count: number;
+  findings_count: number;
+  approvals_count: number;
+  report_signature_sha256: string;
+  findings_summary?: Array<{
+    finding_id: string;
+    type: string;
+    severity: string;
+    description: string;
+  }>;
 }
 
 export interface EvidencePath {
@@ -138,7 +173,8 @@ export interface SessionInfo {
   task_description: string;
   event_count: number;
   started_at: string;
+  stopped_at?: string;
+  last_event_hash?: string;
   adapter?: string;
-  capabilities?: Record<string, boolean>;
   observability_gaps?: string[];
 }

@@ -1,149 +1,199 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
-  Repeat,
-  ShieldCheck,
+  GitPullRequest,
+  CheckCircle2,
+  XCircle,
+  AlertCircle,
+  FileCheck,
+  Cpu,
+  RefreshCw,
   Sparkles,
+  ArrowRight,
 } from 'lucide-react';
 
 export const ReviewLoopView: React.FC = () => {
+  const [activeIteration, setActiveIteration] = useState<number>(1);
+
+  // Structural review iteration data
+  const iterations = [
+    {
+      number: 1,
+      timestamp: '2026-08-13T10:14:00Z',
+      verdict: 'FAILED',
+      convergence_score: 0.65,
+      planner_intent: 'Refactor canonical envelope serialization & hash chaining',
+      worker_patch: 'src/agenttrace/models/events.py',
+      reviews: [
+        { role: 'Spec Compliance', status: 'PASSED', comment: 'All typed subclass attributes serialized in canonical JSON' },
+        { role: 'Security & Redaction', status: 'FAILED', comment: 'Secret redaction must run before sealing hash' },
+        { role: 'Convention & Style', status: 'PASSED', comment: 'Strict type annotations and zero lint errors' },
+      ],
+    },
+    {
+      number: 2,
+      timestamp: '2026-08-13T10:18:00Z',
+      verdict: 'PASSED',
+      convergence_score: 1.0,
+      planner_intent: 'Incorporate recursive secret sanitizer before ledger seal',
+      worker_patch: 'src/agenttrace/storage/ledger.py',
+      reviews: [
+        { role: 'Spec Compliance', status: 'PASSED', comment: 'Verified deterministic SHA-256 pre-image matching' },
+        { role: 'Security & Redaction', status: 'PASSED', comment: 'Entropy check & recursive dict sanitizer validated' },
+        { role: 'Convention & Style', status: 'PASSED', comment: 'Standard schema compliance met' },
+      ],
+    },
+  ];
+
+  const current = iterations.find((i) => i.number === activeIteration) || iterations[0];
+
   return (
-    <div className="glass-panel" style={{ margin: '0 16px 16px 16px', padding: '24px', height: 'calc(100vh - 120px)', overflowY: 'auto' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '24px' }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Repeat size={20} color="var(--accent-cyan)" />
-            <h2 className="font-heading" style={{ fontSize: '18px', fontWeight: 700 }}>
-              AgentTrace Self-Improving Review Loop
-            </h2>
-            <span className="badge badge-high">Active Protocol</span>
-          </div>
-          <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-            Multi-agent self-verification cycle based on AGENTS.md, mind.md & review.md standards
-          </p>
-        </div>
-      </div>
-
-      {/* Visual Flow Architecture */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', alignItems: 'center', marginBottom: '32px' }}>
-        {/* Step 1: Task */}
-        <div style={{ background: 'rgba(6, 182, 212, 0.08)', border: '1px solid rgba(6, 182, 212, 0.3)', borderRadius: '12px', padding: '16px', textAlign: 'center' }}>
-          <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: 'var(--accent-cyan)', color: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 8px auto', fontWeight: 700 }}>
-            1
-          </div>
-          <h4 style={{ fontSize: '14px', fontWeight: 600, color: 'var(--accent-cyan)' }}>Task Contract</h4>
-          <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
-            User intent, allowed paths & risk constraints
-          </p>
+    <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: '16px', margin: '0 16px 16px 16px', height: 'calc(100vh - 120px)' }}>
+      {/* Iterations Sidebar */}
+      <div className="glass-panel" style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <RefreshCw size={14} color="#ffffff" />
+          <h2 className="font-heading" style={{ fontSize: '13px', fontWeight: 600 }}>
+            Review Iterations ({iterations.length})
+          </h2>
         </div>
 
-        {/* Step 2: Planner */}
-        <div style={{ background: 'var(--bg-input)', border: '1px solid var(--border-dim)', borderRadius: '12px', padding: '16px', textAlign: 'center' }}>
-          <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: 'rgba(255,255,255,0.1)', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 8px auto', fontWeight: 700 }}>
-            2
-          </div>
-          <h4 style={{ fontSize: '14px', fontWeight: 600 }}>Planner (Ephemeral)</h4>
-          <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
-            Subtask decomposition & acceptance criteria
-          </p>
-        </div>
-
-        {/* Step 3: Worker */}
-        <div style={{ background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.3)', borderRadius: '12px', padding: '16px', textAlign: 'center' }}>
-          <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: '#10b981', color: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 8px auto', fontWeight: 700 }}>
-            3
-          </div>
-          <h4 style={{ fontSize: '14px', fontWeight: 600, color: '#10b981' }}>Worker (Resident)</h4>
-          <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
-            Executes code & incorporates reviewer feedback
-          </p>
-        </div>
-
-        {/* Step 4: Multi Reviewers */}
-        <div style={{ background: 'rgba(168, 85, 247, 0.08)', border: '1px solid rgba(168, 85, 247, 0.3)', borderRadius: '12px', padding: '16px', textAlign: 'center' }}>
-          <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: '#a855f7', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 8px auto', fontWeight: 700 }}>
-            4
-          </div>
-          <h4 style={{ fontSize: '14px', fontWeight: 600, color: '#a855f7' }}>Reviewers 1..N</h4>
-          <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
-            Spec, Anti-Slop, Security & Conventions
-          </p>
-        </div>
-
-        {/* Step 5: Synthesiser */}
-        <div style={{ background: 'var(--bg-input)', border: '1px solid var(--border-dim)', borderRadius: '12px', padding: '16px', textAlign: 'center' }}>
-          <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: 'rgba(255,255,255,0.1)', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 8px auto', fontWeight: 700 }}>
-            5
-          </div>
-          <h4 style={{ fontSize: '14px', fontWeight: 600 }}>Synthesiser</h4>
-          <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
-            Pass / Fail verdict & structured feedback loop
-          </p>
-        </div>
-      </div>
-
-      {/* Convergence & Anti-Slop Checklist */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
-        {/* Anti-Slop 6 Critical Gates */}
-        <div style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '12px', padding: '16px', border: '1px solid var(--border-dim)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
-            <ShieldCheck size={16} color="#10b981" />
-            <h3 className="font-heading" style={{ fontSize: '14px', fontWeight: 600 }}>
-              6 Anti-Slop Verification Gates (review.md)
-            </h3>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            {[
-              { title: 'Plausible but Incorrect Logic', status: 'Passed', desc: 'Syntax strictly satisfies business intent' },
-              { title: 'Over-Engineering', status: 'Passed', desc: 'No enterprise generic abstractions for simple tasks' },
-              { title: 'Convention Blindness', status: 'Passed', desc: 'Adheres to existing repo naming & error patterns' },
-              { title: 'Hallucinated / Deprecated APIs', status: 'Passed', desc: 'Every endpoint & library verified in Python 3.10' },
-              { title: 'Defensive Overreach', status: 'Passed', desc: 'No bare excepts or error swallowing' },
-              { title: 'Cargo-Cult Patterns', status: 'Passed', desc: 'No redundant circuit breakers or sync retry loops' },
-            ].map((gate, i) => (
-              <div key={i} style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', padding: '8px', background: 'var(--bg-input)', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
-                <div>
-                  <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-main)' }}>{gate.title}</div>
-                  <div style={{ fontSize: '11px', color: 'var(--text-dim)' }}>{gate.desc}</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          {iterations.map((iter) => (
+            <div
+              key={iter.number}
+              onClick={() => setActiveIteration(iter.number)}
+              tabIndex={0}
+              role="button"
+              aria-label={`Iteration ${iter.number}`}
+              style={{
+                padding: '10px 12px',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                background: activeIteration === iter.number ? '#18181b' : 'transparent',
+                border: activeIteration === iter.number ? '1px solid #ffffff' : '1px solid var(--border-dim)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+              }}
+            >
+              <div>
+                <div style={{ fontWeight: 600, fontSize: '12px', color: '#ffffff' }}>
+                  Iteration #{iter.number}
                 </div>
-                <span className="badge badge-high" style={{ fontSize: '9px' }}>{gate.status}</span>
+                <div style={{ fontSize: '10px', color: 'var(--text-dim)' }}>
+                  {new Date(iter.timestamp).toLocaleTimeString()}
+                </div>
+              </div>
+              <span className={`badge ${iter.verdict === 'PASSED' ? 'badge-high' : 'badge-low'}`} style={{ fontSize: '9px' }}>
+                {iter.verdict}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Main Review Loop Trace */}
+      <div className="glass-panel" style={{ padding: '18px', display: 'flex', flexDirection: 'column', gap: '16px', overflowY: 'auto' }}>
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid var(--border-dim)', paddingBottom: '12px' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <h2 className="font-heading" style={{ fontSize: '16px', fontWeight: 700 }}>
+                Review Loop Convergence Trace — Iteration #{current.number}
+              </h2>
+              <span className={`badge ${current.verdict === 'PASSED' ? 'badge-high' : 'badge-critical'}`}>
+                {current.verdict}
+              </span>
+            </div>
+            <p style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '2px' }}>
+              Autonomous multi-agent synthesis loop (Planner → Worker → Independent Reviewers → Synthesizer)
+            </p>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Convergence:</span>
+            <span className="badge badge-high" style={{ fontSize: '10px' }}>
+              {(current.convergence_score * 100).toFixed(0)}%
+            </span>
+          </div>
+        </div>
+
+        {/* Roles Flow Chart */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px' }}>
+          {/* Planner */}
+          <div style={{ background: '#09090b', padding: '12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+              <Sparkles size={13} color="#ffffff" />
+              <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase' }}>PLANNER</span>
+            </div>
+            <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+              {current.planner_intent}
+            </p>
+          </div>
+
+          {/* Worker */}
+          <div style={{ background: '#09090b', padding: '12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+              <Cpu size={13} color="#ffffff" />
+              <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase' }}>WORKER</span>
+            </div>
+            <p className="font-mono" style={{ fontSize: '11px', color: '#ffffff' }}>
+              {current.worker_patch}
+            </p>
+          </div>
+
+          {/* Synthesizer */}
+          <div style={{ background: '#09090b', padding: '12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+              <FileCheck size={13} color="#ffffff" />
+              <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase' }}>SYNTHESIZER</span>
+            </div>
+            <p style={{ fontSize: '11px', color: current.verdict === 'PASSED' ? '#ffffff' : 'var(--text-muted)' }}>
+              {current.verdict === 'PASSED' ? 'All criteria satisfied. Approved for merge.' : 'Failed criteria detected. Iteration loop resumed.'}
+            </p>
+          </div>
+        </div>
+
+        {/* Independent Reviewers Section */}
+        <div>
+          <h3 className="font-heading" style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
+            Independent Reviewer Verdicts
+          </h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {current.reviews.map((rev, idx) => (
+              <div
+                key={idx}
+                style={{
+                  background: '#09090b',
+                  border: '1px solid var(--border-dim)',
+                  borderRadius: '6px',
+                  padding: '10px 14px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  {rev.status === 'PASSED' ? (
+                    <CheckCircle2 size={15} color="#ffffff" />
+                  ) : (
+                    <XCircle size={15} color="#71717a" />
+                  )}
+                  <div>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: '#ffffff' }}>
+                      {rev.role}
+                    </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                      {rev.comment}
+                    </div>
+                  </div>
+                </div>
+
+                <span className={`badge ${rev.status === 'PASSED' ? 'badge-high' : 'badge-low'}`}>
+                  {rev.status}
+                </span>
               </div>
             ))}
-          </div>
-        </div>
-
-        {/* Convergence Metrics & gotchas.md logger */}
-        <div style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '12px', padding: '16px', border: '1px solid var(--border-dim)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
-            <Sparkles size={16} color="var(--accent-cyan)" />
-            <h3 className="font-heading" style={{ fontSize: '14px', fontWeight: 600 }}>
-              Self-Improvement & Gotchas Log
-            </h3>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            <div style={{ background: 'var(--bg-input)', padding: '12px', borderRadius: '8px', border: '1px solid var(--border-dim)' }}>
-              <div style={{ fontSize: '11px', color: 'var(--text-dim)', textTransform: 'uppercase', fontWeight: 600 }}>
-                Convergence Metric
-              </div>
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', marginTop: '4px' }}>
-                <span className="font-mono" style={{ fontSize: '24px', fontWeight: 700, color: 'var(--accent-cyan)' }}>
-                  100%
-                </span>
-                <span style={{ fontSize: '12px', color: '#10b981' }}>Converged (Iteration 1)</span>
-              </div>
-            </div>
-
-            <div style={{ background: 'var(--bg-input)', padding: '12px', borderRadius: '8px', border: '1px solid var(--border-dim)' }}>
-              <div style={{ fontSize: '11px', color: 'var(--text-dim)', textTransform: 'uppercase', fontWeight: 600 }}>
-                Living Gotchas Register (gotchas.md)
-              </div>
-              <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                • Python 3.10 StrEnum compatibility: Standardized to (str, Enum) across all canonical models.<br/>
-                • Local storage: WAL mode sqlite3 provides full durability without native C-compiler prerequisites.
-              </p>
-            </div>
           </div>
         </div>
       </div>

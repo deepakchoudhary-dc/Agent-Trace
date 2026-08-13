@@ -2,7 +2,7 @@
 
 Every event in the system flows through these models. Each event is:
 - Immutable once stored
-- Hash-chained to its predecessor
+- Cryptographically hash-chained to its predecessor across ALL typed fields
 - Classified by confidence level
 - Tagged with source adapter provenance
 """
@@ -51,10 +51,11 @@ class EventType(str, Enum):
 class EventBase(BaseModel):
     """Base for all events in the hash-chained ledger.
 
-    Every event carries provenance metadata so we always know
-    what observed it, when, and with what confidence.
+    Every event carries provenance metadata and complete typed attributes.
+    The cryptographic hash commits to ALL typed subclass fields deterministically.
     """
 
+    version: str = "1.0"
     event_id: UUID = Field(default_factory=uuid4)
     event_type: EventType
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -65,29 +66,34 @@ class EventBase(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     prev_hash: str = ""
     event_hash: str = ""
+    seq: int = 0
     payload: dict[str, Any] = Field(default_factory=dict)
 
-    def compute_hash(self) -> str:
-        """Compute SHA-256 hash over the event's canonical content."""
-        canonical = json.dumps(
-            {
-                "event_id": str(self.event_id),
-                "event_type": self.event_type,
-                "timestamp": self.timestamp.isoformat(),
-                "actor_id": self.actor_id,
-                "session_id": str(self.session_id),
-                "source_adapter": self.source_adapter,
-                "prev_hash": self.prev_hash,
-                "payload": self.payload,
-            },
+    def canonical_dict(self) -> dict[str, Any]:
+        """Produce the canonical, deterministic dictionary for hashing and storage."""
+        data = self.model_dump(mode="json")
+        # Exclude event_hash itself from the preimage to avoid recursion
+        data.pop("event_hash", None)
+        return data
+
+    def canonical_bytes(self) -> bytes:
+        """Produce deterministic canonical UTF-8 bytes."""
+        canonical_str = json.dumps(
+            self.canonical_dict(),
             sort_keys=True,
             separators=(",", ":"),
+            ensure_ascii=False,
         )
-        return hashlib.sha256(canonical.encode()).hexdigest()
+        return canonical_str.encode("utf-8")
 
-    def seal(self, prev_hash: str = "") -> None:
-        """Set the hash chain link and compute this event's hash."""
+    def compute_hash(self) -> str:
+        """Compute SHA-256 hash over the event's complete canonical envelope."""
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def seal(self, prev_hash: str = "", seq: int = 0) -> None:
+        """Set the hash chain link, sequence number, and compute this event's hash."""
         self.prev_hash = prev_hash
+        self.seq = seq
         self.event_hash = self.compute_hash()
 
 
@@ -255,3 +261,34 @@ class ContextBoundaryEvent(EventBase):
     context_window_tokens: int = 0
     system_prompt_hash: str = ""
     external_sources: list[str] = Field(default_factory=list)
+
+
+_EVENT_TYPE_MAP: dict[EventType, type[EventBase]] = {
+    EventType.INVOCATION: InvocationEvent,
+    EventType.TOOL_REQUEST: ToolRequestEvent,
+    EventType.TOOL_RESULT: ToolResultEvent,
+    EventType.APPROVAL: ApprovalEvent,
+    EventType.FILE_MUTATION: FileMutationEvent,
+    EventType.PROCESS: ProcessEvent,
+    EventType.COMMAND: CommandEvent,
+    EventType.NETWORK: NetworkEvent,
+    EventType.GIT: GitEvent,
+    EventType.TEST_RESULT: TestResultEvent,
+    EventType.BUILD_RESULT: BuildResultEvent,
+    EventType.POLICY_FINDING: PolicyFindingEvent,
+    EventType.INCIDENT: IncidentEvent,
+    EventType.CONTEXT_BOUNDARY: ContextBoundaryEvent,
+    EventType.SESSION_START: EventBase,
+    EventType.SESSION_END: EventBase,
+}
+
+
+def event_from_dict(data: dict[str, Any]) -> EventBase:
+    """Deserialize a canonical event dictionary into its concrete Event model subclass."""
+    event_type_str = data.get("event_type", "")
+    try:
+        event_type = EventType(event_type_str)
+        model_cls = _EVENT_TYPE_MAP.get(event_type, EventBase)
+        return model_cls.model_validate(data)
+    except Exception:
+        return EventBase.model_validate(data)

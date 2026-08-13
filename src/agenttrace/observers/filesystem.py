@@ -1,12 +1,13 @@
 """Filesystem observer using watchfiles (Rust-backed, cross-platform).
 
 Watches the workspace for file creates, modifications, and deletions.
-Computes content hashes before/after for diff tracking.
+Computes content hashes before/after and captures unified diffs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import logging
 from fnmatch import fnmatch
@@ -32,7 +33,7 @@ class FilesystemObserver(BaseObserver):
     """Watches workspace files for mutations.
 
     Uses watchfiles (Rust-backed) for efficient cross-platform file
-    watching. Filters out ignored patterns (e.g., .git, node_modules).
+    watching. Builds an initial cache before monitoring starts.
     """
 
     def __init__(
@@ -53,11 +54,16 @@ class FilesystemObserver(BaseObserver):
         ]
         # Cache of file content hashes for before/after comparison
         self._hash_cache: dict[str, str] = {}
+        # In-memory text cache for bounded diff generation
+        self._content_cache: dict[str, str] = {}
 
     def _should_ignore(self, path: str) -> bool:
         """Check if a file path matches any ignore pattern."""
-        rel_path = str(Path(path).relative_to(self.workspace_path))
-        return any(fnmatch(rel_path, pat) for pat in self._ignore_patterns)
+        try:
+            rel_path = str(Path(path).relative_to(self.workspace_path)).replace("\\", "/")
+            return any(fnmatch(rel_path, pat) or fnmatch(Path(path).name, pat) for pat in self._ignore_patterns)
+        except Exception:
+            return False
 
     @staticmethod
     def _compute_file_hash(path: str) -> str:
@@ -68,14 +74,45 @@ class FilesystemObserver(BaseObserver):
         except (OSError, PermissionError):
             return ""
 
+    def _read_file_text(self, path: str) -> str:
+        """Safely read text file for diff generation (max 100KB)."""
+        try:
+            p = Path(path)
+            if p.is_file() and p.stat().st_size < 100_000:
+                return p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        return ""
+
+    async def build_initial_cache(self) -> None:
+        """Build initial hash cache by scanning the workspace."""
+        workspace = Path(self.workspace_path)
+        count = 0
+        try:
+            for file_path in workspace.rglob("*"):
+                if file_path.is_file():
+                    path_str = str(file_path)
+                    if not self._should_ignore(path_str):
+                        file_hash = self._compute_file_hash(path_str)
+                        if file_hash:
+                            self._hash_cache[path_str] = file_hash
+                            self._content_cache[path_str] = self._read_file_text(path_str)
+                            count += 1
+        except Exception as e:
+            logger.warning("Error building initial filesystem cache: %s", e)
+        logger.info("Initial filesystem cache built: %d files hashed", count)
+
     async def _run(self) -> None:
         """Watch the workspace for file changes."""
         logger.info("Watching filesystem: %s", self.workspace_path)
 
+        # Build initial cache first so the very first edit has a valid before_hash
+        await self.build_initial_cache()
+
         try:
             async for changes in awatch(
                 self.workspace_path,
-                stop_event=asyncio.Event(),  # We control via self._running
+                stop_event=asyncio.Event(),
             ):
                 if not self._running:
                     break
@@ -86,16 +123,34 @@ class FilesystemObserver(BaseObserver):
 
                     mutation_type = _CHANGE_MAP.get(change_type, "modify")
                     before_hash = self._hash_cache.get(path_str, "")
+                    before_content = self._content_cache.get(path_str, "")
                     after_hash = ""
+                    after_content = ""
+                    diff_summary = ""
 
                     if mutation_type != "delete":
                         after_hash = self._compute_file_hash(path_str)
+                        after_content = self._read_file_text(path_str)
                         self._hash_cache[path_str] = after_hash
+                        self._content_cache[path_str] = after_content
+
+                        if before_content and after_content:
+                            diff_lines = list(
+                                difflib.unified_diff(
+                                    before_content.splitlines(),
+                                    after_content.splitlines(),
+                                    fromfile="before",
+                                    tofile="after",
+                                    lineterm="",
+                                )
+                            )
+                            diff_summary = "\n".join(diff_lines[:30])
                     else:
                         self._hash_cache.pop(path_str, None)
+                        self._content_cache.pop(path_str, None)
 
                     # Skip if file content didn't actually change
-                    if mutation_type == "modify" and before_hash == after_hash:
+                    if mutation_type == "modify" and before_hash and before_hash == after_hash:
                         continue
 
                     event = FileMutationEvent(
@@ -107,6 +162,7 @@ class FilesystemObserver(BaseObserver):
                         mutation_type=mutation_type,
                         before_hash=before_hash,
                         after_hash=after_hash,
+                        diff_summary=diff_summary,
                     )
                     await self.emit(event)
 
@@ -118,15 +174,3 @@ class FilesystemObserver(BaseObserver):
     def snapshot_hashes(self) -> dict[str, str]:
         """Return current file hash cache for baseline generation."""
         return dict(self._hash_cache)
-
-    async def build_initial_cache(self) -> None:
-        """Build initial hash cache by scanning the workspace."""
-        workspace = Path(self.workspace_path)
-        for file_path in workspace.rglob("*"):
-            if file_path.is_file():
-                path_str = str(file_path)
-                if not self._should_ignore(path_str):
-                    file_hash = self._compute_file_hash(path_str)
-                    if file_hash:
-                        self._hash_cache[path_str] = file_hash
-        logger.info("Initial cache built: %d files", len(self._hash_cache))

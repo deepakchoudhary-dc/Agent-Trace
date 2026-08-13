@@ -228,6 +228,17 @@ class PolicyEngine:
                         rule, f"Write outside scope: {event.file_path}", event.file_path,
                     ))
 
+        # Credential access detection on sensitive files
+        sensitive_patterns = [".env*", "*secret*", "*credential*", "*.pem", "*.key"]
+        from fnmatch import fnmatch
+        if any(fnmatch(file_name.lower(), pat) for pat in sensitive_patterns):
+            rule = self._rules.get("credential_access")
+            if rule and rule.enabled:
+                result.triggered_rules.append(rule)
+                result.findings.append(self._make_finding(
+                    rule, f"Credential file access or mutation: {event.file_path}", event.file_path,
+                ))
+
     def _check_command_policies(
         self, event: CommandEvent, result: PolicyEvaluation
     ) -> None:
@@ -254,6 +265,17 @@ class PolicyEngine:
                 result.findings.append(self._make_finding(
                     rule, f"Piped script execution: {event.command}", "",
                     command=event.command,
+                ))
+
+        # Credential keyword or token in command line
+        cred_keywords = ["passwd", "password", "api_key", "secret_key", "bearer ", "token "]
+        if any(k in cmd for k in cred_keywords):
+            rule = self._rules.get("credential_access")
+            if rule and rule.enabled:
+                result.triggered_rules.append(rule)
+                result.findings.append(self._make_finding(
+                    rule, f"Credential exposure in command line arguments", "",
+                    command=event.command[:80],
                 ))
 
     def _check_network_policies(

@@ -68,18 +68,27 @@ class TestSecretRedactor:
         assert redactor.contains_secrets(f"api_key = '{test_key}'")
         assert not redactor.contains_secrets("Hello world")
 
-    def test_redact_dict(self) -> None:
+    def test_recursive_nested_structures(self) -> None:
+        """Verify deeply nested dictionaries inside lists and tuples are sanitized."""
         redactor = SecretRedactor()
-        data = {
-            "command": "curl -H 'Authorization: Bearer eyJhbG123456789abcdefghijklmn'",
-            "output": "Success",
-            "nested": {
-                "secret": "password = hunter2",
+        complex_data = {
+            "root_key": "normal",
+            "sensitive_token": "raw_token_value_9999",
+            "items": [
+                {"description": "clean", "password": "nested_password_123"},
+                ["inner_list", "Authorization: Bearer " + "tok_1234567890"],
+            ],
+            "nested_obj": {
+                "auth": "secret_auth_header",
             },
         }
-        result = redactor.redact_dict(data)
-        assert "[REDACTED]" in result["command"]  # type: ignore[operator]
-        assert result["output"] == "Success"
+
+        sanitized = redactor.redact_any(complex_data)
+        assert sanitized["sensitive_token"] == "[REDACTED]"
+        assert sanitized["items"][0]["password"] == "[REDACTED]"
+        assert "[REDACTED]" in sanitized["items"][1][1]
+        assert sanitized["nested_obj"]["auth"] == "[REDACTED]"
+        assert sanitized["root_key"] == "normal"
 
     def test_redaction_audit_log(self) -> None:
         redactor = SecretRedactor()
@@ -87,14 +96,10 @@ class TestSecretRedactor:
         redactor.redact(f"token: {sample_tok}")
         log = redactor.redaction_log
         assert len(log) >= 1
-        # Verify the log doesn't contain the secret
         for record in log:
             assert "TESTAUDITTOKEN" not in record.context_preview
 
     def test_shannon_entropy(self) -> None:
-        """High-entropy strings should be flagged."""
         redactor = SecretRedactor()
-        # Low entropy
         assert redactor._shannon_entropy("aaaaaaaaaa") < 1.0
-        # High entropy (random-looking)
         assert redactor._shannon_entropy("aB3$cD5!eF7@gH9#") > 3.0

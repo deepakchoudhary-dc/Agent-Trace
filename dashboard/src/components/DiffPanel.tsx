@@ -1,189 +1,235 @@
-import React, { useState } from 'react';
-import { BlastRadiusResult } from '../types';
-import { FileCode, AlertOctagon } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { api } from '../api/client';
+import { DiffItem, BlastRadiusResult } from '../types';
+import {
+  FileDiff,
+  FilePlus,
+  FileMinus,
+  FileEdit,
+  Flame,
+  Shield,
+  Layers,
+} from 'lucide-react';
 
 interface DiffPanelProps {
+  sessionId?: string;
   blastRadius?: BlastRadiusResult | null;
 }
 
-export const DiffPanel: React.FC<DiffPanelProps> = ({ blastRadius }) => {
-  const [selectedFile, setSelectedFile] = useState('src/auth/jwt.ts');
+export const DiffPanel: React.FC<DiffPanelProps> = ({ sessionId, blastRadius }) => {
+  const [diffs, setDiffs] = useState<DiffItem[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
 
-  const sampleDiffs: Record<string, { before: string[]; after: string[] }> = {
-    'src/auth/jwt.ts': {
-      before: [
-        'import jwt from "jsonwebtoken";',
-        '',
-        'export function verifyToken(token: string): boolean {',
-        '  try {',
-        '    const decoded = jwt.verify(token, process.env.JWT_SECRET!);',
-        '    return Boolean(decoded);',
-        '  } catch {',
-        '    return false;',
-        '  }',
-        '}',
-      ],
-      after: [
-        'import jwt from "jsonwebtoken";',
-        'import { auditLog } from "../utils/audit";',
-        '',
-        'export function verifyToken(token: string): boolean {',
-        '  try {',
-        '    const decoded = jwt.verify(token, process.env.JWT_SECRET!, {',
-        '      algorithms: ["HS256", "RS256"],',
-        '      maxAge: "2h"',
-        '    });',
-        '    auditLog("token_verified", { subject: (decoded as any).sub });',
-        '    return true;',
-        '  } catch (err: any) {',
-        '    auditLog("token_verification_failed", { error: err.message });',
-        '    return false;',
-        '  }',
-        '}',
-      ],
-    },
-    'package.json': {
-      before: [
-        '  "dependencies": {',
-        '    "fastapi": "^0.111.0",',
-        '    "pydantic": "^2.10.0"',
-        '  }',
-      ],
-      after: [
-        '  "dependencies": {',
-        '    "fastapi": "^0.111.0",',
-        '    "jsonwebtoken": "^9.0.2",',
-        '    "pydantic": "^2.10.0"',
-        '  }',
-      ],
-    },
+  useEffect(() => {
+    if (sessionId) {
+      loadDiffs(sessionId);
+    }
+  }, [sessionId]);
+
+  const loadDiffs = async (sid: string) => {
+    setLoading(true);
+    try {
+      const data = await api.getSessionDiffs(sid);
+      setDiffs(data);
+      if (data.length > 0) {
+        setSelectedFile(data[0].path);
+      }
+    } catch {
+      setDiffs([]);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const currentDiff = sampleDiffs[selectedFile] || sampleDiffs['src/auth/jwt.ts'];
+  const activeDiff = diffs.find((d) => d.path === selectedFile) || diffs[0];
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'added':
+        return <FilePlus size={14} color="#ffffff" />;
+      case 'deleted':
+        return <FileMinus size={14} color="#a1a1aa" />;
+      default:
+        return <FileEdit size={14} color="#ffffff" />;
+    }
+  };
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '320px 1fr', gap: '16px', margin: '0 16px 16px 16px', height: 'calc(100vh - 120px)' }}>
-      {/* File List & Blast Radius Overview */}
-      <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', padding: '16px', gap: '16px', overflowY: 'auto' }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
-            <FileCode size={16} color="var(--accent-cyan)" />
-            <h2 className="font-heading" style={{ fontSize: '15px', fontWeight: 600 }}>
-              Mutated Workspace Files
-            </h2>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            {Object.keys(sampleDiffs).map((filePath) => (
-              <button
-                key={filePath}
-                onClick={() => setSelectedFile(filePath)}
-                style={{
-                  padding: '8px 12px',
-                  borderRadius: '6px',
-                  border: selectedFile === filePath ? '1px solid var(--accent-cyan)' : '1px solid var(--border-dim)',
-                  background: selectedFile === filePath ? 'rgba(6, 182, 212, 0.1)' : 'var(--bg-input)',
-                  color: selectedFile === filePath ? 'var(--accent-cyan)' : 'var(--text-main)',
-                  textAlign: 'left',
-                  fontSize: '12px',
-                  fontFamily: 'var(--font-mono)',
-                  cursor: 'pointer',
-                }}
-              >
-                {filePath}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Blast Radius Section */}
-        <div style={{ borderTop: '1px solid var(--border-dim)', paddingTop: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      {/* File List & Blast Radius Sidebar */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', height: '100%', overflow: 'hidden' }}>
+        {/* Changed Files List */}
+        <div className="glass-panel" style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '14px', gap: '10px', overflow: 'hidden' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <AlertOctagon size={16} color="#f59e0b" />
-              <h3 className="font-heading" style={{ fontSize: '14px', fontWeight: 600 }}>
-                Blast Radius
-              </h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <FileDiff size={15} color="#ffffff" />
+              <h2 className="font-heading" style={{ fontSize: '13px', fontWeight: 600 }}>
+                Mutated Files ({diffs.length})
+              </h2>
             </div>
-            <span className="badge badge-medium">
-              Risk: {((blastRadius?.risk_score || 0.72) * 100).toFixed(0)}%
-            </span>
+            {loading && <span className="badge badge-low">Syncing...</span>}
           </div>
 
-          <div style={{ background: 'rgba(0,0,0,0.3)', padding: '12px', borderRadius: '8px', border: '1px solid var(--border-dim)', fontSize: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <div>
-              <span style={{ fontSize: '10px', color: 'var(--text-dim)', textTransform: 'uppercase', fontWeight: 600 }}>
-                Downstream Impacted Files ({blastRadius?.affected_files.length || 3})
-              </span>
-              <ul style={{ listStyle: 'none', marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                {(blastRadius?.affected_files || ['src/auth/jwt.ts', 'src/server.ts', 'src/routes/login.ts']).map((f) => (
-                  <li key={f} className="font-mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                    • {f}
-                  </li>
-                ))}
-              </ul>
-            </div>
-
-            <div>
-              <span style={{ fontSize: '10px', color: 'var(--text-dim)', textTransform: 'uppercase', fontWeight: 600 }}>
-                Test Regressions ({blastRadius?.failed_tests.length || 2})
-              </span>
-              <ul style={{ listStyle: 'none', marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                {(blastRadius?.failed_tests || ['test_auth_header_validation', 'test_jwt_expiration']).map((t) => (
-                  <li key={t} style={{ fontSize: '11px', color: '#f43f5e' }}>
-                    ✕ {t}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Side-by-Side Diff Display */}
-      <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-dim)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <span className="font-mono" style={{ fontSize: '13px', fontWeight: 600, color: 'var(--accent-cyan)' }}>
-            Diff: {selectedFile}
-          </span>
-          <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
-            Before (Recorded Baseline) ⟷ After (Agent Mutation)
-          </span>
-        </div>
-
-        <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', overflow: 'hidden' }}>
-          {/* Before */}
-          <div style={{ padding: '12px', overflowY: 'auto', borderRight: '1px solid var(--border-dim)', background: 'rgba(0,0,0,0.2)' }}>
-            <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginBottom: '8px', fontWeight: 600 }}>BEFORE</div>
-            <pre className="font-mono" style={{ fontSize: '12px', lineHeight: 1.6, color: '#94a3b8' }}>
-              {currentDiff.before.map((line, idx) => (
-                <div key={idx} style={{ padding: '0 4px' }}>
-                  <span style={{ color: 'var(--text-dim)', marginRight: '12px', userSelect: 'none' }}>{idx + 1}</span>
-                  {line}
-                </div>
-              ))}
-            </pre>
-          </div>
-
-          {/* After */}
-          <div style={{ padding: '12px', overflowY: 'auto', background: 'rgba(6, 182, 212, 0.02)' }}>
-            <div style={{ fontSize: '11px', color: '#10b981', marginBottom: '8px', fontWeight: 600 }}>AFTER</div>
-            <pre className="font-mono" style={{ fontSize: '12px', lineHeight: 1.6, color: 'var(--text-main)' }}>
-              {currentDiff.after.map((line, idx) => (
+          <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            {diffs.length === 0 ? (
+              <div style={{ padding: '24px 8px', textAlign: 'center', color: 'var(--text-dim)', fontSize: '11.5px' }}>
+                No file mutations recorded yet.
+              </div>
+            ) : (
+              diffs.map((diff) => (
                 <div
-                  key={idx}
+                  key={diff.path}
+                  onClick={() => setSelectedFile(diff.path)}
+                  tabIndex={0}
+                  role="button"
+                  aria-label={`Diff for file: ${diff.path}`}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      setSelectedFile(diff.path);
+                    }
+                  }}
                   style={{
-                    padding: '0 4px',
-                    background: line.includes('auditLog') || line.includes('algorithms') ? 'rgba(16, 185, 129, 0.15)' : 'transparent',
-                    borderLeft: line.includes('auditLog') || line.includes('algorithms') ? '2px solid #10b981' : 'none',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '8px 10px',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    background: selectedFile === diff.path ? '#18181b' : 'transparent',
+                    border: selectedFile === diff.path ? '1px solid #ffffff' : '1px solid transparent',
                   }}
                 >
-                  <span style={{ color: 'var(--text-dim)', marginRight: '12px', userSelect: 'none' }}>{idx + 1}</span>
-                  {line}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', overflow: 'hidden' }}>
+                    {getStatusIcon(diff.status)}
+                    <span className="font-mono" style={{ fontSize: '11.5px', color: '#ffffff', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                      {diff.path}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '10px', color: '#ffffff', fontFamily: 'var(--font-mono)' }}>
+                      +{diff.additions}
+                    </span>
+                    <span style={{ fontSize: '10px', color: '#71717a', fontFamily: 'var(--font-mono)' }}>
+                      -{diff.deletions}
+                    </span>
+                  </div>
                 </div>
-              ))}
-            </pre>
+              ))
+            )}
           </div>
         </div>
+
+        {/* Blast Radius Assessment */}
+        {blastRadius && (
+          <div className="glass-panel" style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Flame size={14} color="#ffffff" />
+                <h3 className="font-heading" style={{ fontSize: '12px', fontWeight: 600 }}>
+                  Blast Radius
+                </h3>
+              </div>
+              <span className="badge badge-high" style={{ fontSize: '9px' }}>
+                {blastRadius.affected_nodes.length} Nodes
+              </span>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', fontSize: '11px', marginTop: '2px' }}>
+              <div style={{ background: '#09090b', padding: '6px 8px', borderRadius: '4px', border: '1px solid var(--border-dim)' }}>
+                <div style={{ color: 'var(--text-dim)', fontSize: '9.5px' }}>IMPACT TIER</div>
+                <div style={{ fontWeight: 600, color: '#ffffff' }}>
+                  {blastRadius.impact_score > 0.6 ? 'HIGH' : 'ISOLATED'}
+                </div>
+              </div>
+
+              <div style={{ background: '#09090b', padding: '6px 8px', borderRadius: '4px', border: '1px solid var(--border-dim)' }}>
+                <div style={{ color: 'var(--text-dim)', fontSize: '9.5px' }}>CRITICAL PATHS</div>
+                <div style={{ fontWeight: 600, color: '#ffffff' }}>
+                  {blastRadius.critical_paths.length}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Unified Diff Viewer */}
+      <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        {activeDiff ? (
+          <>
+            {/* Diff Header */}
+            <div style={{ padding: '10px 18px', borderBottom: '1px solid var(--border-dim)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <span className="font-mono" style={{ fontSize: '12px', fontWeight: 600, color: '#ffffff' }}>
+                  {activeDiff.path}
+                </span>
+                <span className="badge badge-medium">
+                  {activeDiff.status.toUpperCase()}
+                </span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '11px' }}>
+                <span style={{ color: '#ffffff', fontFamily: 'var(--font-mono)' }}>+{activeDiff.additions} additions</span>
+                <span style={{ color: '#71717a', fontFamily: 'var(--font-mono)' }}>-{activeDiff.deletions} deletions</span>
+              </div>
+            </div>
+
+            {/* Diff Body */}
+            <div style={{ flex: 1, overflowY: 'auto', padding: '16px', background: '#050505', fontFamily: 'var(--font-mono)', fontSize: '11.5px', lineHeight: 1.6 }}>
+              {activeDiff.diff ? (
+                activeDiff.diff.split('\n').map((line, idx) => {
+                  const isAdd = line.startsWith('+') && !line.startsWith('+++');
+                  const isDel = line.startsWith('-') && !line.startsWith('---');
+                  const isHunk = line.startsWith('@@');
+
+                  let bg = 'transparent';
+                  let color = '#d4d4d8';
+                  if (isAdd) {
+                    bg = 'rgba(255, 255, 255, 0.08)';
+                    color = '#ffffff';
+                  } else if (isDel) {
+                    bg = 'rgba(255, 255, 255, 0.02)';
+                    color = '#71717a';
+                  } else if (isHunk) {
+                    color = '#a1a1aa';
+                  }
+
+                  return (
+                    <div
+                      key={idx}
+                      style={{
+                        background: bg,
+                        color,
+                        padding: '1px 8px',
+                        display: 'flex',
+                        gap: '12px',
+                        borderRadius: '2px',
+                      }}
+                    >
+                      <span style={{ color: 'var(--text-dim)', userSelect: 'none', width: '32px', textAlign: 'right' }}>
+                        {idx + 1}
+                      </span>
+                      <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                        {line}
+                      </span>
+                    </div>
+                  );
+                })
+              ) : (
+                <div style={{ color: 'var(--text-dim)', textAlign: 'center', padding: '40px' }}>
+                  No structural diff content available for this mutation.
+                </div>
+              )}
+            </div>
+          </>
+        ) : (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', color: 'var(--text-dim)', gap: '10px' }}>
+            <FileDiff size={32} color="var(--border-dim)" />
+            <h3 className="font-heading" style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
+              No Diff Selected
+            </h3>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -1,8 +1,8 @@
 """Secret redaction engine.
 
 Detects and redacts secrets (API keys, tokens, passwords, private keys,
-connection strings) before any data reaches persistent storage. Maintains
-an audit log of what was redacted (without the secret itself).
+connection strings, high-entropy credentials) before any data reaches
+persistent storage. Maintains an audit log of what was redacted (without the secret itself).
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,19 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("env_secret", re.compile(r"(?:SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL)[_A-Z]*\s*=\s*['\"]?([A-Za-z0-9\-_.+/=]{16,200})['\"]?", re.IGNORECASE)),
 ]
 
+# Sensitive key substrings in JSON / dictionaries
+_SENSITIVE_KEY_SUBSTRINGS = (
+    "password",
+    "secret",
+    "apikey",
+    "api_key",
+    "token",
+    "credential",
+    "auth",
+    "private_key",
+    "passwd",
+)
+
 
 @dataclass
 class RedactionRecord:
@@ -63,8 +77,8 @@ class RedactionRecord:
 class SecretRedactor:
     """Detects and redacts secrets before storage.
 
-    Uses both regex pattern matching and entropy analysis. Maintains
-    an audit log of what was redacted for incident review.
+    Uses regex pattern matching, sensitive dictionary key inspection,
+    and Shannon entropy analysis.
     """
 
     def __init__(self, entropy_threshold: float = 4.5) -> None:
@@ -77,17 +91,13 @@ class SecretRedactor:
         return list(self._redaction_log)
 
     def redact(self, text: str) -> str:
-        """Redact all detected secrets from text.
-
-        Returns the redacted text. Logs each redaction.
-        """
-        if not text:
+        """Redact all detected secrets from text."""
+        if not text or not isinstance(text, str):
             return text
 
         result = text
         for pattern_name, pattern in _SECRET_PATTERNS:
             for match in pattern.finditer(result):
-                # Log the redaction (without the secret)
                 start = max(0, match.start() - 10)
                 end = min(len(result), match.end() + 10)
                 context = result[start:match.start()] + _REDACTED + result[match.end():end]
@@ -100,30 +110,49 @@ class SecretRedactor:
                 )
                 self._redaction_log.append(record)
 
-            # Replace matches
             result = pattern.sub(_REDACTED, result)
 
         return result
 
-    def redact_dict(self, data: dict[str, object]) -> dict[str, object]:
+    def redact_any(self, value: Any) -> Any:
+        """Recursively redact secrets across arbitrary nested Python data structures."""
+        if isinstance(value, str):
+            return self.redact(value)
+        elif isinstance(value, dict):
+            redacted_dict: dict[str, Any] = {}
+            for k, v in value.items():
+                k_str = str(k)
+                # If key name itself indicates sensitive credential, redact value directly
+                if any(sub in k_str.lower() for sub in _SENSITIVE_KEY_SUBSTRINGS) and isinstance(v, str) and len(v) >= 4:
+                    redacted_dict[k] = _REDACTED
+                    self._redaction_log.append(
+                        RedactionRecord(
+                            pattern_name=f"sensitive_key:{k_str}",
+                            position=0,
+                            length=len(v),
+                            context_preview=f"{k_str}={_REDACTED}",
+                        )
+                    )
+                else:
+                    redacted_dict[k] = self.redact_any(v)
+            return redacted_dict
+        elif isinstance(value, list):
+            return [self.redact_any(item) for item in value]
+        elif isinstance(value, tuple):
+            return tuple(self.redact_any(item) for item in value)
+        elif isinstance(value, set):
+            return {self.redact_any(item) for item in value}
+        return value
+
+    def redact_dict(self, data: dict[str, Any]) -> dict[str, Any]:
         """Recursively redact secrets in a dictionary."""
-        redacted: dict[str, object] = {}
-        for key, value in data.items():
-            if isinstance(value, str):
-                redacted[key] = self.redact(value)
-            elif isinstance(value, dict):
-                redacted[key] = self.redact_dict(value)  # type: ignore[arg-type]
-            elif isinstance(value, list):
-                redacted[key] = [
-                    self.redact(item) if isinstance(item, str) else item
-                    for item in value
-                ]
-            else:
-                redacted[key] = value
-        return redacted
+        return self.redact_any(data)  # type: ignore[no-any-return]
 
     def contains_secrets(self, text: str) -> bool:
         """Check if text contains any detectable secrets."""
+        if not isinstance(text, str):
+            return False
+
         for _, pattern in _SECRET_PATTERNS:
             if pattern.search(text):
                 return True
@@ -131,7 +160,8 @@ class SecretRedactor:
         # Also check for high-entropy strings
         words = text.split()
         for word in words:
-            if len(word) >= 20 and self._shannon_entropy(word) > self._entropy_threshold:
+            clean_word = word.strip("\"'()[]{}:;,")
+            if len(clean_word) >= 20 and self._shannon_entropy(clean_word) > self._entropy_threshold:
                 return True
 
         return False
