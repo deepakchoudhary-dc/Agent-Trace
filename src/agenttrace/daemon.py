@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from agenttrace.adapters.claude import ClaudeAdapter
 from agenttrace.adapters.codex import CodexAdapter
+from agenttrace.adapters.composite import CompositeAdapter
+from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.generic import GenericAdapter
 from agenttrace.adapters.sdk import AdapterBase
 from agenttrace.graph.baseline import BaselineGenerator
@@ -734,12 +737,13 @@ class AgentTraceDaemon:
 
         if agent_type == AgentType.CODEX:
             return CodexAdapter(session.session_id, workspace)
+        elif agent_type == AgentType.COPILOT:
+            return CopilotAdapter(session.session_id, workspace)
+        elif agent_type == AgentType.CLAUDE:
+            return ClaudeAdapter(session.session_id, workspace)
         elif agent_type == AgentType.AUTO:
-            codex = CodexAdapter(session.session_id, workspace)
-            if codex._log_dir:
-                return codex
-            return GenericAdapter(session.session_id, workspace)
-        return GenericAdapter(session.session_id, workspace)
+            return CompositeAdapter(session.session_id, workspace)
+        return CompositeAdapter(session.session_id, workspace)
 
     # -- Queries --
 

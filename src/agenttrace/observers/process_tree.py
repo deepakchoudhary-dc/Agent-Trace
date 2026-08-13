@@ -94,11 +94,10 @@ class ProcessTreeObserver(BaseObserver):
                     "cmdline": " ".join(cmdline) if cmdline else name,
                     "cwd": cwd,
                 }
-                self._tracked_pids[pid] = proc_info
-
+                actor_id = self._classify_actor(name, str(proc_info["cmdline"]))
                 event = ProcessEvent(
                     session_id=self.session_id,
-                    actor_id=f"process:{pid}",
+                    actor_id=actor_id,
                     source_adapter="process_tree_observer",
                     confidence=ConfidenceLevel.HIGH,
                     pid=pid,
@@ -106,9 +105,24 @@ class ProcessTreeObserver(BaseObserver):
                     command_line=str(proc_info["cmdline"]),
                     working_dir=cwd,
                     started_at=datetime.now(timezone.utc),
-                    payload={"process_name": name},
+                    payload={"process_name": name, "actor": actor_id},
                 )
                 await self.emit(event)
+
+                # If process is a discrete command, also emit CommandEvent
+                clean_cmd = str(proc_info["cmdline"])
+                if any(tool_prefix in name for tool_prefix in ["git", "npm", "python", "node", "tsc", "pytest", "curl", "pip", "vite", "esbuild"]):
+                    from agenttrace.models.events import CommandEvent
+                    cmd_event = CommandEvent(
+                        session_id=self.session_id,
+                        actor_id=actor_id,
+                        source_adapter="process_tree_observer",
+                        confidence=ConfidenceLevel.HIGH,
+                        command=clean_cmd[:300],
+                        working_dir=cwd,
+                        payload={"pid": pid, "tool": name},
+                    )
+                    await self.emit(cmd_event)
 
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
@@ -117,9 +131,11 @@ class ProcessTreeObserver(BaseObserver):
         terminated = set(self._tracked_pids.keys()) - current_pids
         for pid in terminated:
             proc_info = self._tracked_pids.pop(pid)
+            name = str(proc_info.get("name") or "")
+            actor_id = self._classify_actor(name, str(proc_info.get("cmdline") or ""))
             event = ProcessEvent(
                 session_id=self.session_id,
-                actor_id=f"process:{pid}",
+                actor_id=actor_id,
                 source_adapter="process_tree_observer",
                 confidence=ConfidenceLevel.HIGH,
                 pid=pid,
@@ -127,7 +143,7 @@ class ProcessTreeObserver(BaseObserver):
                 command_line=str(proc_info.get("cmdline") or ""),
                 working_dir=str(proc_info.get("cwd") or ""),
                 ended_at=datetime.now(timezone.utc),
-                payload={"terminated": True},
+                payload={"terminated": True, "actor": actor_id},
             )
             await self.emit(event)
 
@@ -159,6 +175,25 @@ class ProcessTreeObserver(BaseObserver):
                 return True
 
         return False
+
+    @staticmethod
+    def _classify_actor(name: str, cmdline_str: str) -> str:
+        """Classify actor identity based on process characteristics."""
+        combined = (name + " " + cmdline_str).lower()
+        if "copilot" in combined:
+            return "agent:copilot_chat"
+        if "claude" in combined:
+            return "agent:claude_code"
+        if "codex" in combined:
+            return "agent:codex_cli"
+        if "antigravity" in combined or "code.exe" in combined:
+            return "agent:ide_host"
+        if any(k in name.lower() for k in ["powershell", "cmd.exe", "bash", "zsh"]):
+            return "terminal:developer"
+        if any(k in name.lower() for k in ["git", "npm", "node", "python", "pytest", "tsc", "vite", "esbuild", "pip"]):
+            clean_name = name.lower().replace(".exe", "")
+            return f"tool:{clean_name}"
+        return f"process:{name}"
 
     def get_tracked_pids(self) -> set[int]:
         """Return currently tracked workspace PIDs."""

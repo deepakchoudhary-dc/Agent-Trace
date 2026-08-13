@@ -53,7 +53,7 @@ class TerminalObserver(BaseObserver):
         workspace_path: str,
         callback: EventCallback,
         poll_interval: float = _POLL_INTERVAL,
-        track_global_history: bool = False,
+        track_global_history: bool = True,
     ) -> None:
         super().__init__(session_id, workspace_path, callback)
         self._poll_interval = poll_interval
