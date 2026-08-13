@@ -21,6 +21,7 @@ from agenttrace.adapters.composite import CompositeAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.generic import GenericAdapter
 from agenttrace.adapters.sdk import AdapterBase
+from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.task_boundary import TaskBoundaryEngine
@@ -741,9 +742,7 @@ class AgentTraceDaemon:
             return CopilotAdapter(session.session_id, workspace)
         elif agent_type == AgentType.CLAUDE:
             return ClaudeAdapter(session.session_id, workspace)
-        elif agent_type == AgentType.AUTO:
-            return CompositeAdapter(session.session_id, workspace)
-        return CompositeAdapter(session.session_id, workspace)
+        return UniversalAgentAdapter(session.session_id, workspace)
 
     # -- Queries --
 

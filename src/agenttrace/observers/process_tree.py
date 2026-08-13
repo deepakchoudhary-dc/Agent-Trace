@@ -1,40 +1,56 @@
-"""Process tree observer using psutil.
+"""Process tree observer using psutil with Universal AI Agent Classification.
 
-Monitors child processes of agent sessions, auto-detects known agent
-processes, and tracks process lifecycle events with strict workspace scoping.
+Monitors child processes of agent sessions, auto-detects ANY AI coding tool
+(Cline, Kilo Code, Roo Code, Copilot, Claude, Cursor, Aider, Windsurf, Ollama, etc.),
+and tracks process lifecycle events with strict workspace scoping.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import psutil
 
-from agenttrace.models.events import ConfidenceLevel, ProcessEvent
+from agenttrace.models.events import CommandEvent, ConfidenceLevel, ProcessEvent
 from agenttrace.observers.base import BaseObserver, EventCallback
 
 logger = logging.getLogger(__name__)
 
-# Process names that indicate known AI agent tools
-KNOWN_AGENT_NAMES = {
-    "codex",
-    "claude",
+# Core agent keyword signatures
+_UNIVERSAL_AGENT_SIGNATURES = [
+    "kilo",
+    "cline",
+    "roo",
     "copilot",
-}
+    "claude",
+    "codex",
+    "cursor",
+    "windsurf",
+    "aider",
+    "goose",
+    "continue",
+    "devika",
+    "ollama",
+    "open-interpreter",
+    "antigravity",
+    "code.exe",
+]
 
-_POLL_INTERVAL = 2.0
+_POLL_INTERVAL = 1.5
 
 
 class ProcessTreeObserver(BaseObserver):
-    """Watches for agent-related processes strictly within the workspace.
+    """Universal process watcher for AI coding agents and developer toolchains.
 
-    Uses psutil to poll the process tree. Tracks new processes, terminated processes,
-    and updates active workspace PIDs.
+    Automatically identifies and attributes actions across Cline, Kilo Code,
+    Roo Code, Copilot, Claude Code, Cursor, Aider, manual terminals, and local LLMs.
     """
 
     def __init__(
@@ -53,7 +69,7 @@ class ProcessTreeObserver(BaseObserver):
 
     async def _run(self) -> None:
         """Poll process tree at regular intervals."""
-        logger.info("Watching process tree for workspace: %s", self.workspace_path)
+        logger.info("Universal ProcessTreeObserver watching workspace: %s", self.workspace_path)
 
         try:
             while self._running:
@@ -94,6 +110,8 @@ class ProcessTreeObserver(BaseObserver):
                     "cmdline": " ".join(cmdline) if cmdline else name,
                     "cwd": cwd,
                 }
+                self._tracked_pids[pid] = proc_info
+
                 actor_id = self._classify_actor(name, str(proc_info["cmdline"]))
                 event = ProcessEvent(
                     session_id=self.session_id,
@@ -109,10 +127,9 @@ class ProcessTreeObserver(BaseObserver):
                 )
                 await self.emit(event)
 
-                # If process is a discrete command, also emit CommandEvent
+                # If process is a discrete command, also emit CommandEvent for graph correlation
                 clean_cmd = str(proc_info["cmdline"])
-                if any(tool_prefix in name for tool_prefix in ["git", "npm", "python", "node", "tsc", "pytest", "curl", "pip", "vite", "esbuild"]):
-                    from agenttrace.models.events import CommandEvent
+                if any(tool_prefix in name for tool_prefix in ["git", "npm", "python", "node", "tsc", "pytest", "curl", "pip", "vite", "esbuild", "cargo", "go", "docker"]):
                     cmd_event = CommandEvent(
                         session_id=self.session_id,
                         actor_id=actor_id,
@@ -168,8 +185,8 @@ class ProcessTreeObserver(BaseObserver):
             if str(self._workspace_resolved).lower() in cmdline_str or self.workspace_path.lower() in cmdline_str:
                 return True
 
-        # 3. Known agent tool executing within or pointing to workspace
-        if any(agent_name in name for agent_name in KNOWN_AGENT_NAMES):
+        # 3. Known or detected AI agent tool executing within or pointing to workspace
+        if any(agent_sig in name for agent_sig in _UNIVERSAL_AGENT_SIGNATURES):
             cmdline_str = " ".join(cmdline).lower()
             if self.workspace_path.lower() in cmdline_str:
                 return True
@@ -178,22 +195,50 @@ class ProcessTreeObserver(BaseObserver):
 
     @staticmethod
     def _classify_actor(name: str, cmdline_str: str) -> str:
-        """Classify actor identity based on process characteristics."""
+        """Dynamically and universally classify any AI agent, extension, CLI, or tool."""
         combined = (name + " " + cmdline_str).lower()
-        if "copilot" in combined:
-            return "agent:copilot_chat"
-        if "claude" in combined:
-            return "agent:claude_code"
-        if "codex" in combined:
-            return "agent:codex_cli"
-        if "antigravity" in combined or "code.exe" in combined:
-            return "agent:ide_host"
-        if any(k in name.lower() for k in ["powershell", "cmd.exe", "bash", "zsh"]):
+
+        # 1. Match known AI coding assistants and CLI tools
+        known_agents = [
+            ("kilo", "agent:kilo_code"),
+            ("cline", "agent:cline"),
+            ("roo-cline", "agent:roo_code"),
+            ("roo", "agent:roo_code"),
+            ("copilot", "agent:copilot_chat"),
+            ("claude", "agent:claude_code"),
+            ("codex", "agent:codex_cli"),
+            ("cursor", "agent:cursor_ai"),
+            ("windsurf", "agent:windsurf_ai"),
+            ("aider", "agent:aider"),
+            ("goose", "agent:goose_ai"),
+            ("continue", "agent:continue_dev"),
+            ("devika", "agent:devika"),
+            ("ollama", "agent:ollama_local"),
+            ("open-interpreter", "agent:open_interpreter"),
+            ("antigravity", "agent:antigravity_ide"),
+        ]
+        for key, agent_id in known_agents:
+            if key in combined:
+                return agent_id
+
+        # 2. Extract VS Code / IDE extension name dynamically
+        # e.g., "extensions\publisher.extension-name\..."
+        ext_match = re.search(r"extensions[\\/]([a-zA-Z0-9_\-\.]+)[\\/]", cmdline_str, re.IGNORECASE)
+        if ext_match:
+            ext_full = ext_match.group(1).lower()
+            ext_short = ext_full.split(".")[-1]
+            return f"agent:{ext_short}"
+
+        # 3. Interactive Developer Terminals
+        if any(k in name.lower() for k in ["powershell", "cmd.exe", "bash", "zsh", "fish"]):
             return "terminal:developer"
-        if any(k in name.lower() for k in ["git", "npm", "node", "python", "pytest", "tsc", "vite", "esbuild", "pip"]):
+
+        # 4. Standard developer build tools, compilers, and runtimes
+        if any(k in name.lower() for k in ["git", "npm", "node", "python", "pytest", "tsc", "vite", "esbuild", "pip", "cargo", "go", "docker", "make"]):
             clean_name = name.lower().replace(".exe", "")
             return f"tool:{clean_name}"
-        return f"process:{name}"
+
+        return f"process:{name.lower().replace('.exe', '')}"
 
     def get_tracked_pids(self) -> set[int]:
         """Return currently tracked workspace PIDs."""
