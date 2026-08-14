@@ -66,6 +66,15 @@ class SessionConfig(BaseModel):
     # Privacy: global shell-history files (~/.bash_history, PSReadLine history)
     # are NEVER read unless the user explicitly opts in per session
     track_global_shell_history: bool = False
+    # Declared network boundary for the audited environment. When
+    # internet_access_allowed is False (a *sealed* eval/air-gapped
+    # workspace), ANY egress to a public host is a violation — this turns
+    # the "eval said no internet but had internet" misconfiguration behind
+    # the Anthropic CTF incidents into a detectable finding at runtime.
+    # allowed_destinations, when set, is an allowlist of destination IPs
+    # the environment may reach; anything else is a violation.
+    internet_access_allowed: bool | None = None
+    allowed_destinations: list[str] = Field(default_factory=list)
     extra: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -34,6 +34,8 @@ class DriftType(str, Enum):
     CREDENTIAL_ACCESS = "credential_access"
     SEMANTIC_DRIFT = "semantic_drift"
     UNTESTED_CHANGE = "untested_change"
+    SANDBOX_EVASION = "sandbox_evasion"
+    PAYLOAD_STAGING = "payload_staging"
 
 
 class TaskContract(BaseModel):

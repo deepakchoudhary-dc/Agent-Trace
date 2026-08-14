@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any
 from uuid import UUID
 
-from agenttrace.models.events import ConfidenceLevel, EventBase, EventType
+from agenttrace.models.events import EventBase, EventType
 
 logger = logging.getLogger(__name__)
 

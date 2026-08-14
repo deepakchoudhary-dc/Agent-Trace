@@ -15,8 +15,6 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
-from uuid import UUID, uuid4
 
 from agenttrace.review_loop.planner import ReviewPlan
 from agenttrace.review_loop.worker import WorkerArtifact, WorkerResult

@@ -10,6 +10,7 @@ import asyncio
 import logging
 import subprocess
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from agenttrace.models.events import ConfidenceLevel, GitEvent
@@ -73,7 +74,7 @@ class GitMonitor(BaseObserver):
         parent = self._git_cmd("log", "-1", "--format=%P", commit_hash)
         return {"message": msg, "parent": parent}
 
-    def _get_diff_stat(self, from_ref: str, to_ref: str) -> dict[str, list[str] | int]:
+    def _get_diff_stat(self, from_ref: str, to_ref: str) -> dict[str, Any]:
         """Get diff statistics between two refs."""
         files_raw = self._git_cmd("diff", "--name-only", from_ref, to_ref)
         files = [f for f in files_raw.split("\n") if f.strip()] if files_raw else []
@@ -142,9 +143,9 @@ class GitMonitor(BaseObserver):
                 commit_hash=current_head,
                 parent_hash=info["parent"],
                 message=info["message"],
-                files_changed=diff_stat["files"],  # type: ignore[arg-type]
-                insertions=diff_stat["insertions"],  # type: ignore[arg-type]
-                deletions=diff_stat["deletions"],  # type: ignore[arg-type]
+                files_changed=diff_stat["files"],
+                insertions=diff_stat["insertions"],
+                deletions=diff_stat["deletions"],
             )
             await self.emit(event)
             self._last_head = current_head

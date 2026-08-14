@@ -12,12 +12,11 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from agenttrace.models.events import (
     CommandEvent,
     EventBase,
-    EventType,
     FileMutationEvent,
     GitEvent,
     NetworkEvent,
@@ -96,6 +95,13 @@ _DEFAULT_RULES: list[PolicyRule] = [
         severity="medium",
     ),
     PolicyRule(
+        rule_id="external_state_change",
+        name="External State-Changing Request",
+        description="State-changing HTTP request (POST/PUT/PATCH/DELETE) to a public/external host",
+        action=PolicyAction.PAUSE,
+        severity="high",
+    ),
+    PolicyRule(
         rule_id="high_impact_git",
         name="High-Impact Git Operation",
         description="Force push, rebase, or reset operations",
@@ -106,6 +112,20 @@ _DEFAULT_RULES: list[PolicyRule] = [
         rule_id="script_execution",
         name="Script Execution",
         description="Execution of downloaded or untrusted scripts",
+        action=PolicyAction.PAUSE,
+        severity="high",
+    ),
+    PolicyRule(
+        rule_id="seal_violation",
+        name="Sealed-Environment Egress",
+        description="Network egress from an environment declared to have no internet access",
+        action=PolicyAction.PAUSE,
+        severity="critical",
+    ),
+    PolicyRule(
+        rule_id="destination_allowlist",
+        name="Destination Allowlist Violation",
+        description="Connection to a destination outside the environment's declared allowlist",
         action=PolicyAction.PAUSE,
         severity="high",
     ),
@@ -156,11 +176,16 @@ class PolicyEngine:
         session_id: UUID,
         contract: TaskContract | None = None,
         rules: list[PolicyRule] | None = None,
+        internet_allowed: bool | None = None,
+        allowed_destinations: list[str] | None = None,
     ) -> None:
         self.session_id = session_id
         self.contract = contract
         self._rules = {r.rule_id: r for r in (rules or _DEFAULT_RULES)}
         self._known_destinations: set[str] = set()
+        # Declared network boundary (sealed-eval detection)
+        self._internet_allowed = internet_allowed
+        self._allowed_destinations = set(allowed_destinations or [])
 
     def evaluate(self, event: EventBase) -> PolicyEvaluation:
         """Evaluate an event against all active policy rules."""
@@ -282,7 +307,47 @@ class PolicyEngine:
         self, event: NetworkEvent, result: PolicyEvaluation
     ) -> None:
         """Check network events against policies."""
+        from agenttrace.security.netutil import is_public_ip
+
         destination = f"{event.destination_ip}:{event.destination_port}"
+
+        # Sealed-environment egress — the eval misconfiguration pattern from
+        # the Anthropic CTF incidents (environment declared offline but live
+        # on the internet). Any public egress from a sealed env is critical.
+        if self._internet_allowed is False and is_public_ip(event.destination_ip):
+            rule = self._rules.get("seal_violation")
+            if rule and rule.enabled:
+                result.triggered_rules.append(rule)
+                result.findings.append(self._make_finding(
+                    rule,
+                    f"Egress from sealed environment (declared offline): {destination}",
+                    "",
+                ))
+
+        # Destination allowlist — connections outside the declared set
+        if self._allowed_destinations and is_public_ip(event.destination_ip):
+            if event.destination_ip not in self._allowed_destinations:
+                rule = self._rules.get("destination_allowlist")
+                if rule and rule.enabled:
+                    result.triggered_rules.append(rule)
+                    result.findings.append(self._make_finding(
+                        rule,
+                        f"Destination outside allowlist: {destination}",
+                        "",
+                    ))
+
+        # State-changing requests to public/external hosts — irreversible
+        # side effects on real systems (the gym-booking incident pattern).
+        method = (event.http_method or "").upper()
+        if method in ("POST", "PUT", "PATCH", "DELETE") and is_public_ip(event.destination_ip):
+            rule = self._rules.get("external_state_change")
+            if rule and rule.enabled:
+                result.triggered_rules.append(rule)
+                result.findings.append(self._make_finding(
+                    rule, f"State-changing request to external host: {destination}", "",
+                ))
+            # Still register as known to avoid double-flagging below
+            self._known_destinations.add(destination)
 
         if destination not in self._known_destinations:
             rule = self._rules.get("network_egress")

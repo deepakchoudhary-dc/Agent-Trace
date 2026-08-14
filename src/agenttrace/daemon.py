@@ -8,7 +8,6 @@ persistence/restoration across restarts, and mediated pre-execution gates.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +21,7 @@ from agenttrace.adapters.sdk import AdapterBase
 from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.context_graph import ContextGraph
+from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.graph.task_boundary import TaskBoundaryEngine
 from agenttrace.models.events import (
     ApprovalEvent,
@@ -80,7 +80,7 @@ class AgentTraceDaemon:
     """
 
     def __init__(self, data_dir: str | Path | None = None) -> None:
-        self._data_dir = Path(data_dir) if data_dir else _DEFAULT_DATA_DIR
+        self._data_dir = Path(data_dir) if data_dir else Path(_DEFAULT_DATA_DIR)
         self._data_dir.mkdir(parents=True, exist_ok=True)
 
         self._encryptor = EncryptionManager(self._data_dir / "keys")
@@ -103,6 +103,7 @@ class AgentTraceDaemon:
         self._contracts: dict[UUID, TaskContract] = {}
         self._boundaries: dict[UUID, TaskBoundaryEngine] = {}
         self._network_observers: dict[UUID, NetworkObserver] = {}
+        self._incidents: dict[UUID, IncidentCorrelationEngine] = {}
         # Most-recent node index per (session, node_type, actor) for causal
         # correlation: links events to the *latest* cause, not the first match
         self._latest: dict[tuple[UUID, NodeType, str], UUID] = {}
@@ -165,12 +166,25 @@ class AgentTraceDaemon:
                         )
                         self._contracts[sid] = contract
                         self._boundaries[sid] = TaskBoundaryEngine(contract)
-                        self._policies[sid] = PolicyEngine(sid, contract)
+                        self._policies[sid] = PolicyEngine(
+                            sid,
+                            contract,
+                            internet_allowed=config.internet_access_allowed,
+                            allowed_destinations=config.allowed_destinations,
+                        )
 
                     # Restore approval manager and its active (non-expired) cache
                     approvals = ApprovalManager(sid, self._ledger)
                     approvals.reload_from_storage()
                     self._approvals[sid] = approvals
+
+                    # Incident correlation engine (starts fresh; past incidents
+                    # remain persisted in the ledger)
+                    self._incidents[sid] = IncidentCorrelationEngine(
+                        sid,
+                        internet_allowed=config.internet_access_allowed,
+                        allowed_destinations=config.allowed_destinations,
+                    )
 
                     # Reconstruct ContextGraph from persisted nodes and edges
                     graph = ContextGraph(sid)
@@ -228,11 +242,15 @@ class AgentTraceDaemon:
         prohibited_paths: list[str] | None = None,
         expected_tests: list[str] | None = None,
         allowed_tools: list[str] | None = None,
+        internet_access_allowed: bool | None = None,
+        allowed_destinations: list[str] | None = None,
     ) -> AuditSession:
         """Create and start a new audit session."""
         config = SessionConfig(
             workspace_path=str(Path(workspace_path).resolve()),
             agent_type=agent_type,
+            internet_access_allowed=internet_access_allowed,
+            allowed_destinations=list(allowed_destinations or []),
         )
 
         session = AuditSession(
@@ -274,11 +292,21 @@ class AgentTraceDaemon:
             notes=contract.notes,
         )
 
-        # 3. Policy Engine & Approvals
-        policy = PolicyEngine(session.session_id, contract)
+        # 3. Policy Engine, Approvals & Incident Correlation
+        policy = PolicyEngine(
+            session.session_id,
+            contract,
+            internet_allowed=config.internet_access_allowed,
+            allowed_destinations=config.allowed_destinations,
+        )
         self._policies[session.session_id] = policy
         approvals = ApprovalManager(session.session_id, self._ledger)
         self._approvals[session.session_id] = approvals
+        self._incidents[session.session_id] = IncidentCorrelationEngine(
+            session.session_id,
+            internet_allowed=config.internet_access_allowed,
+            allowed_destinations=config.allowed_destinations,
+        )
 
         # 4. Generate Baseline Graph & Persist Nodes
         baseline_gen = BaselineGenerator(session.session_id, config.workspace_path)
@@ -460,6 +488,12 @@ class AgentTraceDaemon:
             for finding in evaluation.findings:
                 await self.ingest_event(finding)
 
+        # 5b. Incident correlation — multi-stage attack patterns
+        incident_engine = self._incidents.get(event.session_id)
+        if incident_engine:
+            for incident in incident_engine.observe(event):
+                await self.ingest_event(incident)
+
         # 6. Update Session In-Memory Status
         session = self._sessions.get(event.session_id)
         if session:
@@ -542,7 +576,7 @@ class AgentTraceDaemon:
         # Multi-Hop Causal Edge Inference
         new_edges: list[GraphEdge] = []
 
-        def edge(source_id: UUID, edge_type: EdgeType, confidence: ConfidenceLevel = ConfidenceLevel.HIGH) -> GraphEdge:
+        def link_edge(source_id: UUID, edge_type: EdgeType, confidence: ConfidenceLevel = ConfidenceLevel.HIGH) -> GraphEdge:
             """Helper: edge from a cause node to the just-added node."""
             return GraphEdge(
                 source_node_id=source_id,
@@ -556,13 +590,13 @@ class AgentTraceDaemon:
         # 1. Invocations connect to root task_intent
         if isinstance(event, InvocationEvent):
             for t_node in graph.get_nodes_by_type(NodeType.TASK_INTENT):
-                new_edges.append(edge(t_node.node_id, EdgeType.PROVIDES_CONTEXT_TO))
+                new_edges.append(link_edge(t_node.node_id, EdgeType.PROVIDES_CONTEXT_TO))
 
         # 2. Tool requests connect to the most recent agent session of that actor
         elif isinstance(event, ToolRequestEvent):
             s_node = self._latest_matching(graph, NodeType.AGENT_SESSION, actor_id=event.actor_id)
             if s_node:
-                new_edges.append(edge(s_node.node_id, EdgeType.REQUESTS))
+                new_edges.append(link_edge(s_node.node_id, EdgeType.REQUESTS))
 
         # 3. Tool results connect to the most recent matching tool request
         elif isinstance(event, ToolResultEvent):
@@ -571,25 +605,25 @@ class AgentTraceDaemon:
                 predicate=lambda n: n.data.get("tool_name") == event.tool_name,
             )
             if req_node:
-                new_edges.append(edge(req_node.node_id, EdgeType.EXECUTES))
+                new_edges.append(link_edge(req_node.node_id, EdgeType.EXECUTES))
 
         # 4. Commands connect to the most recent agent session and matching tool request
         elif isinstance(event, CommandEvent):
             s_node = self._latest_matching(graph, NodeType.AGENT_SESSION, actor_id=event.actor_id)
             if s_node:
-                new_edges.append(edge(s_node.node_id, EdgeType.EXECUTES))
+                new_edges.append(link_edge(s_node.node_id, EdgeType.EXECUTES))
             req_node = self._latest_matching(
                 graph, NodeType.TOOL_REQUEST,
                 predicate=lambda n: event.command in str(n.data),
             )
             if req_node:
-                new_edges.append(edge(req_node.node_id, EdgeType.EXECUTES))
+                new_edges.append(link_edge(req_node.node_id, EdgeType.EXECUTES))
 
         # 5. File mutations connect to the most recent command & baseline source file
         elif isinstance(event, FileMutationEvent):
             cmd_node = self._latest_matching(graph, NodeType.COMMAND)
             if cmd_node:
-                new_edges.append(edge(cmd_node.node_id, EdgeType.MODIFIES, ConfidenceLevel.MEDIUM))
+                new_edges.append(link_edge(cmd_node.node_id, EdgeType.MODIFIES, ConfidenceLevel.MEDIUM))
 
             for file_node in graph.get_nodes_by_type(NodeType.SOURCE_FILE):
                 if file_node.data.get("path") == event.file_path:
@@ -612,13 +646,13 @@ class AgentTraceDaemon:
                     predicate=lambda n: n.data.get("pid") == event.process_pid,
                 )
                 if p_node:
-                    new_edges.append(edge(p_node.node_id, EdgeType.SPAWNS))
+                    new_edges.append(link_edge(p_node.node_id, EdgeType.SPAWNS))
 
         # 7. Policy findings connect to the triggering node
         elif isinstance(event, PolicyFindingEvent):
             for candidate in reversed(list(graph._nodes.values())):
                 if candidate.node_id != node.node_id:
-                    new_edges.append(edge(candidate.node_id, EdgeType.VIOLATES))
+                    new_edges.append(link_edge(candidate.node_id, EdgeType.VIOLATES))
                     break
 
         # 8. Approvals connect to findings (approval node → finding node)
@@ -635,19 +669,19 @@ class AgentTraceDaemon:
                     ))
 
         # Add and persist all edges
-        for edge in new_edges:
-            graph.add_edge(edge)
+        for new_edge in new_edges:
+            graph.add_edge(new_edge)
             self._ledger.store_graph_edge(
-                edge_id=edge.edge_id,
+                edge_id=new_edge.edge_id,
                 session_id=event.session_id,
-                source_node_id=edge.source_node_id,
-                target_node_id=edge.target_node_id,
-                edge_type=edge.edge_type.value,
-                timestamp=edge.timestamp.isoformat(),
-                actor_id=edge.actor_id,
-                source_adapter=edge.source_adapter,
-                confidence=edge.confidence.value,
-                data=edge.data,
+                source_node_id=new_edge.source_node_id,
+                target_node_id=new_edge.target_node_id,
+                edge_type=new_edge.edge_type.value,
+                timestamp=new_edge.timestamp.isoformat(),
+                actor_id=new_edge.actor_id,
+                source_adapter=new_edge.source_adapter,
+                confidence=new_edge.confidence.value,
+                data=new_edge.data,
             )
 
     def _latest_matching(
@@ -873,6 +907,10 @@ class AgentTraceDaemon:
 
     def get_findings(self, session_id: UUID) -> list[EventBase]:
         return self._ledger.query_events(session_id, event_type=EventType.POLICY_FINDING)
+
+    def get_incidents(self, session_id: UUID) -> list[EventBase]:
+        """Return all persisted incident records for a session."""
+        return self._ledger.query_events(session_id, event_type=EventType.INCIDENT)
 
     def get_contract(self, session_id: UUID) -> TaskContract | None:
         return self._contracts.get(session_id)

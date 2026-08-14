@@ -13,10 +13,9 @@ import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 from uuid import UUID
 
-import psutil
+import psutil  # type: ignore[import-untyped]
 
 from agenttrace.models.events import CommandEvent, ConfidenceLevel, ProcessEvent
 from agenttrace.observers.base import BaseObserver, EventCallback
@@ -44,6 +43,22 @@ _UNIVERSAL_AGENT_SIGNATURES = [
 ]
 
 _POLL_INTERVAL = 1.5
+
+# Tools whose invocation is itself evidence worth recording as a CommandEvent.
+# Note: this is a *prefix* match on the process name, so short-lived tools
+# (curl, wget, git fetch) are captured whenever they survive a poll; the
+# shell interpreters (bash/sh/zsh/fish) carry their -c payload in argv.
+_COMMAND_TOOL_PREFIXES = [
+    "git", "npm", "npx", "yarn", "pnpm", "python", "python3", "pip", "pip3",
+    "node", "deno", "bun", "tsc", "vite", "esbuild", "webpack", "rollup",
+    "pytest", "curl", "wget", "ssh", "scp", "rsync", "cargo", "go", "rustc",
+    "gcc", "clang", "make", "cmake", "gem", "twine", "ruby", "perl", "php",
+    "java", "mvn", "gradle", "docker", "docker-compose", "kubectl", "helm",
+    "terraform", "aws", "gcloud", "az", "bash", "sh", "zsh", "fish", "cmd.exe",
+]
+
+# Shell interpreters whose argv carries the actual command (-c payload)
+_SHELL_NAMES = {"bash", "sh", "zsh", "fish"}
 
 
 class ProcessTreeObserver(BaseObserver):
@@ -86,7 +101,7 @@ class ProcessTreeObserver(BaseObserver):
 
         for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "cwd"]):
             try:
-                info = proc.info  # type: ignore[attr-defined]
+                info = proc.info
                 pid = info["pid"]
                 if not pid:
                     continue
@@ -127,17 +142,25 @@ class ProcessTreeObserver(BaseObserver):
                 )
                 await self.emit(event)
 
-                # If process is a discrete command, also emit CommandEvent for graph correlation
+                # If process is a discrete command, also emit CommandEvent for
+                # graph correlation. Shell interpreters with a -c payload carry
+                # the *actual* command the agent ran in argv — extract it so the
+                # boundary/policy engines see the real string, not just "bash".
                 clean_cmd = str(proc_info["cmdline"])
-                if any(tool_prefix in name for tool_prefix in ["git", "npm", "python", "node", "tsc", "pytest", "curl", "pip", "vite", "esbuild", "cargo", "go", "docker"]):
+                if any(tool_prefix in name for tool_prefix in _COMMAND_TOOL_PREFIXES):
+                    command = clean_cmd[:300]
+                    if name in _SHELL_NAMES:
+                        extracted = self._extract_shell_payload(cmdline)
+                        if extracted:
+                            command = extracted[:300]
                     cmd_event = CommandEvent(
                         session_id=self.session_id,
                         actor_id=actor_id,
                         source_adapter="process_tree_observer",
                         confidence=ConfidenceLevel.HIGH,
-                        command=clean_cmd[:300],
+                        command=command,
                         working_dir=cwd,
-                        payload={"pid": pid, "tool": name},
+                        payload={"pid": pid, "tool": name, "raw_cmdline": clean_cmd[:300]},
                     )
                     await self.emit(cmd_event)
 
@@ -167,6 +190,22 @@ class ProcessTreeObserver(BaseObserver):
         # Notify network observer of current active PIDs
         if self._on_pids_updated:
             self._on_pids_updated(set(self._tracked_pids.keys()))
+
+    @staticmethod
+    def _extract_shell_payload(cmdline: list[str]) -> str:
+        """Extract the actual command from `bash -c '<cmd>' ...` argv.
+
+        psutil returns argv as a list, so the `-c` payload is a single element
+        (e.g. ``["bash", "-c", "rm -rf /tmp/x"]``). We return that element
+        verbatim — the boundary/policy engines see the real command string.
+        """
+        try:
+            idx = cmdline.index("-c")
+        except ValueError:
+            return ""
+        if idx + 1 < len(cmdline):
+            return cmdline[idx + 1].strip()
+        return ""
 
     def _is_relevant(self, name: str, cmdline: list[str], cwd: str) -> bool:
         """Determine if a process is relevant to track strictly within the workspace."""

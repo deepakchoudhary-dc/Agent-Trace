@@ -10,7 +10,7 @@ import asyncio
 import logging
 from uuid import UUID
 
-import psutil
+import psutil  # type: ignore[import-untyped]
 
 from agenttrace.models.events import ConfidenceLevel, NetworkEvent
 from agenttrace.observers.base import BaseObserver, EventCallback
@@ -21,6 +21,15 @@ _POLL_INTERVAL = 4.0
 
 # Common local addresses to filter out
 _LOCAL_ADDRS = {"127.0.0.1", "::1", "0.0.0.0", "::", "localhost", ""}
+
+# Connection states that prove an *outbound* connection to the destination.
+# TIME_WAIT/CLOSE_WAIT/FIN_WAIT linger after completion (~60s), so a
+# short-lived connection (a curl POST, a gym-cancellation DELETE) that is
+# gone by the next poll still leaves evidence of having happened.
+_OUTBOUND_STATUSES = {
+    "ESTABLISHED", "SYN_SENT", "SYN-RECEIVED", "CLOSE_WAIT", "LAST_ACK",
+    "FIN_WAIT1", "FIN_WAIT2", "TIME_WAIT", "CLOSING",
+}
 
 
 class NetworkObserver(BaseObserver):
@@ -95,7 +104,14 @@ class NetworkObserver(BaseObserver):
             self._seen_connections.add(conn_key)
 
             protocol = "tcp" if conn.type == 1 else "udp"
-            direction = "outbound" if conn.status == "ESTABLISHED" else "unknown"
+            direction = (
+                "outbound"
+                if (conn.status or "").upper() in _OUTBOUND_STATUSES
+                else "unknown"
+            )
+            # Capture the state so downstream engines can weight short-lived
+            # completed connections (TIME_WAIT) as completed egress
+            conn_state = (conn.status or "").upper()
 
             event = NetworkEvent(
                 session_id=self.session_id,
@@ -107,5 +123,6 @@ class NetworkObserver(BaseObserver):
                 protocol=protocol,
                 direction=direction,
                 process_pid=pid,
+                payload={"conn_state": conn_state, "connection_status": conn.status or ""},
             )
             await self.emit(event)

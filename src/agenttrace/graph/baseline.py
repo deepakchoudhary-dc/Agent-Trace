@@ -8,11 +8,9 @@ build config, import relationships, and content-hash snapshots.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any
 from uuid import UUID
 
 from agenttrace.models.events import ConfidenceLevel

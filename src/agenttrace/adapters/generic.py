@@ -10,8 +10,6 @@ It clearly marks unavailable agent-internal context as gaps.
 from __future__ import annotations
 
 import logging
-from typing import Any
-from uuid import UUID
 
 from agenttrace.adapters.sdk import SDK_VERSION, AdapterBase
 from agenttrace.models.events import EventBase, EventType

@@ -2,7 +2,6 @@
 
 from uuid import uuid4
 
-from agenttrace.models.events import ConfidenceLevel
 from agenttrace.models.graph import EdgeType, GraphEdge, GraphNode, NodeType
 from agenttrace.graph.context_graph import ContextGraph
 

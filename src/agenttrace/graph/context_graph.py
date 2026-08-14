@@ -7,15 +7,13 @@ labeled edges. Every node and edge carries provenance metadata.
 
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 import networkx as nx  # type: ignore[import-untyped]
 
-from agenttrace.models.events import ConfidenceLevel
 from agenttrace.models.graph import (
     EdgeType,
     GraphEdge,

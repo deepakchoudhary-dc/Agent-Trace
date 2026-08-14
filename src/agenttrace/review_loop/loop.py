@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from agenttrace.review_loop.planner import Planner, ReviewPlan
+from agenttrace.review_loop.planner import Planner
 from agenttrace.review_loop.plan_reviewer import PlanReviewer, PlanReviewResult
 from agenttrace.review_loop.reviewer import (
     BaseReviewer,

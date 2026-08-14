@@ -7,24 +7,16 @@ Claude Code, Continue.dev, Ollama, LM Studio, or custom local LLMs.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
-import re
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 from uuid import UUID
 
 from agenttrace.adapters.sdk import SDK_VERSION, AdapterBase
 from agenttrace.models.events import (
     ConfidenceLevel,
-    ContextBoundaryEvent,
     EventBase,
     EventType,
     InvocationEvent,
-    ToolRequestEvent,
-    ToolResultEvent,
 )
 
 logger = logging.getLogger(__name__)

@@ -57,12 +57,82 @@ class SimulationResult:
 
 
 class ReplayEngine:
-    """Manages branch-and-replay simulations in isolated disposable environments."""
+    """Manages branch-and-replay simulations in isolated disposable environments.
+
+    Verification commands are restricted to a server-side allowlist — arbitrary
+    API-supplied command text is never executed (P1-7 hardening).
+    """
+
+    # Test runners allowed inside simulations, with their permitted subcommands
+    _PYTHON_MODULES = {"pytest", "unittest"}
+    _JS_PACKAGE_MANAGERS = {"npm", "yarn", "pnpm"}
 
     def __init__(self, workspace_path: str) -> None:
         self.workspace_path = Path(workspace_path)
         self._active_simulations: dict[UUID, Path] = {}
 
+    @staticmethod
+    def verify_command_allowed(command: str) -> tuple[bool, str]:
+        """Check a verification command against the server-side allowlist.
+
+        Allows only well-known, non-destructive test runners and rejects shell
+        metacharacters and arbitrary executables. Returns (allowed, reason).
+        """
+        if not command or not command.strip():
+            return False, "Empty command"
+
+        # Backticks are stripped as quote chars by shlex, so reject them on the
+        # raw string before parsing (command substitution: `id`, `cat x`)
+        if "`" in command:
+            return False, "Command substitution (backticks) is not allowed"
+
+        try:
+            parts = shlex.split(command, posix=os.name != "nt")
+        except ValueError:
+            return False, "Unparseable command"
+        if not parts:
+            return False, "Empty command"
+
+        # Reject shell control operators / redirection outright
+        if any(tok in parts for tok in ("&&", "||", ";", "|", ">", "<")):
+            return False, "Shell control operators and redirection are not allowed"
+        if any("$(" in tok or "${ " in tok for tok in parts):
+            return False, "Command substitution is not allowed"
+
+        base = Path(parts[0]).name.lower()
+
+        # python -m pytest | python -m unittest
+        if base in ("python", "python3", "py"):
+            if (
+                len(parts) >= 3
+                and parts[1] == "-m"
+                and Path(parts[2]).name.lower() in ReplayEngine._PYTHON_MODULES
+            ):
+                return True, ""
+            return False, "Only `python -m pytest` / `python -m unittest` are allowed"
+
+        # pytest ...
+        if base in ("pytest", "pytest.exe"):
+            return True, ""
+
+        # npm test | npm run test | yarn test | pnpm test
+        if base in ReplayEngine._JS_PACKAGE_MANAGERS:
+            sub = parts[1].lower() if len(parts) > 1 else ""
+            if sub == "test":
+                return True, ""
+            if sub == "run" and len(parts) > 2 and parts[2].lower() == "test":
+                return True, ""
+            return False, f"Only `{base} test` is allowed"
+
+        # cargo test | go test | make test
+        if base == "cargo" and len(parts) > 1 and parts[1] == "test":
+            return True, ""
+        if base == "go" and len(parts) > 1 and parts[1] == "test":
+            return True, ""
+        if base == "make" and len(parts) > 1 and parts[1] == "test":
+            return True, ""
+
+        return False, f"`{command}` is not on the verification allowlist"
     def create_simulation(
         self,
         snapshot: GraphSnapshot,
@@ -94,8 +164,18 @@ class ReplayEngine:
             # Step 2: Apply constraints
             self._apply_constraints(worktree_path, config.modified_constraints)
 
-            # Step 3: Run verification commands
+            # Step 3: Run verification commands (allowlist-enforced)
             for cmd in config.verification_commands:
+                allowed, reason = self.verify_command_allowed(cmd)
+                if not allowed:
+                    result.verification_results.append({
+                        "command": cmd,
+                        "exit_code": -1,
+                        "stdout": "",
+                        "stderr": f"Rejected by server-side allowlist: {reason}",
+                        "success": False,
+                    })
+                    continue
                 cmd_result = self._run_command(cmd, worktree_path)
                 result.verification_results.append(cmd_result)
 

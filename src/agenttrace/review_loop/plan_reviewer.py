@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
 from uuid import UUID, uuid4
 
 from agenttrace.review_loop.planner import ReviewPlan

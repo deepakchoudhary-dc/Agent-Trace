@@ -1,6 +1,5 @@
 """Tests for the event ledger — hash chain integrity, field tampering, and encrypted storage."""
 
-import json
 import sqlite3
 from pathlib import Path
 from uuid import uuid4
@@ -9,9 +8,6 @@ import pytest
 
 from agenttrace.models.events import (
     CommandEvent,
-    ConfidenceLevel,
-    EventBase,
-    EventType,
     FileMutationEvent,
     ToolRequestEvent,
 )

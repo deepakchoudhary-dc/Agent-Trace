@@ -1,10 +1,9 @@
 """Tests for the self-improving review loop."""
 
 from agenttrace.review_loop.loop import ReviewLoop
-from agenttrace.review_loop.planner import Planner, ReviewPlan
+from agenttrace.review_loop.planner import Planner
 from agenttrace.review_loop.reviewer import (
     ConventionReviewer,
-    ReviewVerdict,
     SecurityReviewer,
     SpecComplianceReviewer,
 )

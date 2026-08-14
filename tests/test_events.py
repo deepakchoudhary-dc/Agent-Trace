@@ -1,23 +1,18 @@
 """Tests for canonical event models and hash-chain integrity."""
 
-from datetime import datetime, timezone
 from uuid import uuid4
 
 from agenttrace.models.events import (
     ApprovalEvent,
-    CommandEvent,
     ConfidenceLevel,
     EventBase,
     EventType,
     FileMutationEvent,
-    GitEvent,
     InvocationEvent,
     NetworkEvent,
     PolicyFindingEvent,
     ProcessEvent,
-    TestResultEvent,
     ToolRequestEvent,
-    ToolResultEvent,
 )
 
 

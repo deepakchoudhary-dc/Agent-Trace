@@ -5,11 +5,10 @@ from uuid import uuid4
 from agenttrace.models.events import (
     CommandEvent,
     FileMutationEvent,
-    GitEvent,
     NetworkEvent,
 )
 from agenttrace.models.task_contract import TaskContract
-from agenttrace.security.policy import PolicyAction, PolicyEngine
+from agenttrace.security.policy import PolicyEngine
 
 
 class TestPolicyEngine:
@@ -125,3 +124,47 @@ class TestPolicyEngine:
         result = engine.evaluate(event)
         assert result.requires_approval
         assert any(r.rule_id == "script_execution" for r in result.triggered_rules)
+
+    def test_flag_state_change_to_external_host(self) -> None:
+        engine = self._make_engine()
+        event = NetworkEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="test",
+            destination_ip="8.8.8.8",
+            destination_port=443,
+            protocol="tcp",
+            http_method="POST",
+        )
+        result = engine.evaluate(event)
+        assert result.requires_approval
+        assert any(r.rule_id == "external_state_change" for r in result.triggered_rules)
+
+    def test_read_request_to_external_host_is_egress_only(self) -> None:
+        engine = self._make_engine()
+        event = NetworkEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="test",
+            destination_ip="8.8.8.8",
+            destination_port=443,
+            protocol="tcp",
+            http_method="GET",
+        )
+        result = engine.evaluate(event)
+        assert result.requires_approval  # new destination
+        assert not any(r.rule_id == "external_state_change" for r in result.triggered_rules)
+
+    def test_state_change_to_private_host_is_not_external(self) -> None:
+        engine = self._make_engine()
+        event = NetworkEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="test",
+            destination_ip="192.168.1.10",
+            destination_port=8080,
+            protocol="tcp",
+            http_method="POST",
+        )
+        result = engine.evaluate(event)
+        assert not any(r.rule_id == "external_state_change" for r in result.triggered_rules)

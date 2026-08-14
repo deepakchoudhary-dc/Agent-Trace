@@ -49,7 +49,8 @@ def _call_api(endpoint: str, method: str = "GET", data: dict[str, Any] | None = 
 
     try:
         with urllib.request.urlopen(req, data=body, timeout=2.0) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            payload = json.loads(resp.read().decode("utf-8"))
+            return payload if isinstance(payload, (dict, list)) else None
     except urllib.error.HTTPError as e:
         # Daemon reachable but returned an error — do NOT treat as success
         logger.debug("API %s %s -> HTTP %s", method, endpoint, e.code)
@@ -265,12 +266,12 @@ def gate(action_type: str, target: str, session_id: str | None, details: str | N
         "details": details_dict,
     })
 
-    if api_res:
+    if isinstance(api_res, dict):
         action = api_res["action"]
         reason = api_res["reason"]
         req_id = api_res.get("required_approval_id", "")
     else:
-        allowed, reason, req_id = daemon.evaluate_proposed_action(
+        _, reason, req_id = daemon.evaluate_proposed_action(
             target_sid, action_type, target, details_dict
         )
         action = "block" if reason.startswith("BLOCKED:") else ("pause" if req_id else "allow")
@@ -298,6 +299,208 @@ def gate(action_type: str, target: str, session_id: str | None, details: str | N
         title=title,
         border_style=style,
     ))
+
+
+# ---------------------------------------------------------------------------
+# Shield — mediated execution gate. Enforcement: the gate is evaluated BEFORE
+# the command runs. BLOCKED commands are refused outright; APPROVAL REQUIRED
+# commands pause for a scoped approval; ALLOWED commands execute. `install`
+# writes PATH wrappers so agent-launched tools route through this gate.
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def shield() -> None:
+    """Mediated execution gate — enforce policy BEFORE commands run."""
+
+
+def _shield_verdict(sid: UUID, command: str) -> tuple[str, str, str]:
+    """Evaluate a command against the gate. Returns (action, reason, approval_id)."""
+    api_res = _call_api(f"/sessions/{sid}/evaluate", method="POST", data={
+        "action_type": "command",
+        "target": command,
+        "details": {},
+    })
+    if isinstance(api_res, dict):
+        return (
+            api_res.get("action", "allow"),
+            api_res.get("reason", ""),
+            api_res.get("required_approval_id", ""),
+        )
+    daemon = _get_daemon()
+    _, reason, req_id = daemon.evaluate_proposed_action(sid, "command", command, {})
+    action = "block" if reason.startswith("BLOCKED:") else ("pause" if req_id else "allow")
+    return action, reason, req_id
+
+
+def _record_shield_approval(sid: UUID, command: str, reason: str, req_id: str) -> None:
+    """Record a scoped approval for the exact command the gate paused on."""
+    api_res = _call_api(f"/sessions/{sid}/approvals", method="POST", data={
+        "finding_id": req_id or "gate",
+        "approved": True,
+        "reason": reason,
+        "scope": "command",
+        "expiry_minutes": 60,
+        "affected_paths": [],
+        "affected_commands": [command],
+    })
+    if api_res:
+        return
+    daemon = _get_daemon()
+    mgr = daemon.get_approval_manager(sid)
+    if mgr:
+        mgr.record_approval(
+            finding_id=req_id or "gate",
+            approved=True,
+            reason=reason,
+            scope="command",
+            expiry_minutes=60,
+            affected_paths=[],
+            affected_commands=[command],
+        )
+
+
+@shield.command("check", context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
+@click.argument("session_id")
+@click.argument("command", nargs=-1, required=True)
+def shield_check(session_id: str, command: tuple[str, ...]) -> None:
+    """Evaluate a command against the gate and print the verdict WITHOUT running it."""
+    sid = UUID(session_id)
+    cmdline = " ".join(command)
+    action, reason, req_id = _shield_verdict(sid, cmdline)
+    style = {"block": "red", "pause": "yellow", "allow": "green"}[action]
+    lines = [f"Command: {cmdline}", f"Decision: {reason}"]
+    if req_id:
+        lines.append(f"Approval ID: {req_id}")
+    console.print(Panel(
+        "\n".join(lines),
+        title={"block": "⛔ SHIELD: BLOCKED", "pause": "🛑 SHIELD: APPROVAL REQUIRED", "allow": "✅ SHIELD: ALLOWED"}[action],
+        border_style=style,
+    ))
+    raise SystemExit(2 if action == "block" else 0)
+
+
+@shield.command("run", context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
+@click.argument("session_id")
+@click.argument("command", nargs=-1, required=True)
+@click.option("--approve-all", is_flag=True, help="Auto-approve pause verdicts (non-interactive).")
+def shield_run(session_id: str, command: tuple[str, ...], approve_all: bool) -> None:
+    """Evaluate then execute: BLOCK → refuse, APPROVAL REQUIRED → prompt (or
+    auto-approve with --approve-all), ALLOWED → run."""
+    sid = UUID(session_id)
+    cmdline = " ".join(command)
+
+    action, reason, req_id = _shield_verdict(sid, cmdline)
+
+    if action == "block":
+        console.print(f"[bold red]⛔ BLOCKED — not executing:[/bold red] {cmdline}")
+        console.print(f"[red]  {reason}[/red]")
+        raise SystemExit(2)
+
+    if action == "pause":
+        console.print(f"[yellow]🛑 APPROVAL REQUIRED:[/yellow] {cmdline}")
+        console.print(f"[yellow]  {reason}[/yellow]")
+        if not approve_all:
+            if not click.confirm("Approve and execute?", default=False):
+                console.print("[red]Denied — not executing.[/red]")
+                raise SystemExit(1)
+        _record_shield_approval(sid, cmdline, "granted via shield run", req_id)
+        console.print("[green]✓ Approval recorded for this exact command.[/green]")
+
+    import subprocess
+    proc = subprocess.call(list(command))
+    raise SystemExit(proc)
+
+
+@shield.command("install")
+@click.argument("session_id")
+@click.option("--workspace", type=click.Path(file_okay=False), default=None,
+              help="Workspace to install wrappers into (defaults to the session's workspace).")
+def shield_install(session_id: str, workspace: str | None) -> None:
+    """Write PATH wrapper scripts that route agent-launched tools through the gate.
+
+    Prepend the printed directory to the agent's PATH so every wrapped tool
+    (git, npm, python, curl, ...) is evaluated by the shield before running.
+    """
+    sid = UUID(session_id)
+
+    if workspace:
+        workspace_path = str(Path(workspace).resolve())
+    else:
+        daemon = _get_daemon()
+        session = daemon.get_session(sid)
+        if not session:
+            console.print("[red]Session not found. Pass --workspace explicitly.[/red]")
+            return
+        workspace_path = session.config.workspace_path
+
+    bin_dir = Path(workspace_path) / ".agenttrace" / "shield" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    tools = [
+        "git", "npm", "npx", "yarn", "pnpm", "python", "python3", "pip",
+        "pip3", "curl", "wget", "node", "bash", "sh", "docker", "kubectl",
+        "cargo", "go", "gem", "twine", "make", "tsc", "vite", "ssh", "scp",
+    ]
+    written: list[str] = []
+    for tool in tools:
+        bash_wrapper = bin_dir / tool
+        bash_wrapper.write_text(
+            f"#!/usr/bin/env bash\nexec agenttrace shield run {sid} -- \"$@\"\n",
+            encoding="utf-8",
+        )
+        cmd_wrapper = bin_dir / f"{tool}.cmd"
+        cmd_wrapper.write_text(
+            f"@echo off\r\nagenttrace shield run {sid} -- %*\r\n",
+            encoding="utf-8",
+        )
+        written.extend([str(bash_wrapper), str(cmd_wrapper)])
+
+    console.print(Panel(
+        f"[green]✓ {len(written)} shield wrappers installed[/green]\n\n"
+        f"Directory: {bin_dir}\n\n"
+        f"Prepend to the agent's PATH so its tools route through the gate:\n"
+        f"  [bold]export PATH={bin_dir}:$PATH[/bold]\n\n"
+        f"Wrapped tools: {', '.join(tools)}\n\n"
+        f"[dim]Each wrapper evaluates the command via the shield gate; BLOCKED \n"
+        f"commands are refused, APPROVAL REQUIRED commands pause for consent.[/dim]",
+        title="🛡 Shield — mediated execution",
+        border_style="green",
+    ))
+
+
+@main.command()
+@click.argument("session_id")
+def incidents(session_id: str) -> None:
+    """List correlated multi-stage incidents for a session."""
+    sid = UUID(session_id)
+
+    api_res = _call_api(f"/sessions/{sid}/incidents")
+    if isinstance(api_res, list):
+        incs = api_res
+    else:
+        daemon = _get_daemon()
+        incs = [
+            e.model_dump(mode="json")
+            for e in daemon.get_incidents(sid)
+        ]
+
+    if not incs:
+        console.print("[dim]No incidents correlated for this session.[/dim]")
+        return
+
+    for inc in incs:
+        severity = inc.get("severity", "medium")
+        style = {"critical": "red", "high": "yellow", "medium": "cyan"}.get(severity, "white")
+        console.print(Panel(
+            f"Type: {inc.get('incident_type', '?')}\n"
+            f"Severity: {severity}\n"
+            f"Title: {inc.get('title', '')}\n"
+            f"Description: {inc.get('description', '')}\n"
+            f"Evidence events: {', '.join(inc.get('related_events', [])) or '(none)'}",
+            title=f"🚨 Incident ({severity})",
+            border_style=style,
+        ))
 
 
 @main.command()

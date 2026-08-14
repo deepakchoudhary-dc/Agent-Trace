@@ -186,7 +186,7 @@ class EventLedger:
             "SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq FROM events WHERE session_id = ?",
             (str(session_id),),
         ).fetchone()
-        return row["next_seq"]  # type: ignore[return-value]
+        return int(row["next_seq"])
 
     def append_event(self, event: EventBase) -> str:
         """Append an event to the ledger, extending the hash chain.
@@ -340,7 +340,7 @@ class EventLedger:
         """
         if row["canonical_json_enc"]:
             return self._encryption.decrypt_str(row["canonical_json_enc"])
-        return row["canonical_json"]
+        return str(row["canonical_json"])
 
     # -- Complete cryptographic chain verification --
 

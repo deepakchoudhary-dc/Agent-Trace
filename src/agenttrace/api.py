@@ -59,6 +59,11 @@ class CreateSessionRequest(BaseModel):
     prohibited_paths: list[str] = Field(default_factory=lambda: [".env*", "*.pem", "*.key"])
     expected_tests: list[str] = Field(default_factory=list)
     allowed_tools: list[str] = Field(default_factory=list)
+    # Declared network boundary for the audited environment (sealed-eval
+    # detection). internet_access_allowed=False seals the env: any public
+    # egress is a critical finding + unexpected_egress incident.
+    internet_access_allowed: bool | None = None
+    allowed_destinations: list[str] = Field(default_factory=list)
 
 
 class CreateSessionResponse(BaseModel):
@@ -157,6 +162,8 @@ async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
             prohibited_paths=req.prohibited_paths,
             expected_tests=req.expected_tests,
             allowed_tools=req.allowed_tools,
+            internet_access_allowed=req.internet_access_allowed,
+            allowed_destinations=req.allowed_destinations,
         )
     except Exception as e:
         logger.exception("Failed to create session: %s", e)
@@ -234,7 +241,7 @@ async def verify_chain(session_id: UUID) -> VerifyResponse:
         raise HTTPException(status_code=404, detail="Session not found")
 
     is_valid, error_msg = daemon._ledger.verify_chain(session_id)
-    event_count = session.event_count if session else stored.get("event_count", 0)
+    event_count = session.event_count if session else (stored or {}).get("event_count", 0)
     last_hash = daemon._ledger.get_last_hash(session_id)
 
     return VerifyResponse(
@@ -423,6 +430,15 @@ async def get_graph(session_id: UUID) -> dict[str, Any]:
     return graph.to_dict()
 
 
+@app.get("/sessions/{session_id}/incidents")
+async def get_incidents(session_id: UUID) -> list[dict[str, Any]]:
+    """List correlated multi-stage incidents for a session (evidence-backed)."""
+    if not daemon.get_session(session_id) and not daemon._ledger.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    incidents = daemon.get_incidents(session_id)
+    return [e.model_dump(mode="json") for e in incidents]
+
+
 @app.get("/sessions/{session_id}/report")
 async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
     """Generate a verified, cryptographically sealed forensic audit report."""
@@ -430,10 +446,31 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
     events = daemon._ledger.query_events(session_id)
     findings = daemon.get_findings(session_id)
     approvals = daemon._ledger.get_approvals(session_id)
+    incidents = daemon.get_incidents(session_id)
     last_hash = daemon._ledger.get_last_hash(session_id)
 
+    # Reasoning trail — the model's own thinking around risky actions, from
+    # adapter-captured context-boundary events. This is the "why" evidence
+    # (Opus rationalizing a real target as part of the exercise; Mythos
+    # convincing itself it was still in a simulation).
+    reasoning_trail: list[dict[str, Any]] = []
+    for evt in events:
+        if getattr(evt, "event_type", None) == EventType.CONTEXT_BOUNDARY:
+            reasoning = evt.payload.get("reasoning") or ""
+            response_text = evt.payload.get("response_text") or ""
+            excerpt = reasoning or response_text
+            if excerpt:
+                reasoning_trail.append({
+                    "event_id": str(evt.event_id),
+                    "timestamp": evt.timestamp.isoformat(),
+                    "kind": evt.payload.get("reasoning_kind", "thinking"),
+                    "excerpt": str(excerpt)[:500],
+                })
+
     manifest = {
-        "report_id": str(UUID(int=hashlib.sha256(f"{session_id}:{last_hash}".encode()).digest()[:16])),
+        "report_id": str(UUID(int=int.from_bytes(
+            hashlib.sha256(f"{session_id}:{last_hash}".encode()).digest()[:16], "big"
+        ))),
         "session_id": str(session_id),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "integrity_status": "TAMPER_VERIFIED" if is_valid else "TAMPER_DETECTED",
@@ -442,6 +479,8 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
         "event_count": len(events),
         "findings_count": len(findings),
         "approvals_count": len(approvals),
+        "incidents_count": len(incidents),
+        "reasoning_trail": reasoning_trail,
         "findings_summary": [
             {
                 "finding_id": str(f.event_id),
@@ -450,6 +489,16 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
                 "description": getattr(f, "description", ""),
             }
             for f in findings
+        ],
+        "incidents_summary": [
+            {
+                "incident_id": str(i.event_id),
+                "incident_type": getattr(i, "incident_type", "incident"),
+                "severity": getattr(i, "severity", "medium"),
+                "title": getattr(i, "title", ""),
+                "related_events": getattr(i, "related_events", []),
+            }
+            for i in incidents
         ],
     }
 
@@ -467,6 +516,20 @@ async def run_simulation(session_id: UUID, req: SimulationRequest) -> dict[str, 
     session = daemon.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Server-side allowlist: never execute arbitrary API-supplied command text
+    rejected = [
+        cmd for cmd in req.verification_commands
+        if not ReplayEngine.verify_command_allowed(cmd)[0]
+    ]
+    if rejected:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Verification commands not on the server-side allowlist",
+                "commands": rejected,
+            },
+        )
 
     graph = daemon.get_graph(session_id)
     if not graph:

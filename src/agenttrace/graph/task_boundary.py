@@ -10,10 +10,7 @@ import logging
 import re
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any
-from uuid import UUID
 
-from agenttrace.models.events import ConfidenceLevel, EventBase, PolicyFindingEvent
 from agenttrace.models.task_contract import (
     DriftType,
     RiskLevel,
@@ -38,6 +35,64 @@ _NETWORK_COMMANDS = {
     "curl", "wget", "ssh", "scp", "ftp",
     "invoke-webrequest", "invoke-restmethod",
 }
+
+# Containment-evasion patterns from the 2025–26 sandbox-escape case studies:
+# path tricks (/proc/self/root/...), direct dynamic-linker invocation
+# (ld-linux.so.2, ld.so — loads code via mmap, bypassing execve gates),
+# and explicit sandbox-disable flags.
+_SANDBOX_EVASION_PATTERNS = [
+    re.compile(r"/proc/self/root", re.IGNORECASE),
+    re.compile(r"\bld-linux(?:-x86-64)?\.so\.2?\b", re.IGNORECASE),
+    re.compile(r"\bld\.so(?:\.\d+)?\b", re.IGNORECASE),
+    re.compile(r"--no-sandbox", re.IGNORECASE),
+    re.compile(r"--disable-sandbox", re.IGNORECASE),
+    re.compile(r"-no-sandbox", re.IGNORECASE),
+    re.compile(r"--unsafe-perm", re.IGNORECASE),
+]
+
+# Package-manager / registry operations — the supply-chain attack surface
+# (malicious PyPI package incident, dependency-manifest tampering).
+_PACKAGE_OPERATION_RE = re.compile(
+    r"""(
+        ^(?:pip(?:3)?|python|python3|py|conda)\s+(?:-m\s+pip\s+)?(?:install|uninstall)\b
+        |^(?:npm|yarn|pnpm)\s+(?:install|add|i|ci|publish)\b
+        |^cargo\s+(?:add|install|publish)\b
+        |^gem\s+(?:install|push)\b
+        |^twine\s+upload\b
+        |^go\s+get\b
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# References to credential material OUTSIDE the workspace — the read side of
+# the credential-exfiltration chain (Opus 4.7 credential theft; Claude Code
+# CLI shell-injection CVEs).
+_CREDENTIAL_PATH_RE = re.compile(
+    r"""(
+        /etc/(?:passwd|shadow|ssh/|ssl/private|git-credentials)
+        |(?:~|%USERPROFILE%|%HOME%)[\\/]\.(?:ssh|aws|gnupg|kube|docker)(?:[\\/]|$)
+        |\.git-credentials
+        |C:[\\/]Windows[\\/]System32[\\/]config
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# HF intrusion kill-chain patterns (July 2026 technical timeline): cloud
+# metadata endpoints (the first credential-gathering step of the pivot) and
+# Kubernetes service-account token reads (the exact first commands of the
+# in-cluster lateral movement).
+_CLOUD_METADATA_RE = re.compile(r"\b169\.254\.169\.254\b", re.IGNORECASE)
+_K8S_SA_PATH_RE = re.compile(r"/var/run/secrets/kubernetes\.io/", re.IGNORECASE)
+
+# Payload staging / dropper patterns: obfuscated exec of packed blobs and
+# download-then-execute chains (the HF dropper phase: gzip+base64 exec,
+# staged downloads to /tmp, chmod +x).
+_STAGING_PATTERNS = [
+    re.compile(r"exec\s*\(\s*gzip\.decompress\s*\(\s*base64\.b64decode", re.IGNORECASE),
+    re.compile(r"base64\s+-d.*\|.*(?:ba)?sh\b", re.IGNORECASE),
+    re.compile(r"(?:curl|wget)\s+.*-o\s+/tmp/\S+", re.IGNORECASE),
+    re.compile(r"chmod\s+\+x\s+/tmp/\S+", re.IGNORECASE),
+]
 
 
 class TaskBoundaryEngine:
@@ -131,6 +186,95 @@ class TaskBoundaryEngine:
                 affected_command=command,
                 confidence=0.9,
                 evidence=[f"Command '{base_cmd}' performs network operations"],
+            ))
+
+        # Check for sandbox/containment evasion (casestudy Part 5A)
+        if any(pat.search(cmd_lower) for pat in _SANDBOX_EVASION_PATTERNS):
+            results.append(ScopeDriftResult(
+                contract_id=self.contract.contract_id,
+                drift_type=DriftType.SANDBOX_EVASION,
+                severity="critical",
+                description=f"Sandbox/containment evasion pattern detected: {command}",
+                affected_command=command,
+                confidence=0.95,
+                evidence=[
+                    "Matches known evasion patterns: path tricks, dynamic-linker "
+                    "invocation, or sandbox-disable flags"
+                ],
+            ))
+
+        # Check for package-manager / registry operations (supply chain)
+        if _PACKAGE_OPERATION_RE.match(cmd_lower):
+            results.append(ScopeDriftResult(
+                contract_id=self.contract.contract_id,
+                drift_type=DriftType.UNEXPECTED_DEPENDENCY,
+                severity="high",
+                description=f"Package/registry operation detected: {command}",
+                affected_command=command,
+                confidence=0.9,
+                evidence=[
+                    "Installing/publishing dependencies changes the supply chain "
+                    "and can pull in untrusted code"
+                ],
+            ))
+
+        # Check for reads of credential material outside the workspace
+        if _CREDENTIAL_PATH_RE.search(command):
+            results.append(ScopeDriftResult(
+                contract_id=self.contract.contract_id,
+                drift_type=DriftType.CREDENTIAL_ACCESS,
+                severity="critical",
+                description="Command references credential material outside the workspace",
+                affected_command=command,
+                confidence=0.92,
+                evidence=["Sensitive path (SSH keys, cloud creds, /etc shadow) referenced"],
+            ))
+
+        # Cloud metadata endpoint — the HF intrusion's credential-gathering
+        # step (the pivot read the pod's IAM role from 169.254.169.254)
+        if _CLOUD_METADATA_RE.search(command):
+            results.append(ScopeDriftResult(
+                contract_id=self.contract.contract_id,
+                drift_type=DriftType.CREDENTIAL_ACCESS,
+                severity="critical",
+                description="Command accesses the cloud metadata service (169.254.169.254)",
+                affected_command=command,
+                confidence=0.95,
+                evidence=[
+                    "Cloud metadata endpoints expose instance IAM credentials — "
+                    "the first credential-gathering step of the HF intrusion pivot"
+                ],
+            ))
+
+        # Kubernetes service-account token reads — in-cluster credential theft
+        if _K8S_SA_PATH_RE.search(command):
+            results.append(ScopeDriftResult(
+                contract_id=self.contract.contract_id,
+                drift_type=DriftType.CREDENTIAL_ACCESS,
+                severity="critical",
+                description="Command reads Kubernetes service-account credentials",
+                affected_command=command,
+                confidence=0.95,
+                evidence=[
+                    "/var/run/secrets/kubernetes.io/ holds the pod's projected "
+                    "service-account token — reading it is the first step of "
+                    "in-cluster lateral movement (HF intrusion)"
+                ],
+            ))
+
+        # Payload staging / dropper chains
+        if any(pat.search(command) for pat in _STAGING_PATTERNS):
+            results.append(ScopeDriftResult(
+                contract_id=self.contract.contract_id,
+                drift_type=DriftType.PAYLOAD_STAGING,
+                severity="high",
+                description="Payload staging / dropper pattern detected",
+                affected_command=command,
+                confidence=0.9,
+                evidence=[
+                    "Packed/obfuscated execution or download-then-execute chain — "
+                    "the dropper pattern from the HF intrusion campaign"
+                ],
             ))
 
         # Check allowed tools

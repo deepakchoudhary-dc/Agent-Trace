@@ -6,7 +6,6 @@ simultaneously to ensure seamless coverage across all developer tools.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from uuid import UUID
 

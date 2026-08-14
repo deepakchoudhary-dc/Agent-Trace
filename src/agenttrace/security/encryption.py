@@ -49,8 +49,8 @@ def _win32_dpapi_protect(data: bytes, description: str = "AgentTrace Master Key"
         return data
 
     try:
-        crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
 
         data_in = _DATA_BLOB(
             cbData=len(data),
@@ -93,8 +93,8 @@ def _win32_dpapi_unprotect(data: bytes) -> bytes:
         return data
 
     try:
-        crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
 
         data_in = _DATA_BLOB(
             cbData=len(data),

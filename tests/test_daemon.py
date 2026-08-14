@@ -9,10 +9,9 @@ from agenttrace.models.events import (
     CommandEvent,
     FileMutationEvent,
     InvocationEvent,
+    NetworkEvent,
     ToolRequestEvent,
-    ToolResultEvent,
 )
-from agenttrace.models.graph import EdgeType, NodeType
 from agenttrace.models.session import AgentType, SessionStatus
 
 
@@ -244,3 +243,44 @@ async def test_approvals_survive_restart(tmp_path: Path) -> None:
     allowed, _, _ = daemon2.evaluate_proposed_action(sid, "command", "rm -rf /tmp/scratch")
     assert allowed is True
     await daemon2.stop()
+
+
+@pytest.mark.asyncio
+async def test_incident_correlation_wired(tmp_path: Path) -> None:
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    session = await daemon.create_session(
+        workspace_path=str(tmp_path),
+        task_description="Incident test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+
+    # Credential-bearing command → credential finding
+    cmd = CommandEvent(
+        session_id=sid,
+        actor_id="agent",
+        source_adapter="terminal",
+        command="export DB_PASSWORD=supersecretvalue123",
+    )
+    await daemon.ingest_event(cmd)
+
+    # State-changing request to a public host shortly after
+    net = NetworkEvent(
+        session_id=sid,
+        actor_id="agent",
+        source_adapter="network_observer",
+        destination_ip="8.8.8.8",
+        destination_port=443,
+        protocol="tcp",
+        http_method="POST",
+    )
+    await daemon.ingest_event(net)
+
+    incidents = daemon.get_incidents(sid)
+    incident_types = {getattr(i, "incident_type", "") for i in incidents}
+    assert {"credential_exfiltration", "external_state_change"} & incident_types, (
+        f"expected a correlated incident, got {incident_types}"
+    )
+
+    await daemon.stop()
