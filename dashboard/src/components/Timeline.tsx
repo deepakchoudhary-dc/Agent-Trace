@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { TimelineEvent } from '../types';
 import {
   Play,
@@ -9,7 +9,11 @@ import {
   Terminal,
   Shield,
   Activity,
-  ChevronRight,
+  FileEdit,
+  Globe,
+  AlertTriangle,
+  CheckCircle2,
+  GitCommit,
 } from 'lucide-react';
 
 interface TimelineProps {
@@ -17,9 +21,29 @@ interface TimelineProps {
   onSelectEvent?: (event: TimelineEvent) => void;
 }
 
+const getEventIcon = (eventType: string) => {
+  const t = eventType.toLowerCase();
+  if (t.includes('invocation') || t.includes('session')) return <Cpu size={12} color="#ffffff" />;
+  if (t.includes('tool')) return <Activity size={12} color="#ffffff" />;
+  if (t.includes('command') || t.includes('process')) return <Terminal size={12} color="#ffffff" />;
+  if (t.includes('file') || t.includes('mutation') || t.includes('git')) return <FileEdit size={12} color="#ffffff" />;
+  if (t.includes('network')) return <Globe size={12} color="#ffffff" />;
+  if (t.includes('finding') || t.includes('incident')) return <AlertTriangle size={12} color="#ffffff" />;
+  if (t.includes('test') || t.includes('build')) return <CheckCircle2 size={12} color="#ffffff" />;
+  if (t.includes('approval')) return <Shield size={12} color="#ffffff" />;
+  return <GitCommit size={12} color="#a1a1aa" />;
+};
+
+const getActorIcon = (actorId: string) => {
+  if (actorId.toLowerCase().includes('user')) return <User size={14} color="#ffffff" />;
+  if (/(codex|claude|copilot|agent)/i.test(actorId)) return <Cpu size={14} color="#ffffff" />;
+  if (/(terminal|process)/i.test(actorId)) return <Terminal size={14} color="#ffffff" />;
+  return <Shield size={14} color="#ffffff" />;
+};
+
 export const Timeline: React.FC<TimelineProps> = ({ events, onSelectEvent }) => {
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentIndex, setCurrentIndex] = useState(Math.max(0, events.length - 1));
+  const [currentIndex, setCurrentIndex] = useState(0);
   const [speed, setSpeed] = useState(1);
 
   // Sync index when events array updates
@@ -47,30 +71,24 @@ export const Timeline: React.FC<TimelineProps> = ({ events, onSelectEvent }) => 
   }, [isPlaying, events.length, speed]);
 
   // Group events by actor lane
-  const actors = Array.from(new Set(events.map((e) => e.actor_id)));
-
-  const getActorIcon = (actorId: string) => {
-    if (actorId.includes('user')) return <User size={14} color="#ffffff" />;
-    if (actorId.includes('codex') || actorId.includes('claude') || actorId.includes('copilot') || actorId.includes('agent'))
-      return <Cpu size={14} color="#ffffff" />;
-    if (actorId.includes('terminal') || actorId.includes('process'))
-      return <Terminal size={14} color="#ffffff" />;
-    return <Shield size={14} color="#ffffff" />;
-  };
+  const actors = useMemo(() => Array.from(new Set(events.map((e) => e.actor_id))), [events]);
 
   const safeIndex = events.length > 0 ? Math.min(currentIndex, events.length - 1) : 0;
   const visibleEvents = events.slice(0, safeIndex + 1);
+  const progress = events.length > 0 ? ((safeIndex + 1) / events.length) * 100 : 0;
 
   if (events.length === 0) {
     return (
-      <div className="glass-panel" style={{ margin: '0 16px 16px 16px', height: 'calc(100vh - 120px)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px', color: 'var(--text-dim)' }}>
-        <Activity size={36} color="var(--border-dim)" />
-        <h3 className="font-heading" style={{ fontSize: '15px', color: 'var(--text-muted)' }}>
-          No Events Ingested in Current Session
-        </h3>
-        <p style={{ fontSize: '12px' }}>
-          Execute commands or start an agent audit to capture hash-chained events.
-        </p>
+      <div className="glass-panel" style={{ margin: '0 16px 16px 16px', height: 'calc(100vh - 120px)' }}>
+        <div className="empty-state">
+          <Activity size={36} color="var(--border-medium)" />
+          <h3 className="font-heading" style={{ fontSize: '15px', color: 'var(--text-muted)' }}>
+            No Events Ingested in Current Session
+          </h3>
+          <p style={{ fontSize: '12px' }}>
+            Execute commands or start an agent audit to capture hash-chained events.
+          </p>
+        </div>
       </div>
     );
   }
@@ -78,12 +96,11 @@ export const Timeline: React.FC<TimelineProps> = ({ events, onSelectEvent }) => 
   return (
     <div className="glass-panel" style={{ margin: '0 16px 16px 16px', display: 'flex', flexDirection: 'column', height: 'calc(100vh - 120px)', overflow: 'hidden' }}>
       {/* Playback Controls Header */}
-      <div style={{ padding: '10px 18px', borderBottom: '1px solid var(--border-dim)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '14px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+      <div className="panel-header" style={{ flexWrap: 'wrap' }}>
+        <div className="flex" style={{ gap: '10px' }}>
           <button
             onClick={() => setIsPlaying(!isPlaying)}
-            className="btn btn-primary"
-            style={{ padding: '5px 12px', fontSize: '11px' }}
+            className="btn btn-primary btn-sm"
             aria-label={isPlaying ? 'Pause timeline playback' : 'Play timeline'}
           >
             {isPlaying ? <Pause size={13} /> : <Play size={13} />}
@@ -95,30 +112,23 @@ export const Timeline: React.FC<TimelineProps> = ({ events, onSelectEvent }) => 
               setIsPlaying(false);
               setCurrentIndex(0);
             }}
-            className="btn btn-secondary"
+            className="btn btn-secondary btn-icon"
             title="Reset to beginning"
-            style={{ padding: '5px 8px' }}
             aria-label="Reset timeline to start"
           >
             <RotateCcw size={13} />
           </button>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '3px', background: 'var(--bg-input)', padding: '2px 5px', borderRadius: '4px', border: '1px solid var(--border-dim)' }}>
-            <span style={{ fontSize: '10.5px', color: 'var(--text-muted)' }}>Speed:</span>
+          <div className="seg">
+            <span className="flex" style={{ gap: '3px', padding: '0 4px', fontSize: '10.5px', color: 'var(--text-muted)' }}>
+              Speed
+            </span>
             {[1, 2, 4].map((s) => (
               <button
                 key={s}
                 onClick={() => setSpeed(s)}
-                style={{
-                  background: speed === s ? '#ffffff' : 'transparent',
-                  color: speed === s ? '#000000' : 'var(--text-main)',
-                  border: 'none',
-                  borderRadius: '3px',
-                  padding: '2px 5px',
-                  fontSize: '10.5px',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                }}
+                className={`seg-btn ${speed === s ? 'seg-btn--active' : ''}`}
+                aria-pressed={speed === s}
               >
                 {s}x
               </button>
@@ -127,9 +137,9 @@ export const Timeline: React.FC<TimelineProps> = ({ events, onSelectEvent }) => 
         </div>
 
         {/* Timeline Scrubber */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1, maxWidth: '440px' }}>
-          <span className="font-mono" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-            Step {safeIndex + 1} / {events.length}
+        <div className="flex" style={{ gap: '10px', flex: 1, maxWidth: '460px', minWidth: '220px' }}>
+          <span className="font-mono" style={{ fontSize: '11px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+            {safeIndex + 1} / {events.length}
           </span>
           <input
             type="range"
@@ -141,34 +151,28 @@ export const Timeline: React.FC<TimelineProps> = ({ events, onSelectEvent }) => 
               setIsPlaying(false);
               setCurrentIndex(parseInt(e.target.value, 10));
             }}
-            style={{
-              flex: 1,
-              accentColor: '#ffffff',
-              cursor: 'pointer',
-            }}
+            style={{ flex: 1, ['--range-progress' as string]: `${progress}%` }}
           />
         </div>
       </div>
 
       {/* Actor Lanes & Events */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+      <div className="scroll-thin" style={{ flex: 1, overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
         {actors.map((actor) => {
           const actorEvents = visibleEvents.filter((e) => e.actor_id === actor);
           if (actorEvents.length === 0) return null;
 
           return (
-            <div key={actor} style={{ background: '#09090b', padding: '14px', borderRadius: '8px', border: '1px solid var(--border-dim)' }}>
+            <div key={actor} style={{ background: 'var(--bg-card-solid)', padding: '14px', borderRadius: '10px', border: '1px solid var(--border-dim)' }}>
               {/* Actor Header */}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div className="flex-between" style={{ marginBottom: '10px' }}>
+                <div className="flex" style={{ gap: '8px' }}>
                   {getActorIcon(actor)}
-                  <span className="font-heading" style={{ fontSize: '13px', fontWeight: 600, color: '#ffffff' }}>
+                  <span className="font-heading" style={{ fontSize: '13px', fontWeight: 650, color: '#ffffff' }}>
                     {actor}
                   </span>
                 </div>
-                <span className="badge badge-medium" style={{ fontSize: '9px' }}>
-                  {actorEvents.length} events
-                </span>
+                <span className="chip">{actorEvents.length} events</span>
               </div>
 
               {/* Event Cards in Lane */}
@@ -185,37 +189,30 @@ export const Timeline: React.FC<TimelineProps> = ({ events, onSelectEvent }) => 
                         onSelectEvent && onSelectEvent(evt);
                       }
                     }}
-                    style={{
-                      background: 'var(--bg-card)',
-                      border: '1px solid var(--border-dim)',
-                      borderRadius: '6px',
-                      padding: '8px 10px',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: '4px',
-                      cursor: 'pointer',
-                    }}
+                    className="card card--clickable"
+                    style={{ padding: '9px 11px', display: 'flex', flexDirection: 'column', gap: '5px' }}
                   >
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                      <span className="font-mono" style={{ fontSize: '10px', color: '#ffffff', fontWeight: 600 }}>
-                        {evt.event_type.toUpperCase()}
+                    <div className="flex-between">
+                      <span className="flex" style={{ gap: '6px' }}>
+                        {getEventIcon(evt.event_type)}
+                        <span className="font-mono" style={{ fontSize: '9.5px', color: '#ffffff', fontWeight: 650 }}>
+                          {evt.event_type.toUpperCase()}
+                        </span>
                       </span>
-                      <span style={{ fontSize: '10px', color: 'var(--text-dim)' }}>
+                      <span style={{ fontSize: '9.5px', color: 'var(--text-dim)', fontVariantNumeric: 'tabular-nums' }}>
                         {new Date(evt.timestamp).toLocaleTimeString()}
                       </span>
                     </div>
 
-                    <div className="font-mono" style={{ fontSize: '10px', color: 'var(--text-muted)', wordBreak: 'break-all' }}>
-                      Hash: {evt.event_hash.slice(0, 16)}...
+                    <div className="font-mono" style={{ fontSize: '9.5px', color: 'var(--text-muted)', wordBreak: 'break-all' }}>
+                      {evt.event_hash.slice(0, 16)}…
                     </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '2px' }}>
-                      <span className="badge badge-high" style={{ fontSize: '8px', padding: '1px 4px' }}>
+                    <div className="flex-between" style={{ marginTop: '2px' }}>
+                      <span className="badge badge-high" style={{ fontSize: '7.5px', padding: '1px 5px' }}>
                         Seq #{evt.seq}
                       </span>
-                      <span style={{ fontSize: '9.5px', color: 'var(--text-dim)' }}>
-                        {evt.source_adapter}
-                      </span>
+                      <span style={{ fontSize: '9px', color: 'var(--text-dim)' }}>{evt.source_adapter}</span>
                     </div>
                   </div>
                 ))}

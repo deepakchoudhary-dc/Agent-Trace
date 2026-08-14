@@ -103,8 +103,8 @@ class TestEventLedger:
         is_valid, error = ledger.verify_chain(session_id)
         assert is_valid, f"Chain should be verified: {error}"
 
-    def test_tamper_detection_on_field_modification(self, ledger: EventLedger, session_id) -> None:
-        """Adversarial test: direct database tampering of any field breaks chain verification."""
+    def test_tamper_detection_on_envelope_hash(self, ledger: EventLedger, session_id) -> None:
+        """Adversarial test: rewriting the stored envelope tamper hash is detected."""
         ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
 
         event = FileMutationEvent(
@@ -116,20 +116,48 @@ class TestEventLedger:
         )
         ledger.append_event(event)
 
-        # Directly tamper with canonical_json in SQLite
-        db_path = ledger._db_path
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute("SELECT canonical_json FROM events WHERE session_id = ?", (str(session_id),)).fetchone()
-        data = json.loads(row[0])
-        data["file_path"] = "attacker_modified.py"  # Tamper field!
-        conn.execute("UPDATE events SET canonical_json = ? WHERE session_id = ?", (json.dumps(data), str(session_id)))
+        # Tamper the stored envelope hash column (an attacker with DB write
+        # access rewrites it to match their forged envelope)
+        conn = sqlite3.connect(str(ledger._db_path))
+        conn.execute(
+            "UPDATE events SET canonical_json_hash = ? WHERE session_id = ?",
+            ("0" * 64, str(session_id)),
+        )
         conn.commit()
         conn.close()
 
-        # Chain verification must detect the tamper
         is_valid, error = ledger.verify_chain(session_id)
         assert not is_valid
-        assert "Cryptographic tamper detected" in error
+        assert "Envelope tamper detected" in error
+
+    def test_tamper_detection_on_encrypted_envelope(self, ledger: EventLedger, session_id) -> None:
+        """Adversarial test: flipping bytes in the encrypted envelope is detected."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+
+        event = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="rm -rf --no-preserve-root",
+        )
+        ledger.append_event(event)
+
+        conn = sqlite3.connect(str(ledger._db_path))
+        row = conn.execute(
+            "SELECT canonical_json_enc FROM events WHERE session_id = ?", (str(session_id),),
+        ).fetchone()
+        assert row is not None and row[0] is not None
+        tampered = bytearray(row[0])
+        tampered[-1] ^= 0xFF  # AES-GCM tag will fail
+        conn.execute(
+            "UPDATE events SET canonical_json_enc = ? WHERE session_id = ?",
+            (bytes(tampered), str(session_id)),
+        )
+        conn.commit()
+        conn.close()
+
+        is_valid, error = ledger.verify_chain(session_id)
+        assert not is_valid
 
     def test_tamper_detection_on_sequence_discontinuity(self, ledger: EventLedger, session_id) -> None:
         """Adversarial test: sequence skip or deletion is detected."""
@@ -154,6 +182,9 @@ class TestEventLedger:
         """Verify that raw database rows store ciphertext and no plaintext secrets."""
         secret_task = "Super secret project description with key API_KEY_999"
         secret_reason = "Approved because token secret_xyz is verified"
+        # Deliberately NOT redactable by the redactor's regexes, so this assertion
+        # proves at-rest ENCRYPTION (not redaction) hides it from the raw DB
+        secret_command = "echo DB_PASSWORD_xyz > /tmp/creds.txt"
 
         ledger.create_session(session_id, '{"env": "secret"}', task_desc=secret_task)
         ledger.store_approval(
@@ -164,11 +195,22 @@ class TestEventLedger:
             reason=secret_reason,
             scope="secret_path",
         )
+        # A command event whose full envelope would previously have been plaintext
+        ledger.append_event(CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command=secret_command,
+        ))
 
         # Read raw SQLite bytes directly without ledger abstraction
         conn = sqlite3.connect(str(ledger._db_path))
         session_row = conn.execute("SELECT config_enc, task_desc_enc FROM sessions WHERE session_id = ?", (str(session_id),)).fetchone()
         approval_row = conn.execute("SELECT reason_enc, scope_enc FROM approvals WHERE session_id = ?", (str(session_id),)).fetchone()
+        event_row = conn.execute(
+            "SELECT canonical_json, canonical_json_enc, canonical_json_hash FROM events WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
         conn.close()
 
         # Plaintext secrets must NOT be in the raw DB bytes
@@ -177,7 +219,22 @@ class TestEventLedger:
         assert b"API_KEY_999" not in session_row[1]
         assert b"secret_xyz" not in approval_row[0]
 
-        # But decrypted getters should return sanitized plaintext
+        # Event envelopes are encrypted at rest: no plaintext column, encrypted blob,
+        # and a 64-hex tamper hash — with no plaintext command anywhere in the DB
+        # (check both the main DB file and the WAL, where un-checkpointed rows live)
+        assert event_row[0] == ""  # legacy plaintext column is intentionally empty
+        assert isinstance(event_row[1], bytes)
+        assert len(event_row[2]) == 64
+        raw_bytes = open(ledger._db_path, "rb").read()
+        wal_path = Path(str(ledger._db_path) + "-wal")
+        if wal_path.exists():
+            raw_bytes += wal_path.read_bytes()
+        assert secret_command.encode() not in raw_bytes
+
+        # But decrypted getters should return the plaintext round-trip
         s = ledger.get_session(session_id)
         assert s is not None
         assert "Super secret project" in s["task_desc"]
+
+        events = ledger.query_events(session_id)
+        assert any(isinstance(e, CommandEvent) and e.command == secret_command for e in events)

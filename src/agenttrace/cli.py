@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -35,6 +36,7 @@ from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.models.session import AgentType
 
 console = Console()
+logger = logging.getLogger(__name__)
 _DEFAULT_API_URL = "http://127.0.0.1:8000"
 
 
@@ -48,6 +50,10 @@ def _call_api(endpoint: str, method: str = "GET", data: dict[str, Any] | None = 
     try:
         with urllib.request.urlopen(req, data=body, timeout=2.0) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # Daemon reachable but returned an error — do NOT treat as success
+        logger.debug("API %s %s -> HTTP %s", method, endpoint, e.code)
+        return None
     except (urllib.error.URLError, TimeoutError, OSError):
         return None
 
@@ -171,6 +177,15 @@ def approve(finding_id: str, scope: str, reason: str, session_id: str | None, ex
 
     target_sid = UUID(session_id) if session_id else sessions[0].session_id
 
+    # Interpret --scope as a path or command pattern so the enforcement gate
+    # can honor the approval for the same path/command later
+    affected_paths: list[str] = []
+    affected_commands: list[str] = []
+    if scope and any(ch in scope for ch in ("/", "\\", ".")):
+        affected_paths.append(scope)
+    elif scope:
+        affected_commands.append(scope)
+
     # Record approval
     api_res = _call_api(f"/sessions/{target_sid}/approvals", method="POST", data={
         "finding_id": finding_id,
@@ -178,6 +193,8 @@ def approve(finding_id: str, scope: str, reason: str, session_id: str | None, ex
         "reason": reason,
         "scope": scope,
         "expiry_minutes": expiry,
+        "affected_paths": affected_paths,
+        "affected_commands": affected_commands,
     })
 
     if not api_res:
@@ -190,6 +207,8 @@ def approve(finding_id: str, scope: str, reason: str, session_id: str | None, ex
                 reason=reason,
                 scope=scope,
                 expiry_minutes=expiry,
+                affected_paths=affected_paths,
+                affected_commands=affected_commands,
             )
 
     console.print(Panel(
@@ -201,6 +220,83 @@ def approve(finding_id: str, scope: str, reason: str, session_id: str | None, ex
         f"Expires: {expiry} minutes",
         title="🔐 Approval Gate",
         border_style="green",
+    ))
+
+
+@main.command()
+@click.argument("action_type", type=click.Choice(["file_mutation", "command", "network", "git"]))
+@click.argument("target")
+@click.option(
+    "--session-id",
+    type=str,
+    default=None,
+    help="Target session ID (optional if only one session exists).",
+)
+@click.option(
+    "--details", "-d",
+    type=str,
+    default=None,
+    help="Optional JSON details, e.g. '{\"mutation_type\": \"delete\"}'.",
+)
+def gate(action_type: str, target: str, session_id: str | None, details: str | None) -> None:
+    """Evaluate a proposed action against the policy gate BEFORE running it.
+
+    Returns ALLOWED, APPROVAL REQUIRED (pause), or BLOCKED.
+    """
+    details_dict: dict[str, Any] = {}
+    if details:
+        try:
+            details_dict = json.loads(details)
+        except json.JSONDecodeError:
+            console.print("[red]--details must be valid JSON[/red]")
+            return
+
+    daemon = _get_daemon()
+    sessions = daemon.list_sessions()
+    if not sessions:
+        console.print("[red]No sessions found in local ledger[/red]")
+        return
+
+    target_sid = UUID(session_id) if session_id else sessions[0].session_id
+
+    api_res = _call_api(f"/sessions/{target_sid}/evaluate", method="POST", data={
+        "action_type": action_type,
+        "target": target,
+        "details": details_dict,
+    })
+
+    if api_res:
+        action = api_res["action"]
+        reason = api_res["reason"]
+        req_id = api_res.get("required_approval_id", "")
+    else:
+        allowed, reason, req_id = daemon.evaluate_proposed_action(
+            target_sid, action_type, target, details_dict
+        )
+        action = "block" if reason.startswith("BLOCKED:") else ("pause" if req_id else "allow")
+
+    if action == "block":
+        title = "⛔ GATE: BLOCKED"
+        style = "red"
+    elif action == "pause":
+        title = "🛑 GATE: APPROVAL REQUIRED"
+        style = "yellow"
+    else:
+        title = "✅ GATE: ALLOWED"
+        style = "green"
+
+    lines = [
+        f"Session: {target_sid}",
+        f"Action:  {action_type} → {target}",
+        f"Decision: {reason}",
+    ]
+    if req_id:
+        lines.append(f"Required approval ID: {req_id}")
+        lines.append("Grant it with: agenttrace approve <finding-id> --scope ...")
+    console.print(Panel(
+        "\n".join(lines),
+        title=title,
+        border_style=style,
     ))
 
 

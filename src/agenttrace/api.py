@@ -22,7 +22,7 @@ from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.graph.blast_radius import BlastRadiusAnalyzer
 from agenttrace.graph.causal_engine import CausalExplanationEngine
 from agenttrace.graph.replay import ReplayEngine
-from agenttrace.models.events import ApprovalEvent, ConfidenceLevel, EventType, FileMutationEvent
+from agenttrace.models.events import ConfidenceLevel, EventType, FileMutationEvent
 from agenttrace.models.session import AgentType
 
 logger = logging.getLogger(__name__)
@@ -113,6 +113,22 @@ class SimulationRequest(BaseModel):
     verification_commands: list[str] = Field(default_factory=list)
     constraints: dict[str, Any] = Field(default_factory=dict)
     commit_hash: str | None = None
+
+
+class EvaluateRequest(BaseModel):
+    """A proposed action to run through the pre-execution policy gate."""
+
+    action_type: str  # file_mutation | command | network | git
+    target: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluateResponse(BaseModel):
+    session_id: str
+    allowed: bool
+    action: str = "allow"  # allow | pause | block
+    reason: str
+    required_approval_id: str = ""
 
 
 # -- Lifecycle --
@@ -263,10 +279,23 @@ async def get_diffs(session_id: UUID) -> list[DiffItemDTO]:
 
 @app.get("/sessions/{session_id}/findings", response_model=list[FindingDTO])
 async def get_findings(session_id: UUID) -> list[FindingDTO]:
-    """Get decrypted, redacted policy findings for a session."""
+    """Get decrypted, redacted policy findings for a session.
+
+    `auto_resolved` is computed at read time: a finding is resolved when an
+    active (non-expired) approval covers its exact ID or path/command scope.
+    Findings are immutable chain records, so resolution is never written back.
+    """
     findings_events = daemon.get_findings(session_id)
+    mgr = daemon.get_approval_manager(session_id)
     results: list[FindingDTO] = []
     for evt in findings_events:
+        resolved = bool(getattr(evt, "auto_resolved", False))
+        if mgr and not resolved:
+            resolved = mgr.check_approval(
+                finding_id=str(evt.event_id),
+                path=getattr(evt, "affected_path", "") or None,
+                command=getattr(evt, "affected_command", "") or None,
+            )
         results.append(
             FindingDTO(
                 finding_id=str(evt.event_id),
@@ -277,7 +306,7 @@ async def get_findings(session_id: UUID) -> list[FindingDTO]:
                 affected_path=getattr(evt, "affected_path", ""),
                 affected_command=getattr(evt, "affected_command", ""),
                 requires_approval=getattr(evt, "requires_approval", True),
-                auto_resolved=getattr(evt, "auto_resolved", False),
+                auto_resolved=resolved,
                 timestamp=evt.timestamp.isoformat(),
             )
         )
@@ -286,44 +315,94 @@ async def get_findings(session_id: UUID) -> list[FindingDTO]:
 
 @app.post("/sessions/{session_id}/approvals")
 async def record_approval(session_id: UUID, req: ApprovalRequest) -> dict[str, Any]:
-    """Record an authentic user approval/denial in the ledger and update policy state."""
+    """Record an authentic user approval/denial in the ledger and update policy state.
+
+    Single-path recording: the ApprovalManager appends exactly one hash-chained
+    ledger event and one approval record; the daemon then projects it into the
+    context graph once. Approval scope (paths/commands) is derived from the
+    finding when the client did not supply it, so later pre-execution gates on
+    the same path/command are honored.
+    """
     session = daemon.get_session(session_id)
     if not session and not daemon._ledger.get_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    approval_event = ApprovalEvent(
-        session_id=session_id,
-        actor_id="user_dashboard",
-        source_adapter="approval_manager",
-        confidence=ConfidenceLevel.HIGH,
+    mgr = daemon.get_approval_manager(session_id)
+    if not mgr:
+        raise HTTPException(status_code=409, detail="No active approval manager for this session")
+
+    affected_paths = list(req.affected_paths)
+    affected_commands = list(req.affected_commands)
+    if not affected_paths and not affected_commands:
+        finding_evt = None
+        try:
+            finding_evt = daemon._ledger.get_event(UUID(req.finding_id))
+        except (ValueError, AttributeError):
+            finding_evt = None
+        if finding_evt is None:
+            for evt in daemon.get_findings(session_id):
+                if getattr(evt, "finding_type", "") == req.finding_id:
+                    finding_evt = evt
+                    break
+        if finding_evt is not None:
+            path = getattr(finding_evt, "affected_path", "") or ""
+            command = getattr(finding_evt, "affected_command", "") or ""
+            if path:
+                affected_paths.append(path)
+            if command:
+                affected_commands.append(command)
+
+    event = mgr.record_approval(
         finding_id=req.finding_id,
         approved=req.approved,
         reason=req.reason,
         scope=req.scope,
-        affected_paths=req.affected_paths,
-        affected_commands=req.affected_commands,
+        expiry_minutes=req.expiry_minutes,
+        affected_paths=affected_paths,
+        affected_commands=affected_commands,
     )
 
-    event_hash = await daemon.ingest_event(approval_event)
-
-    # Record in approval manager if active
-    mgr = daemon.get_approval_manager(session_id)
-    if mgr:
-        mgr.record_approval(
-            finding_id=req.finding_id,
-            approved=req.approved,
-            reason=req.reason,
-            scope=req.scope,
-            expiry_minutes=req.expiry_minutes,
-            affected_paths=req.affected_paths,
-        )
+    # Project the approval into the graph/session state exactly once
+    await daemon.project_event(event)
 
     return {
         "status": "recorded",
-        "approval_id": str(approval_event.event_id),
-        "event_hash": event_hash,
+        "approval_id": str(event.event_id),
+        "event_hash": event.event_hash,
         "approved": req.approved,
     }
+
+
+@app.post("/sessions/{session_id}/evaluate", response_model=EvaluateResponse)
+async def evaluate_proposed_action(session_id: UUID, req: EvaluateRequest) -> EvaluateResponse:
+    """Pre-execution mediated policy gate (P0-6).
+
+    Evaluate a proposed action before it runs. Returns whether it is allowed,
+    the policy action (allow | pause | block), and — when paused — the
+    approval ID the user must approve to proceed.
+    """
+    session = daemon.get_session(session_id)
+    if not session and not daemon._ledger.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    allowed, reason, approval_id = daemon.evaluate_proposed_action(
+        session_id, req.action_type, req.target, req.details
+    )
+
+    if reason.startswith("BLOCKED:"):
+        action = "block"
+    elif reason.startswith("APPROVAL REQUIRED:"):
+        action = "pause"
+    else:
+        action = "allow"
+
+    return EvaluateResponse(
+        session_id=str(session_id),
+        allowed=allowed,
+        action=action,
+        reason=reason,
+        required_approval_id=approval_id,
+    )
 
 
 # -- Context Graph & Forensic Report (P0-5, P1-2) --

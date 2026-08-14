@@ -54,3 +54,25 @@ class TestEncryptionManager:
         # Re-initialize manager with same key dir to verify persistence
         new_mgr = EncryptionManager(enc_mgr._key_dir)
         assert new_mgr._key == enc_mgr._key
+
+    def test_blob_store_encryption_at_rest(self, enc_mgr: EncryptionManager, tmp_path: Path) -> None:
+        """Large payload blobs are AES-256-GCM encrypted on disk, not plaintext."""
+        from agenttrace.storage.blob_store import BlobStore
+
+        store = BlobStore(tmp_path / "blobs", encryption_mgr=enc_mgr)
+        secret = b"terminal output containing DB_PASSWORD_xyz payload"
+
+        blob_hash = store.store_blob(secret)
+        blob_file = tmp_path / "blobs" / blob_hash[:2] / blob_hash
+
+        raw = blob_file.read_bytes()
+        assert secret not in raw
+        assert store.retrieve_blob(blob_hash) == secret
+
+    def test_blob_store_plaintext_fallback(self, tmp_path: Path) -> None:
+        """Legacy callers without an EncryptionManager keep plaintext behavior."""
+        from agenttrace.storage.blob_store import BlobStore
+
+        store = BlobStore(tmp_path / "blobs")
+        blob_hash = store.store_blob(b"legacy-payload")
+        assert store.retrieve_blob(blob_hash) == b"legacy-payload"

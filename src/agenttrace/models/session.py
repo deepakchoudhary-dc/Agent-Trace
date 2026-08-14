@@ -63,6 +63,9 @@ class SessionConfig(BaseModel):
     redaction_enabled: bool = True
     encryption_enabled: bool = True
     max_blob_size_mb: int = 50
+    # Privacy: global shell-history files (~/.bash_history, PSReadLine history)
+    # are NEVER read unless the user explicitly opts in per session
+    track_global_shell_history: bool = False
     extra: dict[str, Any] = Field(default_factory=dict)
 
 

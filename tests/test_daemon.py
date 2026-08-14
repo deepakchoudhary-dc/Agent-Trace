@@ -119,3 +119,128 @@ def test_daemon_pre_execution_policy_evaluation(tmp_path: Path) -> None:
     )
     # Default without session allows unless policy blocked
     assert isinstance(allowed, bool)
+
+
+@pytest.mark.asyncio
+async def test_pre_execution_gate_pause_and_approve(tmp_path: Path) -> None:
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    session = await daemon.create_session(
+        workspace_path=str(tmp_path),
+        task_description="Audit gate test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+
+    # Destructive command → PAUSE (approval required), not a hard block
+    allowed, reason, req_id = daemon.evaluate_proposed_action(
+        sid, "command", "rm -rf /tmp/scratch"
+    )
+    assert allowed is False
+    assert reason.startswith("APPROVAL REQUIRED:")
+    assert req_id == "destructive_operation"
+
+    # Privilege escalation → hard BLOCK (approval cannot override)
+    allowed2, reason2, req_id2 = daemon.evaluate_proposed_action(
+        sid, "command", "sudo rm -rf /tmp/scratch"
+    )
+    assert allowed2 is False
+    assert reason2.startswith("BLOCKED:")
+    assert req_id2 == ""
+
+    # Approve the destructive scope, then the same gate must pass
+    mgr = daemon.get_approval_manager(sid)
+    assert mgr is not None
+    mgr.record_approval(
+        finding_id="destructive_operation",
+        approved=True,
+        reason="scratch dir is disposable",
+        affected_commands=["rm -rf /tmp/scratch"],
+    )
+    allowed3, _, _ = daemon.evaluate_proposed_action(sid, "command", "rm -rf /tmp/scratch")
+    assert allowed3 is True
+
+    await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_gate_file_mutation_outside_scope(tmp_path: Path) -> None:
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    session = await daemon.create_session(
+        workspace_path=str(tmp_path),
+        task_description="Gate file test",
+        agent_type=AgentType.GENERIC,
+        allowed_paths=["src/**"],
+        prohibited_paths=["secret/**"],
+    )
+    sid = session.session_id
+
+    allowed, reason, req_id = daemon.evaluate_proposed_action(
+        sid, "file_mutation", "secret/keys.pem", {"mutation_type": "modify"}
+    )
+    assert allowed is False
+    assert reason.startswith("APPROVAL REQUIRED:")
+    assert req_id == "file_outside_scope"
+
+    await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_credential_content_check_wired(tmp_path: Path) -> None:
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    session = await daemon.create_session(
+        workspace_path=str(tmp_path),
+        task_description="Credential test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+
+    cmd = CommandEvent(
+        session_id=sid,
+        actor_id="agent",
+        source_adapter="terminal",
+        command="export DB_PASSWORD=supersecretvalue123",
+    )
+    await daemon.ingest_event(cmd)
+
+    findings = daemon.get_findings(sid)
+    credential_findings = [
+        f for f in findings
+        if getattr(f, "finding_type", "") == "credential_access"
+    ]
+    assert credential_findings, "credential_access finding should be produced from command content"
+
+    await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_approvals_survive_restart(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".agenttrace"
+    daemon1 = AgentTraceDaemon(data_dir)
+    await daemon1.start()
+    session = await daemon1.create_session(
+        workspace_path=str(tmp_path),
+        task_description="Approval restart test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+    mgr = daemon1.get_approval_manager(sid)
+    assert mgr is not None
+    mgr.record_approval(
+        finding_id="destructive_operation",
+        approved=True,
+        reason="known disposable scratch dir",
+        affected_commands=["rm -rf /tmp/scratch"],
+    )
+    await daemon1.stop()
+
+    # Restart daemon over the same data dir — approvals must be restored
+    daemon2 = AgentTraceDaemon(data_dir)
+    await daemon2.start()
+    mgr2 = daemon2.get_approval_manager(sid)
+    assert mgr2 is not None
+    allowed, _, _ = daemon2.evaluate_proposed_action(sid, "command", "rm -rf /tmp/scratch")
+    assert allowed is True
+    await daemon2.stop()

@@ -1,15 +1,17 @@
 """Content-addressed encrypted blob store for large captures.
 
-Blobs are stored as individual encrypted files addressed by their
-SHA-256 content hash. This handles file snapshots, terminal output
-dumps, and other large payloads that don't belong in the SQLite ledger.
+Blobs are stored as individual AES-256-GCM encrypted files addressed by the
+SHA-256 hash of their *plaintext* content (for deduplication). This handles
+file snapshots, terminal output dumps, and other large payloads that don't
+belong in the SQLite ledger.
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
+
+from agenttrace.security.encryption import EncryptionManager
 
 
 class BlobStoreError(Exception):
@@ -17,16 +19,22 @@ class BlobStoreError(Exception):
 
 
 class BlobStore:
-    """Content-addressed file store with optional encryption.
+    """Content-addressed file store with at-rest encryption.
 
-    Files are stored in a flat directory named by their content hash.
-    Encryption is handled by the caller (EncryptionManager) — this
-    layer handles addressing and deduplication only.
+    Files are stored in a flat directory named by their plaintext content
+    hash. The bytes written to disk are AES-256-GCM ciphertext; retrieval
+    transparently decrypts. If no EncryptionManager is supplied (legacy
+    callers), blobs fall back to plaintext.
     """
 
-    def __init__(self, store_dir: str | Path) -> None:
+    def __init__(
+        self,
+        store_dir: str | Path,
+        encryption_mgr: EncryptionManager | None = None,
+    ) -> None:
         self._store_dir = Path(store_dir)
         self._store_dir.mkdir(parents=True, exist_ok=True)
+        self._encryption = encryption_mgr
 
     @staticmethod
     def compute_hash(data: bytes) -> str:
@@ -44,8 +52,20 @@ class BlobStore:
         shard_dir.mkdir(exist_ok=True)
         return shard_dir / content_hash
 
+    def _encrypt(self, data: bytes) -> bytes:
+        """Encrypt blob bytes for at-rest storage (no-op without a manager)."""
+        if self._encryption is None:
+            return data
+        return self._encryption.encrypt(data)
+
+    def _decrypt(self, payload: bytes) -> bytes:
+        """Decrypt blob bytes read from disk."""
+        if self._encryption is None:
+            return payload
+        return self._encryption.decrypt(payload)
+
     def store_blob(self, data: bytes) -> str:
-        """Store a blob, returning its content hash.
+        """Store a blob, returning its plaintext content hash.
 
         If the blob already exists (same hash), this is a no-op.
         """
@@ -58,7 +78,7 @@ class BlobStore:
         # Write atomically: temp file then rename
         tmp_path = blob_path.with_suffix(".tmp")
         try:
-            tmp_path.write_bytes(data)
+            tmp_path.write_bytes(self._encrypt(data))
             tmp_path.rename(blob_path)
         except OSError:
             # On Windows, rename can fail if target exists (race condition)
@@ -70,11 +90,11 @@ class BlobStore:
         return content_hash
 
     def retrieve_blob(self, content_hash: str) -> bytes:
-        """Retrieve a blob by its content hash."""
+        """Retrieve and decrypt a blob by its content hash."""
         blob_path = self._blob_path(content_hash)
         if not blob_path.exists():
             raise BlobStoreError(f"Blob not found: {content_hash}")
-        return blob_path.read_bytes()
+        return self._decrypt(blob_path.read_bytes())
 
     def exists(self, content_hash: str) -> bool:
         """Check if a blob exists."""

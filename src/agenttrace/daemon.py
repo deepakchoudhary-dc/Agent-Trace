@@ -17,9 +17,7 @@ from uuid import UUID, uuid4
 
 from agenttrace.adapters.claude import ClaudeAdapter
 from agenttrace.adapters.codex import CodexAdapter
-from agenttrace.adapters.composite import CompositeAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
-from agenttrace.adapters.generic import GenericAdapter
 from agenttrace.adapters.sdk import AdapterBase
 from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.baseline import BaselineGenerator
@@ -29,7 +27,6 @@ from agenttrace.models.events import (
     ApprovalEvent,
     CommandEvent,
     ConfidenceLevel,
-    ContextBoundaryEvent,
     EventBase,
     EventType,
     FileMutationEvent,
@@ -37,8 +34,6 @@ from agenttrace.models.events import (
     InvocationEvent,
     NetworkEvent,
     PolicyFindingEvent,
-    ProcessEvent,
-    TestResultEvent,
     ToolRequestEvent,
     ToolResultEvent,
 )
@@ -49,7 +44,7 @@ from agenttrace.models.session import (
     SessionConfig,
     SessionStatus,
 )
-from agenttrace.models.task_contract import RiskLevel, TaskContract
+from agenttrace.models.task_contract import RiskLevel, ScopeDriftResult, TaskContract
 from agenttrace.observers.base import BaseObserver
 from agenttrace.observers.filesystem import FilesystemObserver
 from agenttrace.observers.git_monitor import GitMonitor
@@ -58,12 +53,13 @@ from agenttrace.observers.process_tree import ProcessTreeObserver
 from agenttrace.observers.terminal import TerminalObserver
 from agenttrace.security.approval import ApprovalManager
 from agenttrace.security.encryption import EncryptionManager
-from agenttrace.security.policy import PolicyAction, PolicyEngine, PolicyEvaluation
+from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.redaction import SecretRedactor
 from agenttrace.storage.blob_store import BlobStore
 from agenttrace.storage.ledger import EventLedger
 
 logger = logging.getLogger(__name__)
+
 
 _DEFAULT_DATA_DIR = Path.home() / ".agenttrace"
 
@@ -94,7 +90,7 @@ class AgentTraceDaemon:
             encryption_mgr=self._encryptor,
             redactor=self._redactor,
         )
-        self._blob_store = BlobStore(self._data_dir / "blobs")
+        self._blob_store = BlobStore(self._data_dir / "blobs", encryption_mgr=self._encryptor)
 
         # Operational state
         self._sessions: dict[UUID, AuditSession] = {}
@@ -107,6 +103,9 @@ class AgentTraceDaemon:
         self._contracts: dict[UUID, TaskContract] = {}
         self._boundaries: dict[UUID, TaskBoundaryEngine] = {}
         self._network_observers: dict[UUID, NetworkObserver] = {}
+        # Most-recent node index per (session, node_type, actor) for causal
+        # correlation: links events to the *latest* cause, not the first match
+        self._latest: dict[tuple[UUID, NodeType, str], UUID] = {}
 
         self._running = False
 
@@ -168,8 +167,10 @@ class AgentTraceDaemon:
                         self._boundaries[sid] = TaskBoundaryEngine(contract)
                         self._policies[sid] = PolicyEngine(sid, contract)
 
-                    # Restore approval manager
-                    self._approvals[sid] = ApprovalManager(sid, self._ledger)
+                    # Restore approval manager and its active (non-expired) cache
+                    approvals = ApprovalManager(sid, self._ledger)
+                    approvals.reload_from_storage()
+                    self._approvals[sid] = approvals
 
                     # Reconstruct ContextGraph from persisted nodes and edges
                     graph = ContextGraph(sid)
@@ -408,6 +409,18 @@ class AgentTraceDaemon:
         # 2. Append to cryptographic event ledger
         event_hash = self._ledger.append_event(event)
 
+        # 3-6. Graph projection, boundary/policy evaluation, session state
+        await self.project_event(event)
+
+        return event_hash
+
+    async def project_event(self, event: EventBase) -> None:
+        """Apply graph projection, boundary/policy evaluation, and session state
+        for an event that has already been appended to the ledger.
+
+        Split from ingest_event so approvals (which self-append via the
+        ApprovalManager) can be projected exactly once.
+        """
         # 3. Context Graph Causal Projection & DB Storage
         graph = self._graphs.get(event.session_id)
         if graph:
@@ -419,34 +432,26 @@ class AgentTraceDaemon:
             if isinstance(event, FileMutationEvent):
                 drift = boundary.check_file_mutation(event.file_path, event.mutation_type)
                 if drift:
-                    finding = PolicyFindingEvent(
-                        session_id=event.session_id,
-                        actor_id="task_boundary_engine",
-                        source_adapter="task_boundary_engine",
-                        confidence=ConfidenceLevel.HIGH,
-                        finding_type=drift.drift_type.value,
-                        severity=drift.severity,
-                        description=drift.description,
-                        affected_path=drift.affected_path,
-                        requires_approval=drift.requires_approval,
-                    )
-                    await self.ingest_event(finding)
+                    await self.ingest_event(self._boundary_finding(event, drift))
 
             elif isinstance(event, CommandEvent):
-                drifts = boundary.check_command(event.command)
-                for drift in drifts:
-                    finding = PolicyFindingEvent(
-                        session_id=event.session_id,
-                        actor_id="task_boundary_engine",
-                        source_adapter="task_boundary_engine",
-                        confidence=ConfidenceLevel.HIGH,
-                        finding_type=drift.drift_type.value,
-                        severity=drift.severity,
-                        description=drift.description,
-                        affected_command=drift.affected_command,
-                        requires_approval=drift.requires_approval,
+                for drift in boundary.check_command(event.command):
+                    await self.ingest_event(self._boundary_finding(event, drift))
+
+            # 4b. Credential content check (P1-6) — scans actual content for
+            #     credential patterns rather than only filenames/keywords
+            if isinstance(event, CommandEvent) and event.command:
+                drift = boundary.check_credential_access(event.command)
+                if drift:
+                    await self.ingest_event(
+                        self._boundary_finding(event, drift, affected_command=event.command[:80])
                     )
-                    await self.ingest_event(finding)
+            elif isinstance(event, FileMutationEvent) and event.diff_summary:
+                drift = boundary.check_credential_access(event.diff_summary)
+                if drift:
+                    await self.ingest_event(
+                        self._boundary_finding(event, drift, affected_path=event.file_path)
+                    )
 
         # 5. Security Policy Evaluation
         policy = self._policies.get(event.session_id)
@@ -459,9 +464,28 @@ class AgentTraceDaemon:
         session = self._sessions.get(event.session_id)
         if session:
             session.event_count += 1
-            session.last_event_hash = event_hash
+            session.last_event_hash = event.event_hash
 
-        return event_hash
+    @staticmethod
+    def _boundary_finding(
+        event: EventBase,
+        drift: ScopeDriftResult,
+        affected_path: str = "",
+        affected_command: str = "",
+    ) -> PolicyFindingEvent:
+        """Build a PolicyFindingEvent from a scope drift result."""
+        return PolicyFindingEvent(
+            session_id=event.session_id,
+            actor_id="task_boundary_engine",
+            source_adapter="task_boundary_engine",
+            confidence=ConfidenceLevel.HIGH,
+            finding_type=drift.drift_type.value,
+            severity=drift.severity,
+            description=drift.description,
+            affected_path=affected_path or drift.affected_path,
+            affected_command=affected_command or drift.affected_command,
+            requires_approval=drift.requires_approval,
+        )
 
     def _update_graph(self, graph: ContextGraph, event: EventBase) -> None:
         """Update Context Graph with rich, multi-hop causal correlation rules."""
@@ -499,6 +523,9 @@ class AgentTraceDaemon:
         )
         graph.add_node(node)
 
+        # Index the most recent node per (session, type, actor) for correlation
+        self._latest[(event.session_id, node.node_type, event.actor_id)] = node.node_id
+
         # Persist node to SQLite
         self._ledger.store_graph_node(
             node_id=node.node_id,
@@ -515,75 +542,58 @@ class AgentTraceDaemon:
         # Multi-Hop Causal Edge Inference
         new_edges: list[GraphEdge] = []
 
+        def edge(source_id: UUID, edge_type: EdgeType, confidence: ConfidenceLevel = ConfidenceLevel.HIGH) -> GraphEdge:
+            """Helper: edge from a cause node to the just-added node."""
+            return GraphEdge(
+                source_node_id=source_id,
+                target_node_id=node.node_id,
+                edge_type=edge_type,
+                actor_id=event.actor_id,
+                source_adapter=event.source_adapter,
+                confidence=confidence,
+            )
+
         # 1. Invocations connect to root task_intent
         if isinstance(event, InvocationEvent):
             for t_node in graph.get_nodes_by_type(NodeType.TASK_INTENT):
-                new_edges.append(GraphEdge(
-                    source_node_id=t_node.node_id,
-                    target_node_id=node.node_id,
-                    edge_type=EdgeType.PROVIDES_CONTEXT_TO,
-                    actor_id=event.actor_id,
-                    source_adapter=event.source_adapter,
-                    confidence=ConfidenceLevel.HIGH,
-                ))
+                new_edges.append(edge(t_node.node_id, EdgeType.PROVIDES_CONTEXT_TO))
 
-        # 2. Tool requests connect to agent sessions
+        # 2. Tool requests connect to the most recent agent session of that actor
         elif isinstance(event, ToolRequestEvent):
-            for s_node in graph.get_nodes_by_type(NodeType.AGENT_SESSION):
-                if s_node.actor_id == event.actor_id:
-                    new_edges.append(GraphEdge(
-                        source_node_id=s_node.node_id,
-                        target_node_id=node.node_id,
-                        edge_type=EdgeType.REQUESTS,
-                        actor_id=event.actor_id,
-                        source_adapter=event.source_adapter,
-                        confidence=ConfidenceLevel.HIGH,
-                    ))
+            s_node = self._latest_matching(graph, NodeType.AGENT_SESSION, actor_id=event.actor_id)
+            if s_node:
+                new_edges.append(edge(s_node.node_id, EdgeType.REQUESTS))
 
-        # 3. Tool results connect to tool requests
+        # 3. Tool results connect to the most recent matching tool request
         elif isinstance(event, ToolResultEvent):
-            for req_node in graph.get_nodes_by_type(NodeType.TOOL_REQUEST):
-                if req_node.data.get("tool_name") == event.tool_name:
-                    new_edges.append(GraphEdge(
-                        source_node_id=req_node.node_id,
-                        target_node_id=node.node_id,
-                        edge_type=EdgeType.EXECUTES,
-                        actor_id=event.actor_id,
-                        source_adapter=event.source_adapter,
-                        confidence=ConfidenceLevel.HIGH,
-                    ))
-                    break
+            req_node = self._latest_matching(
+                graph, NodeType.TOOL_REQUEST,
+                predicate=lambda n: n.data.get("tool_name") == event.tool_name,
+            )
+            if req_node:
+                new_edges.append(edge(req_node.node_id, EdgeType.EXECUTES))
 
-        # 4. Commands connect to agent session / tool request
+        # 4. Commands connect to the most recent agent session and matching tool request
         elif isinstance(event, CommandEvent):
-            for req_node in graph.get_nodes_by_type(NodeType.TOOL_REQUEST):
-                if event.command in str(req_node.data):
-                    new_edges.append(GraphEdge(
-                        source_node_id=req_node.node_id,
-                        target_node_id=node.node_id,
-                        edge_type=EdgeType.EXECUTES,
-                        actor_id=event.actor_id,
-                        source_adapter=event.source_adapter,
-                        confidence=ConfidenceLevel.HIGH,
-                    ))
+            s_node = self._latest_matching(graph, NodeType.AGENT_SESSION, actor_id=event.actor_id)
+            if s_node:
+                new_edges.append(edge(s_node.node_id, EdgeType.EXECUTES))
+            req_node = self._latest_matching(
+                graph, NodeType.TOOL_REQUEST,
+                predicate=lambda n: event.command in str(n.data),
+            )
+            if req_node:
+                new_edges.append(edge(req_node.node_id, EdgeType.EXECUTES))
 
-        # 5. File mutations connect to commands / processes & baseline source files
+        # 5. File mutations connect to the most recent command & baseline source file
         elif isinstance(event, FileMutationEvent):
-            # Connect to executing command/process
-            for cmd_node in graph.get_nodes_by_type(NodeType.COMMAND):
-                new_edges.append(GraphEdge(
-                    source_node_id=cmd_node.node_id,
-                    target_node_id=node.node_id,
-                    edge_type=EdgeType.MODIFIES,
-                    actor_id=event.actor_id,
-                    source_adapter=event.source_adapter,
-                    confidence=ConfidenceLevel.MEDIUM,
-                ))
-                break
+            cmd_node = self._latest_matching(graph, NodeType.COMMAND)
+            if cmd_node:
+                new_edges.append(edge(cmd_node.node_id, EdgeType.MODIFIES, ConfidenceLevel.MEDIUM))
 
-            # Connect to baseline source file
             for file_node in graph.get_nodes_by_type(NodeType.SOURCE_FILE):
                 if file_node.data.get("path") == event.file_path:
+                    # mutation node MODIFIES the baseline source file
                     new_edges.append(GraphEdge(
                         source_node_id=node.node_id,
                         target_node_id=file_node.node_id,
@@ -594,36 +604,24 @@ class AgentTraceDaemon:
                     ))
                     break
 
-        # 6. Network connections connect to spawning process
+        # 6. Network connections connect to the most recent spawning process
         elif isinstance(event, NetworkEvent):
             if event.process_pid:
-                for p_node in graph.get_nodes_by_type(NodeType.PROCESS):
-                    if p_node.data.get("pid") == event.process_pid:
-                        new_edges.append(GraphEdge(
-                            source_node_id=p_node.node_id,
-                            target_node_id=node.node_id,
-                            edge_type=EdgeType.SPAWNS,
-                            actor_id=event.actor_id,
-                            source_adapter=event.source_adapter,
-                            confidence=ConfidenceLevel.HIGH,
-                        ))
-                        break
+                p_node = self._latest_matching(
+                    graph, NodeType.PROCESS,
+                    predicate=lambda n: n.data.get("pid") == event.process_pid,
+                )
+                if p_node:
+                    new_edges.append(edge(p_node.node_id, EdgeType.SPAWNS))
 
-        # 7. Policy findings connect to triggering nodes
+        # 7. Policy findings connect to the triggering node
         elif isinstance(event, PolicyFindingEvent):
             for candidate in reversed(list(graph._nodes.values())):
                 if candidate.node_id != node.node_id:
-                    new_edges.append(GraphEdge(
-                        source_node_id=candidate.node_id,
-                        target_node_id=node.node_id,
-                        edge_type=EdgeType.VIOLATES,
-                        actor_id=event.actor_id,
-                        source_adapter=event.source_adapter,
-                        confidence=ConfidenceLevel.HIGH,
-                    ))
+                    new_edges.append(edge(candidate.node_id, EdgeType.VIOLATES))
                     break
 
-        # 8. Approvals connect to findings
+        # 8. Approvals connect to findings (approval node → finding node)
         elif isinstance(event, ApprovalEvent):
             for f_node in graph.get_nodes_by_type(NodeType.POLICY_FINDING):
                 if f_node.data.get("event_id") == event.finding_id or f_node.data.get("finding_type") == event.finding_id:
@@ -652,6 +650,36 @@ class AgentTraceDaemon:
                 data=edge.data,
             )
 
+    def _latest_matching(
+        self,
+        graph: ContextGraph,
+        node_type: NodeType,
+        actor_id: str = "",
+        predicate: Any | None = None,
+    ) -> GraphNode | None:
+        """Return the most recent node of a type, preferring same-actor matches.
+
+        Uses the O(1) recent-node index when possible, falling back to a
+        timestamp-ordered scan of the graph.
+        """
+        if not predicate and actor_id:
+            nid = self._latest.get((graph.session_id, node_type, actor_id))
+            if nid:
+                node = graph.get_node(nid)
+                if node:
+                    return node
+
+        candidates = graph.get_nodes_by_type(node_type)
+        if actor_id:
+            same_actor = [n for n in candidates if n.actor_id == actor_id]
+            if same_actor:
+                candidates = same_actor
+        if predicate:
+            candidates = [n for n in candidates if predicate(n)]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda n: n.timestamp)
+
     @staticmethod
     def _make_node_label(event: EventBase) -> str:
         if isinstance(event, FileMutationEvent):
@@ -675,33 +703,119 @@ class AgentTraceDaemon:
         target: str,
         details: dict[str, Any] | None = None,
     ) -> tuple[bool, str, str]:
-        """Pre-execution policy evaluation for mediated actions.
+        """Pre-execution mediated policy gate (P0-6).
 
-        Returns (allowed, reason, required_approval_id).
+        Evaluates a *proposed* action against the task boundary AND the full
+        policy engine before it is executed. Returns
+        (allowed, reason, required_approval_id):
+
+        - allowed=True  → action may proceed
+        - allowed=False + required_approval_id non-empty → action is PAUSED;
+          proceed only after the user approves the given finding/scope
+        - allowed=False + required_approval_id empty → action is BLOCKED outright
+
+        Reason strings are prefixed with "APPROVAL REQUIRED:" or "BLOCKED:"
+        so callers (API, CLI) can distinguish pause from block.
         """
-        contract = self._contracts.get(session_id)
         boundary = self._boundaries.get(session_id)
         approvals = self._approvals.get(session_id)
+        policy = self._policies.get(session_id)
 
-        # 1. Scope boundary check
+        # 1. Task-boundary scope checks (file paths, destructive/privilege/network commands)
+        boundary_hits: list[tuple[str, str, str, str]] = []  # (drift_type, description, path, command)
         if boundary:
             if action_type == "file_mutation":
-                drift = boundary.check_file_mutation(target, details.get("mutation_type", "modify") if details else "modify")
+                mutation_type = (details or {}).get("mutation_type", "modify")
+                drift = boundary.check_file_mutation(target, mutation_type)
                 if drift:
-                    # Check active approval
-                    if approvals and approvals.is_approved(drift.drift_type.value, path=target):
-                        return True, "Pre-approved by active approval record", ""
-                    return False, f"Blocked: {drift.description}", drift.drift_type.value
-
+                    boundary_hits.append(
+                        (drift.drift_type.value, drift.description, drift.affected_path, drift.affected_command)
+                    )
             elif action_type == "command":
-                drifts = boundary.check_command(target)
-                if drifts:
-                    for drift in drifts:
-                        if approvals and approvals.is_approved(drift.drift_type.value, command=target):
-                            continue
-                        return False, f"Blocked: {drift.description}", drift.drift_type.value
+                for drift in boundary.check_command(target):
+                    boundary_hits.append(
+                        (drift.drift_type.value, drift.description, drift.affected_path, drift.affected_command)
+                    )
+
+        # 2. Full policy engine over a synthetic event (destructive ops,
+        #    credential files, dependency manifests, network egress, git ops)
+        policy_blocked = False
+        policy_hits: list[tuple[str, str]] = []  # (rule_id, description)
+        if policy:
+            synthetic = self._synthetic_event_for_gate(action_type, target, details)
+            if synthetic is not None:
+                evaluation = policy.evaluate(synthetic)
+                for finding in evaluation.findings:
+                    policy_hits.append((finding.finding_type, finding.description))
+                if evaluation.is_blocked:
+                    policy_blocked = True
+
+        # 3. BLOCK outright (privilege escalation, etc.) — approval cannot override
+        if policy_blocked:
+            desc = policy_hits[0][1] if policy_hits else "action is not permitted by policy"
+            return False, f"BLOCKED: {desc}", ""
+
+        # 4. Boundary hits — pause unless covered by an active approval
+        for drift_type, desc, path, cmd in boundary_hits:
+            if approvals and approvals.check_approval(
+                finding_id=None, path=path or None, command=cmd or None
+            ):
+                continue
+            return False, f"APPROVAL REQUIRED: {desc}", drift_type
+
+        # 5. Policy hits — pause unless covered by an active approval
+        for rule_id, desc in policy_hits:
+            if approvals and approvals.check_approval(
+                finding_id=None,
+                path=None if action_type == "command" else target,
+                command=target if action_type == "command" else None,
+            ):
+                continue
+            return False, f"APPROVAL REQUIRED: {desc}", rule_id
 
         return True, "Allowed by policy", ""
+
+    @staticmethod
+    def _synthetic_event_for_gate(
+        action_type: str,
+        target: str,
+        details: dict[str, Any] | None,
+    ) -> EventBase | None:
+        """Build a throwaway event for pre-execution policy evaluation."""
+        details = details or {}
+        if action_type == "file_mutation":
+            return FileMutationEvent(
+                session_id=uuid4(),
+                actor_id="gate",
+                source_adapter="gate",
+                file_path=target,
+                mutation_type=details.get("mutation_type", "modify"),
+            )
+        if action_type == "command":
+            return CommandEvent(
+                session_id=uuid4(),
+                actor_id="gate",
+                source_adapter="gate",
+                command=target,
+            )
+        if action_type == "network":
+            ip, _, port = target.partition(":")
+            return NetworkEvent(
+                session_id=uuid4(),
+                actor_id="gate",
+                source_adapter="gate",
+                destination_ip=ip or "0.0.0.0",
+                destination_port=int(port) if port.isdigit() else 0,
+                protocol=details.get("protocol", "tcp"),
+            )
+        if action_type == "git":
+            return GitEvent(
+                session_id=uuid4(),
+                actor_id="gate",
+                source_adapter="gate",
+                git_action=target,
+            )
+        return None
 
     # -- Observers & Adapter Selection --
 
@@ -723,7 +837,12 @@ class AgentTraceDaemon:
             FilesystemObserver(session.session_id, workspace, callback, session.config.ignore_patterns),
             proc_observer,
             GitMonitor(session.session_id, workspace, callback),
-            TerminalObserver(session.session_id, workspace, callback),
+            TerminalObserver(
+                session.session_id,
+                workspace,
+                callback,
+                track_global_history=session.config.track_global_shell_history,
+            ),
             net_observer,
         ]
 

@@ -43,8 +43,11 @@ _POLL_INTERVAL = 2.0
 class TerminalObserver(BaseObserver):
     """Captures terminal command executions within the workspace.
 
-    Distinguishes verified workspace commands (high confidence)
-    from global shell activity (marked unattributed with low confidence).
+    Global shell-history files (~/.bash_history, PowerShell PSReadLine, etc.)
+    are privacy-sensitive and are only read when explicitly opted in via
+    SessionConfig.track_global_shell_history. The default is mediated/process
+    mode: the observer waits for workspace-scoped command events instead of
+    reading the user's global shell history.
     """
 
     def __init__(
@@ -53,7 +56,7 @@ class TerminalObserver(BaseObserver):
         workspace_path: str,
         callback: EventCallback,
         poll_interval: float = _POLL_INTERVAL,
-        track_global_history: bool = True,
+        track_global_history: bool = False,
     ) -> None:
         super().__init__(session_id, workspace_path, callback)
         self._poll_interval = poll_interval

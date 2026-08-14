@@ -16,18 +16,20 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE TABLE IF NOT EXISTS events (
-    event_id        TEXT PRIMARY KEY,
-    session_id      TEXT NOT NULL REFERENCES sessions(session_id),
-    event_type      TEXT NOT NULL,
-    timestamp       TEXT NOT NULL,
-    actor_id        TEXT NOT NULL,
-    source_adapter  TEXT NOT NULL,
-    confidence      TEXT NOT NULL DEFAULT 'high',
-    canonical_json  TEXT NOT NULL,          -- Full canonical event envelope JSON
-    payload_enc     BLOB,                   -- AES-256-GCM encrypted payload
-    event_hash      TEXT NOT NULL UNIQUE,
-    prev_hash       TEXT NOT NULL DEFAULT '',
-    seq             INTEGER NOT NULL        -- Strict monotonic 0-based sequence
+    event_id            TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL REFERENCES sessions(session_id),
+    event_type          TEXT NOT NULL,
+    timestamp           TEXT NOT NULL,
+    actor_id            TEXT NOT NULL,
+    source_adapter      TEXT NOT NULL,
+    confidence          TEXT NOT NULL DEFAULT 'high',
+    canonical_json      TEXT NOT NULL DEFAULT '',  -- Legacy plaintext envelope (pre-v0.3); empty for new rows
+    canonical_json_enc  BLOB,                      -- AES-256-GCM encrypted canonical envelope
+    canonical_json_hash TEXT NOT NULL DEFAULT '',  -- SHA-256 of the canonical envelope (tamper evidence w/o plaintext)
+    payload_enc         BLOB,                      -- AES-256-GCM encrypted payload
+    event_hash          TEXT NOT NULL UNIQUE,
+    prev_hash           TEXT NOT NULL DEFAULT '',
+    seq                 INTEGER NOT NULL           -- Strict monotonic 0-based sequence
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);

@@ -7,6 +7,7 @@ Sensitive columns and payloads are encrypted at rest using AES-256-GCM.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -14,7 +15,6 @@ from typing import Any
 from uuid import UUID
 
 from agenttrace.models.events import (
-    ConfidenceLevel,
     EventBase,
     EventType,
     event_from_dict,
@@ -54,10 +54,21 @@ class EventLedger:
         self._init_schema()
 
     def _init_schema(self) -> None:
-        """Apply the database schema."""
+        """Apply the database schema and migrate existing databases in place."""
         schema_sql = _SCHEMA_PATH.read_text(encoding="utf-8")
         self._conn.executescript(schema_sql)
+        self._migrate_schema()
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        """Add columns introduced after v0.2 to databases created before them."""
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(events)")}
+        if "canonical_json_enc" not in cols:
+            self._conn.execute("ALTER TABLE events ADD COLUMN canonical_json_enc BLOB")
+        if "canonical_json_hash" not in cols:
+            self._conn.execute(
+                "ALTER TABLE events ADD COLUMN canonical_json_hash TEXT NOT NULL DEFAULT ''"
+            )
 
     def close(self) -> None:
         """Close the database connection."""
@@ -201,19 +212,24 @@ class EventLedger:
         if clean_event.payload:
             payload_enc = self._encryption.encrypt_json(clean_event.payload)
 
+        # The canonical envelope is the full event content (commands, prompts,
+        # tool args, diffs). It is AES-256-GCM encrypted at rest; its SHA-256 is
+        # stored separately so tamper verification never needs the plaintext.
         canonical_json = json.dumps(
             clean_event.canonical_dict(),
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
         )
+        canonical_json_enc = self._encryption.encrypt_str(canonical_json)
+        canonical_json_hash = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
         self._conn.execute(
             """INSERT INTO events
                (event_id, session_id, event_type, timestamp, actor_id,
-                source_adapter, confidence, canonical_json, payload_enc,
-                event_hash, prev_hash, seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_adapter, confidence, canonical_json, canonical_json_enc,
+                canonical_json_hash, payload_enc, event_hash, prev_hash, seq)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 str(clean_event.event_id),
                 str(clean_event.session_id),
@@ -222,7 +238,9 @@ class EventLedger:
                 clean_event.actor_id,
                 clean_event.source_adapter,
                 clean_event.confidence.value if hasattr(clean_event.confidence, "value") else str(clean_event.confidence),
-                canonical_json,
+                "",  # canonical_json (legacy column) intentionally left empty
+                canonical_json_enc,
+                canonical_json_hash,
                 payload_enc,
                 clean_event.event_hash,
                 clean_event.prev_hash,
@@ -250,7 +268,7 @@ class EventLedger:
         if not row:
             return None
 
-        event_data = json.loads(row["canonical_json"])
+        event_data = json.loads(self._read_canonical_json(row))
         event_data["event_hash"] = row["event_hash"]
         event = event_from_dict(event_data)
 
@@ -300,7 +318,7 @@ class EventLedger:
         events: list[EventBase] = []
         for r in rows:
             try:
-                event_data = json.loads(r["canonical_json"])
+                event_data = json.loads(self._read_canonical_json(r))
                 event_data["event_hash"] = r["event_hash"]
                 evt = event_from_dict(event_data)
                 if r["payload_enc"]:
@@ -313,6 +331,16 @@ class EventLedger:
                 continue
 
         return events
+
+    def _read_canonical_json(self, row: Any) -> str:
+        """Read and decrypt the canonical envelope for a stored event row.
+
+        New rows store an encrypted envelope plus a tamper hash; legacy rows
+        store the plaintext envelope in the pre-v0.3 `canonical_json` column.
+        """
+        if row["canonical_json_enc"]:
+            return self._encryption.decrypt_str(row["canonical_json_enc"])
+        return row["canonical_json"]
 
     # -- Complete cryptographic chain verification --
 
@@ -341,7 +369,7 @@ class EventLedger:
             stored_hash = row["event_hash"]
             stored_prev_hash = row["prev_hash"]
             stored_seq = row["seq"]
-            canonical_json = row["canonical_json"]
+            stored_canonical_hash = row["canonical_json_hash"]
 
             # 1. Verify sequence monotonicity
             if stored_seq != expected_seq:
@@ -359,6 +387,21 @@ class EventLedger:
 
             # 3. Full hash recomputation over canonical data
             try:
+                canonical_json = self._read_canonical_json(row)
+
+                # 3a. Verify the stored envelope tamper hash (encrypted rows only)
+                if stored_canonical_hash:
+                    recomputed_canonical_hash = hashlib.sha256(
+                        canonical_json.encode("utf-8")
+                    ).hexdigest()
+                    if recomputed_canonical_hash != stored_canonical_hash:
+                        return False, (
+                            f"Envelope tamper detected at seq={stored_seq} (event {row['event_id']}): "
+                            f"stored_canonical_hash={stored_canonical_hash}, "
+                            f"recomputed_canonical_hash={recomputed_canonical_hash}"
+                        )
+
+                # 3b. Recompute the event's own hash over the decrypted envelope
                 event_data = json.loads(canonical_json)
                 event_data["event_hash"] = stored_hash
                 evt = event_from_dict(event_data)
@@ -374,6 +417,25 @@ class EventLedger:
 
             expected_prev_hash = stored_hash
             expected_seq += 1
+
+        # 4. Verify the session-level chain head and count stay consistent
+        session_row = self._conn.execute(
+            "SELECT event_count, last_event_hash FROM sessions WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        if session_row and session_row["last_event_hash"]:
+            if session_row["last_event_hash"] != expected_prev_hash:
+                return False, (
+                    "Session head mismatch: ledger chain ends at "
+                    f"{expected_prev_hash!r} but sessions.last_event_hash="
+                    f"{session_row['last_event_hash']!r}"
+                )
+            if session_row["event_count"] != expected_seq:
+                return False, (
+                    "Session count mismatch: ledger contains "
+                    f"{expected_seq} events but sessions.event_count="
+                    f"{session_row['event_count']}"
+                )
 
         return True, ""
 
@@ -539,14 +601,18 @@ class EventLedger:
         scope: str = "",
         expiry: str | None = None,
         affected_paths: list[str] | None = None,
+        affected_commands: list[str] | None = None,
         created_at: str = "",
         event_hash: str = "",
     ) -> None:
-        """Store an approval record with encrypted reason and scope."""
+        """Store an approval record with encrypted reason, scope, and scope items."""
         redacted_reason = self._redactor.redact(reason)
         reason_enc = self._encryption.encrypt_str(redacted_reason)
         scope_enc = self._encryption.encrypt_str(scope)
-        affected_enc = self._encryption.encrypt_json(affected_paths or [])
+        affected_enc = self._encryption.encrypt_json({
+            "paths": affected_paths or [],
+            "commands": affected_commands or [],
+        })
 
         self._conn.execute(
             """INSERT INTO approvals
@@ -587,9 +653,20 @@ class EventLedger:
             except Exception:
                 d["scope"] = ""
             try:
-                d["affected_paths"] = self._encryption.decrypt_json(d["affected_enc"])
+                affected = self._encryption.decrypt_json(d["affected_enc"])
+                if isinstance(affected, dict):
+                    d["affected"] = affected
+                    d["affected_paths"] = affected.get("paths", [])
+                    d["affected_commands"] = affected.get("commands", [])
+                else:
+                    # Legacy rows stored a bare list of paths
+                    d["affected"] = {"paths": affected or [], "commands": []}
+                    d["affected_paths"] = affected or []
+                    d["affected_commands"] = []
             except Exception:
+                d["affected"] = {"paths": [], "commands": []}
                 d["affected_paths"] = []
+                d["affected_commands"] = []
             approvals.append(d)
         return approvals
 

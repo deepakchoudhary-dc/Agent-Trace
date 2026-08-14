@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
 import {
   SessionInfo,
@@ -13,6 +13,7 @@ import {
   Download,
   Check,
   FileCheck,
+  X,
 } from 'lucide-react';
 
 interface ForensicReportModalProps {
@@ -33,21 +34,23 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
   const [downloading, setDownloading] = useState(false);
   const [verification, setVerification] = useState<VerificationResult | null>(null);
   const [verifying, setVerifying] = useState(true);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') closeRef.current();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
+  }, []);
 
   useEffect(() => {
     let active = true;
     if (session?.session_id) {
       setVerifying(true);
       api
-        .verifySession(session.session_id)
+        .verifyChain(session.session_id)
         .then((res) => {
           if (active) setVerification(res);
         })
@@ -55,10 +58,10 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
           if (active) {
             setVerification({
               session_id: session.session_id,
-              is_valid: false,
+              verified: false,
               error: 'Daemon verification endpoint unreachable',
-              head_event_hash: '',
               event_count: timeline.length,
+              last_event_hash: timeline.length > 0 ? timeline[timeline.length - 1].event_hash : '',
             });
           }
         })
@@ -73,8 +76,9 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
 
   if (!session) return null;
 
-  const isChainValid = verification ? verification.is_valid : false;
-  const lastEventHash = verification?.head_event_hash || (timeline.length > 0 ? timeline[timeline.length - 1].event_hash : '0'.repeat(64));
+  const isChainValid = verification ? verification.verified : false;
+  const lastEventHash =
+    verification?.last_event_hash || (timeline.length > 0 ? timeline[timeline.length - 1].event_hash : '0'.repeat(64));
 
   const handleExportJSON = () => {
     setDownloading(true);
@@ -126,61 +130,63 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
       <div
         className="glass-panel"
         onClick={(e) => e.stopPropagation()}
-        style={{ width: '100%', maxWidth: '640px', padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}
+        style={{ width: '100%', maxWidth: '640px', padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px', maxHeight: '90vh', overflowY: 'auto' }}
       >
         {/* Header */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <div style={{ width: '36px', height: '36px', borderRadius: '6px', background: '#ffffff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div className="flex-between">
+          <div className="flex" style={{ gap: '10px' }}>
+            <div className="brand-mark brand-mark--sm">
               <FileCheck size={18} color="#000000" />
             </div>
             <div>
-              <h2 id="report-modal-title" className="font-heading" style={{ fontSize: '16px', fontWeight: 600 }}>
+              <h2 id="report-modal-title" className="font-heading" style={{ fontSize: '16px', fontWeight: 650 }}>
                 Forensic Audit Export Manifest
               </h2>
-              <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                Session: {session.session_id}
+              <p className="font-mono" style={{ fontSize: '10.5px', color: 'var(--text-muted)' }}>
+                {session.session_id}
               </p>
             </div>
           </div>
-          <button onClick={onClose} aria-label="Close dialog" style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '20px' }}>
-            &times;
+          <button onClick={onClose} aria-label="Close dialog" className="btn btn-ghost btn-icon">
+            <X size={16} />
           </button>
         </div>
 
         {/* Verification Status Banner */}
-        <div style={{
-          background: '#09090b',
-          border: isChainValid ? '1px solid #ffffff' : '1px solid var(--border-dim)',
-          borderRadius: '8px',
-          padding: '14px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '12px',
-        }}>
+        <div
+          style={{
+            background: 'var(--bg-card-solid)',
+            border: isChainValid ? '1px solid #ffffff' : '1px solid var(--border-dim)',
+            borderRadius: '10px',
+            padding: '14px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '12px',
+            boxShadow: isChainValid ? '0 0 18px rgba(255,255,255,0.12)' : 'none',
+          }}
+        >
           {verifying ? (
-            <span className="badge badge-low">Checking cryptographic integrity...</span>
+            <div className="flex" style={{ gap: '10px' }}>
+              <div className="live-dot" />
+              <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Recomputing cryptographic hash chain…</span>
+            </div>
           ) : isChainValid ? (
             <>
-              <ShieldCheck size={24} color="#ffffff" />
+              <ShieldCheck size={26} color="#ffffff" style={{ flexShrink: 0 }} />
               <div>
-                <h4 style={{ fontSize: '13px', fontWeight: 600, color: '#ffffff' }}>
-                  Cryptographic Hash Chain: VERIFIED
-                </h4>
+                <h4 style={{ fontSize: '13px', fontWeight: 650, color: '#ffffff' }}>Hash Chain: VERIFIED</h4>
                 <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                  All {timeline.length} event hashes recomputed from canonical JSON preimages and validated unbroken.
+                  All {verification?.event_count ?? timeline.length} event hashes recomputed from canonical JSON preimages — chain unbroken.
                 </p>
               </div>
             </>
           ) : (
             <>
-              <ShieldAlert size={24} color="#71717a" />
+              <ShieldAlert size={26} color="#71717a" style={{ flexShrink: 0 }} />
               <div>
-                <h4 style={{ fontSize: '13px', fontWeight: 600, color: '#ffffff' }}>
-                  Cryptographic Status: UNVERIFIED
-                </h4>
+                <h4 style={{ fontSize: '13px', fontWeight: 650, color: '#ffffff' }}>Hash Chain: UNVERIFIED</h4>
                 <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                  {verification?.error || 'Hash chain integrity could not be confirmed.'}
+                  {verification?.error || 'Integrity could not be confirmed.'}
                 </p>
               </div>
             </>
@@ -189,44 +195,38 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
 
         {/* Audit Metrics */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px' }}>
-          <div style={{ background: '#09090b', padding: '10px 12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
-            <div style={{ fontSize: '10px', color: 'var(--text-dim)', textTransform: 'uppercase' }}>SEALED EVENTS</div>
-            <div style={{ fontSize: '18px', fontWeight: 700, color: '#ffffff', marginTop: '2px' }}>
-              {timeline.length}
-            </div>
+          <div className="stat">
+            <div className="stat-label">SEALED EVENTS</div>
+            <div className="stat-value">{timeline.length}</div>
           </div>
-          <div style={{ background: '#09090b', padding: '10px 12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
-            <div style={{ fontSize: '10px', color: 'var(--text-dim)', textTransform: 'uppercase' }}>CONTEXT NODES</div>
-            <div style={{ fontSize: '18px', fontWeight: 700, color: '#ffffff', marginTop: '2px' }}>
-              {graphData?.nodes.length || 0}
-            </div>
+          <div className="stat">
+            <div className="stat-label">CONTEXT NODES</div>
+            <div className="stat-value">{graphData?.nodes.length || 0}</div>
           </div>
-          <div style={{ background: '#09090b', padding: '10px 12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
-            <div style={{ fontSize: '10px', color: 'var(--text-dim)', textTransform: 'uppercase' }}>POLICY GATES</div>
-            <div style={{ fontSize: '18px', fontWeight: 700, color: '#ffffff', marginTop: '2px' }}>
-              {findings.length}
-            </div>
+          <div className="stat">
+            <div className="stat-label">POLICY GATES</div>
+            <div className="stat-value">{findings.length}</div>
           </div>
         </div>
 
         {/* Cryptographic Head Hash */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-          <label style={{ fontSize: '11px', fontWeight: 500, color: 'var(--text-muted)' }}>
-            Head Event Hash (Merkle Chain Root)
+        <div className="flex-col" style={{ gap: '5px' }}>
+          <label style={{ fontSize: '11px', fontWeight: 550, color: 'var(--text-muted)' }}>
+            Head Event Hash (Chain Root)
           </label>
-          <div className="font-mono" style={{ background: '#09090b', padding: '8px 12px', borderRadius: '6px', border: '1px solid var(--border-dim)', fontSize: '11px', color: '#d4d4d8', wordBreak: 'break-all' }}>
+          <div className="code-block" style={{ fontSize: '11px', color: '#d4d4d8', wordBreak: 'break-all' }}>
             {lastEventHash}
           </div>
         </div>
 
         {/* Action Buttons */}
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '6px' }}>
+        <div className="flex" style={{ justifyContent: 'flex-end', gap: '10px', marginTop: '6px' }}>
           <button onClick={onClose} className="btn btn-secondary">
             Close
           </button>
           <button onClick={handleExportJSON} className="btn btn-primary" disabled={downloading}>
             {downloading ? <Check size={14} /> : <Download size={14} />}
-            {downloading ? 'Exported!' : 'Export Verified Report (JSON)'}
+            {downloading ? 'Exported!' : 'Export Report (JSON)'}
           </button>
         </div>
       </div>

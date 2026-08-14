@@ -40,7 +40,11 @@ class _DATA_BLOB(ctypes.Structure):
 
 
 def _win32_dpapi_protect(data: bytes, description: str = "AgentTrace Master Key") -> bytes:
-    """Encrypts bytes using Windows DPAPI (tied to current user login)."""
+    """Encrypts bytes using Windows DPAPI (tied to current user login).
+
+    FAILS CLOSED: if DPAPI protection fails, an EncryptionError is raised
+    rather than silently persisting the master key in plaintext.
+    """
     if sys.platform != "win32":
         return data
 
@@ -65,19 +69,26 @@ def _win32_dpapi_protect(data: bytes, description: str = "AgentTrace Master Key"
             ctypes.byref(data_out),
         )
         if not ret:
-            logger.warning("CryptProtectData failed, saving without DPAPI envelope")
-            return data
+            raise EncryptionError(
+                "CryptProtectData failed; refusing to store the master key in plaintext"
+            )
 
         raw_bytes = ctypes.string_at(data_out.pbData, data_out.cbData)
         kernel32.LocalFree(data_out.pbData)
         return raw_bytes
+    except EncryptionError:
+        raise
     except Exception as e:
-        logger.warning("DPAPI Protect error: %s", e)
-        return data
+        raise EncryptionError(f"DPAPI Protect error: {e}") from e
 
 
 def _win32_dpapi_unprotect(data: bytes) -> bytes:
-    """Decrypts bytes using Windows DPAPI."""
+    """Decrypts bytes using Windows DPAPI.
+
+    FAILS CLOSED: if the data is not a valid DPAPI blob, an EncryptionError
+    is raised. Callers may treat the failure as a legacy-plaintext migration
+    case, but the bytes are never silently trusted.
+    """
     if sys.platform != "win32":
         return data
 
@@ -101,15 +112,15 @@ def _win32_dpapi_unprotect(data: bytes) -> bytes:
             ctypes.byref(data_out),
         )
         if not ret:
-            # Maybe it wasn't DPAPI protected (plain bytes)
-            return data
+            raise EncryptionError("CryptUnprotectData failed: data is not a DPAPI-protected blob")
 
         raw_bytes = ctypes.string_at(data_out.pbData, data_out.cbData)
         kernel32.LocalFree(data_out.pbData)
         return raw_bytes
+    except EncryptionError:
+        raise
     except Exception as e:
-        logger.debug("DPAPI Unprotect error or non-DPAPI data: %s", e)
-        return data
+        raise EncryptionError(f"DPAPI Unprotect error: {e}") from e
 
 
 class EncryptionManager:
@@ -137,41 +148,79 @@ class EncryptionManager:
         return self._key_dir / "master.key"
 
     def _load_or_create_key(self) -> bytes:
-        """Load existing key or generate a new one with OS protection."""
+        """Load existing key or generate a new one with OS protection.
+
+        Fail-closed behavior: a present-but-unreadable/corrupt key file raises
+        rather than being silently replaced (replacement would orphan all
+        previously encrypted data). Legacy plaintext keys written by older
+        versions are migrated to DPAPI protection in place.
+        """
         key_path = self._key_path()
 
         if key_path.exists():
+            raw_disk_bytes = key_path.read_bytes()
+            key = self._try_load_key(key_path, raw_disk_bytes)
+            if key is not None:
+                return key
+            raise EncryptionError(
+                f"Master key file {key_path} is present but unreadable/corrupt. "
+                "Refusing to overwrite it (existing encrypted data would be lost). "
+                "Restore a valid key or remove the file deliberately to start fresh."
+            )
+
+        return self._create_key(key_path)
+
+    def _try_load_key(self, key_path: Path, raw: bytes) -> bytes | None:
+        """Attempt to load a key from disk, handling current and legacy formats."""
+        # 1) Current format: DPAPI-protected (Windows) or raw base64 (POSIX, file-perms protected)
+        try:
+            unprotected = _win32_dpapi_unprotect(raw)
             try:
-                raw_disk_bytes = key_path.read_bytes()
-                # Attempt DPAPI unprotect
-                unprotected = _win32_dpapi_unprotect(raw_disk_bytes)
-                # Decode if base64 encoded
-                try:
-                    key = base64.b64decode(unprotected)
-                except Exception:
-                    key = unprotected
+                key = base64.b64decode(unprotected)
+            except Exception:
+                key = unprotected
+            if len(key) == _KEY_SIZE:
+                return key
+        except EncryptionError:
+            pass
 
-                if len(key) == _KEY_SIZE:
-                    return key
-                logger.warning("Loaded key has invalid length %d, generating fresh key", len(key))
-            except Exception as e:
-                logger.warning("Failed to load key from %s (%s), generating fresh key", key_path, e)
+        # 2) Legacy format: plaintext base64 key written by versions that failed open.
+        #    Migrate it to DPAPI protection in place (one-time), then return it.
+        try:
+            legacy_key = base64.b64decode(raw)
+        except Exception:
+            legacy_key = b""
+        if len(legacy_key) == _KEY_SIZE:
+            logger.warning(
+                "Legacy plaintext master key detected at %s; migrating to OS-protected storage",
+                key_path,
+            )
+            protected_bytes = _win32_dpapi_protect(legacy_key)
+            key_path.write_bytes(protected_bytes)
+            self._restrict_permissions(key_path)
+            return legacy_key
 
-        # Generate fresh 256-bit cryptographically secure key
+        return None
+
+    def _create_key(self, key_path: Path) -> bytes:
+        """Generate a fresh 256-bit cryptographically secure key with OS protection."""
         key = secrets.token_bytes(_KEY_SIZE)
         encoded_key = base64.b64encode(key)
         protected_bytes = _win32_dpapi_protect(encoded_key)
 
         key_path.write_bytes(protected_bytes)
+        self._restrict_permissions(key_path)
 
-        # Enforce restrictive permissions
+        logger.info("Generated new protected encryption key at: %s", key_path)
+        return key
+
+    @staticmethod
+    def _restrict_permissions(key_path: Path) -> None:
+        """Enforce restrictive file permissions on the key file."""
         try:
             os.chmod(str(key_path), 0o600)
         except OSError:
             pass
-
-        logger.info("Generated new protected encryption key at: %s", key_path)
-        return key
 
     def encrypt(self, plaintext: bytes, associated_data: bytes | None = None) -> bytes:
         """Encrypt data using AES-256-GCM.

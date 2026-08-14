@@ -6,11 +6,9 @@ expiry, and affected commands/paths/destinations.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from agenttrace.models.events import ApprovalEvent, ConfidenceLevel
 from agenttrace.storage.ledger import EventLedger
@@ -77,7 +75,7 @@ class ApprovalManager:
         # Append to the hash-chained ledger
         event_hash = self._ledger.append_event(event)
 
-        # Store queryable approval record
+        # Store queryable approval record (paths AND commands encrypted)
         self._ledger.store_approval(
             approval_id=event.event_id,
             session_id=self.session_id,
@@ -86,9 +84,8 @@ class ApprovalManager:
             reason=reason,
             scope=scope,
             expiry=expiry.isoformat(),
-            affected_json=json.dumps(
-                {"paths": affected_paths or [], "commands": affected_commands or []}
-            ),
+            affected_paths=affected_paths or [],
+            affected_commands=affected_commands or [],
             created_at=event.timestamp.isoformat(),
             event_hash=event_hash,
         )
@@ -108,36 +105,96 @@ class ApprovalManager:
 
     def check_approval(
         self,
-        finding_id: str,
+        finding_id: str | None = None,
         path: str | None = None,
         command: str | None = None,
     ) -> bool:
         """Check if an action is covered by an active approval.
 
-        Returns True if a valid, non-expired approval covers the action.
+        Returns True if a valid, non-expired approval matches either:
+        - the exact finding ID, or
+        - the action's path / command scope (so a user who approved a finding
+          covering `/workspace/.env` is not re-prompted for the same file).
+
+        Expired approvals are pruned from the active cache on access.
         """
-        approval = self._active_approvals.get(finding_id)
-        if not approval:
-            return False
+        now = datetime.now(timezone.utc)
 
-        # Check expiry
-        if approval.expiry and datetime.now(timezone.utc) > approval.expiry:
-            del self._active_approvals[finding_id]
-            return False
+        for fid, approval in list(self._active_approvals.items()):
+            if not approval.approved:
+                continue
 
-        if not approval.approved:
-            return False
+            # Prune expired approvals
+            if approval.expiry and now > approval.expiry:
+                del self._active_approvals[fid]
+                continue
 
-        # Check scope
-        if path and approval.affected_paths:
-            if not any(p in path for p in approval.affected_paths):
-                return False
+            # Exact finding match
+            if finding_id and (fid == finding_id or approval.finding_id == finding_id):
+                return True
 
-        if command and approval.affected_commands:
-            if not any(c in command for c in approval.affected_commands):
-                return False
+            # Scope match on path
+            if path and approval.affected_paths:
+                if any(p in path for p in approval.affected_paths):
+                    return True
 
-        return True
+            # Scope match on command
+            if command and approval.affected_commands:
+                if any(c in command for c in approval.affected_commands):
+                    return True
+
+        return False
+
+    # Backwards-compatible alias: earlier daemon code referenced is_approved()
+    is_approved = check_approval
+
+    def reload_from_storage(self) -> int:
+        """Repopulate the active approval cache from the persisted ledger.
+
+        Called on daemon restart so previously granted approvals keep working
+        without requiring the user to re-approve the same action.
+
+        Returns the number of active approvals restored.
+        """
+        records = self._ledger.get_approvals(self.session_id)
+        now = datetime.now(timezone.utc)
+        restored = 0
+
+        for rec in records:
+            if not rec.get("approved"):
+                continue
+
+            try:
+                expiry = datetime.fromisoformat(rec["expiry"]) if rec.get("expiry") else None
+            except (ValueError, TypeError):
+                expiry = None
+
+            if expiry and now > expiry:
+                continue
+
+            event = ApprovalEvent(
+                session_id=self.session_id,
+                actor_id="user",
+                source_adapter="approval_manager",
+                confidence=ConfidenceLevel.HIGH,
+                finding_id=rec.get("finding_id", ""),
+                approved=True,
+                reason=rec.get("reason", ""),
+                scope=rec.get("scope", ""),
+                expiry=expiry,
+                affected_paths=rec.get("affected_paths", []) or [],
+                affected_commands=rec.get("affected_commands", []) or [],
+            )
+            self._active_approvals[event.finding_id] = event
+            restored += 1
+
+        if restored:
+            logger.info(
+                "Restored %d active approval(s) for session %s from ledger",
+                restored,
+                self.session_id,
+            )
+        return restored
 
     def get_active_approvals(self) -> list[ApprovalEvent]:
         """Get all active (non-expired) approvals."""

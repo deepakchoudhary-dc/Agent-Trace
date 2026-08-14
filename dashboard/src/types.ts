@@ -22,7 +22,8 @@ export type NodeType =
   | 'build_result'
   | 'approval'
   | 'policy_finding'
-  | 'incident';
+  | 'incident'
+  | 'cluster';
 
 export type EdgeType =
   | 'READS'

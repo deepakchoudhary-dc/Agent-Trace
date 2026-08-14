@@ -1,9 +1,7 @@
 import React, { useState } from 'react';
 import {
-  GitPullRequest,
   CheckCircle2,
   XCircle,
-  AlertCircle,
   FileCheck,
   Cpu,
   RefreshCw,
@@ -45,19 +43,21 @@ export const ReviewLoopView: React.FC = () => {
   ];
 
   const current = iterations.find((i) => i.number === activeIteration) || iterations[0];
+  const convergencePct = Math.round(current.convergence_score * 100);
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: '16px', margin: '0 16px 16px 16px', height: 'calc(100vh - 120px)' }}>
+    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 260px) 1fr', gap: '16px', margin: '0 16px 16px 16px', height: 'calc(100vh - 120px)' }}>
       {/* Iterations Sidebar */}
-      <div className="glass-panel" style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <RefreshCw size={14} color="#ffffff" />
-          <h2 className="font-heading" style={{ fontSize: '13px', fontWeight: 600 }}>
-            Review Iterations ({iterations.length})
-          </h2>
+      <div className="glass-panel" style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px', minHeight: 0 }}>
+        <div className="panel-header" style={{ padding: 0, border: 'none', background: 'transparent' }}>
+          <div className="flex" style={{ gap: '8px' }}>
+            <RefreshCw size={14} color="#ffffff" />
+            <span className="panel-title">Iterations</span>
+            <span className="chip">{iterations.length}</span>
+          </div>
         </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        <div className="scroll-thin" style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '6px' }}>
           {iterations.map((iter) => (
             <div
               key={iter.number}
@@ -65,19 +65,14 @@ export const ReviewLoopView: React.FC = () => {
               tabIndex={0}
               role="button"
               aria-label={`Iteration ${iter.number}`}
-              style={{
-                padding: '10px 12px',
-                borderRadius: '6px',
-                cursor: 'pointer',
-                background: activeIteration === iter.number ? '#18181b' : 'transparent',
-                border: activeIteration === iter.number ? '1px solid #ffffff' : '1px solid var(--border-dim)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') setActiveIteration(iter.number);
               }}
+              className={`card card--clickable ${activeIteration === iter.number ? 'card--selected' : ''}`}
+              style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
             >
               <div>
-                <div style={{ fontWeight: 600, fontSize: '12px', color: '#ffffff' }}>
+                <div style={{ fontWeight: 650, fontSize: '12px', color: '#ffffff' }}>
                   Iteration #{iter.number}
                 </div>
                 <div style={{ fontSize: '10px', color: 'var(--text-dim)' }}>
@@ -95,11 +90,11 @@ export const ReviewLoopView: React.FC = () => {
       {/* Main Review Loop Trace */}
       <div className="glass-panel" style={{ padding: '18px', display: 'flex', flexDirection: 'column', gap: '16px', overflowY: 'auto' }}>
         {/* Header */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid var(--border-dim)', paddingBottom: '12px' }}>
+        <div className="flex-between" style={{ borderBottom: '1px solid var(--border-dim)', paddingBottom: '12px', flexWrap: 'wrap', gap: '10px' }}>
           <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div className="flex" style={{ gap: '8px' }}>
               <h2 className="font-heading" style={{ fontSize: '16px', fontWeight: 700 }}>
-                Review Loop Convergence Trace — Iteration #{current.number}
+                Review Loop Convergence — Iteration #{current.number}
               </h2>
               <span className={`badge ${current.verdict === 'PASSED' ? 'badge-high' : 'badge-critical'}`}>
                 {current.verdict}
@@ -110,77 +105,85 @@ export const ReviewLoopView: React.FC = () => {
             </p>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Convergence:</span>
-            <span className="badge badge-high" style={{ fontSize: '10px' }}>
-              {(current.convergence_score * 100).toFixed(0)}%
-            </span>
+          <div className="flex" style={{ gap: '10px' }}>
+            <div className="flex" style={{ gap: '6px' }}>
+              <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Convergence</span>
+              <span className="badge badge-high">{convergencePct}%</span>
+            </div>
+            <div
+              style={{
+                width: '110px',
+                height: '6px',
+                background: 'rgba(255,255,255,0.1)',
+                borderRadius: '999px',
+                overflow: 'hidden',
+              }}
+            >
+              <div
+                style={{
+                  width: `${convergencePct}%`,
+                  height: '100%',
+                  background: '#ffffff',
+                  borderRadius: '999px',
+                  boxShadow: '0 0 8px rgba(255,255,255,0.6)',
+                  transition: 'width 0.4s var(--ease-out)',
+                }}
+              />
+            </div>
           </div>
         </div>
 
         {/* Roles Flow Chart */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px' }}>
-          {/* Planner */}
-          <div style={{ background: '#09090b', padding: '12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
-              <Sparkles size={13} color="#ffffff" />
-              <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase' }}>PLANNER</span>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '10px' }}>
+          {[
+            { icon: Sparkles, title: 'PLANNER', body: current.planner_intent, mono: false },
+            { icon: Cpu, title: 'WORKER', body: current.worker_patch, mono: true },
+            {
+              icon: FileCheck,
+              title: 'SYNTHESIZER',
+              body: current.verdict === 'PASSED' ? 'All criteria satisfied. Approved for merge.' : 'Failed criteria detected. Iteration loop resumed.',
+              mono: false,
+            },
+          ].map(({ icon: Icon, title, body, mono }) => (
+            <div key={title} className="card" style={{ padding: '12px' }}>
+              <div className="flex" style={{ gap: '6px', marginBottom: '7px' }}>
+                <Icon size={13} color="#ffffff" />
+                <span style={{ fontSize: '10.5px', fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  {title}
+                </span>
+              </div>
+              <p className={mono ? 'font-mono' : ''} style={{ fontSize: '11px', color: mono ? '#ffffff' : 'var(--text-muted)', wordBreak: 'break-word' }}>
+                {body}
+              </p>
             </div>
-            <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-              {current.planner_intent}
-            </p>
-          </div>
+          ))}
+        </div>
 
-          {/* Worker */}
-          <div style={{ background: '#09090b', padding: '12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
-              <Cpu size={13} color="#ffffff" />
-              <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase' }}>WORKER</span>
-            </div>
-            <p className="font-mono" style={{ fontSize: '11px', color: '#ffffff' }}>
-              {current.worker_patch}
-            </p>
-          </div>
-
-          {/* Synthesizer */}
-          <div style={{ background: '#09090b', padding: '12px', borderRadius: '6px', border: '1px solid var(--border-dim)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
-              <FileCheck size={13} color="#ffffff" />
-              <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase' }}>SYNTHESIZER</span>
-            </div>
-            <p style={{ fontSize: '11px', color: current.verdict === 'PASSED' ? '#ffffff' : 'var(--text-muted)' }}>
-              {current.verdict === 'PASSED' ? 'All criteria satisfied. Approved for merge.' : 'Failed criteria detected. Iteration loop resumed.'}
-            </p>
-          </div>
+        {/* Flow connector */}
+        <div className="flex" style={{ justifyContent: 'center', color: 'var(--text-dim)' }}>
+          <ArrowRight size={14} />
         </div>
 
         {/* Independent Reviewers Section */}
         <div>
-          <h3 className="font-heading" style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
+          <h3 className="font-heading" style={{ fontSize: '13px', fontWeight: 650, marginBottom: '8px' }}>
             Independent Reviewer Verdicts
           </h3>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <div className="flex-col" style={{ gap: '8px' }}>
             {current.reviews.map((rev, idx) => (
               <div
                 key={idx}
-                style={{
-                  background: '#09090b',
-                  border: '1px solid var(--border-dim)',
-                  borderRadius: '6px',
-                  padding: '10px 14px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                }}
+                className="card"
+                style={{ padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px' }}
               >
-                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div className="flex" style={{ gap: '10px', minWidth: 0 }}>
                   {rev.status === 'PASSED' ? (
-                    <CheckCircle2 size={15} color="#ffffff" />
+                    <CheckCircle2 size={15} color="#ffffff" style={{ flexShrink: 0 }} />
                   ) : (
-                    <XCircle size={15} color="#71717a" />
+                    <XCircle size={15} color="#71717a" style={{ flexShrink: 0 }} />
                   )}
-                  <div>
-                    <div style={{ fontSize: '12px', fontWeight: 600, color: '#ffffff' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: '12px', fontWeight: 650, color: '#ffffff' }}>
                       {rev.role}
                     </div>
                     <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
@@ -189,7 +192,7 @@ export const ReviewLoopView: React.FC = () => {
                   </div>
                 </div>
 
-                <span className={`badge ${rev.status === 'PASSED' ? 'badge-high' : 'badge-low'}`}>
+                <span className={`badge ${rev.status === 'PASSED' ? 'badge-high' : 'badge-low'}`} style={{ flexShrink: 0 }}>
                   {rev.status}
                 </span>
               </div>

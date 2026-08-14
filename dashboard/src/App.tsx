@@ -17,7 +17,23 @@ import { DiffPanel } from './components/DiffPanel';
 import { ReviewLoopView } from './components/ReviewLoopView';
 import { ApprovalGateModal } from './components/ApprovalGateModal';
 import { ForensicReportModal } from './components/ForensicReportModal';
-import { AlertCircle, RefreshCw } from 'lucide-react';
+import { AlertCircle, RefreshCw, X } from 'lucide-react';
+
+const LoadingShell: React.FC = () => (
+  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', margin: '0 16px 16px 16px' }}>
+    <div className="glass-panel" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div className="skeleton" style={{ width: '45%', height: '14px' }} />
+      <div className="skeleton" style={{ width: '100%', height: '120px' }} />
+      <div className="skeleton" style={{ width: '80%', height: '120px' }} />
+      <div className="skeleton" style={{ width: '60%', height: '120px' }} />
+    </div>
+    <div className="glass-panel" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div className="skeleton" style={{ width: '35%', height: '14px' }} />
+      <div className="skeleton" style={{ width: '100%', height: '200px' }} />
+      <div className="skeleton" style={{ width: '70%', height: '80px' }} />
+    </div>
+  </div>
+);
 
 export const App: React.FC = () => {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -177,6 +193,8 @@ export const App: React.FC = () => {
     }
   };
 
+  const showInitialSkeleton = loading && sessions.length === 0 && !connectionError;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', background: '#000000' }}>
       {/* Top Navigation */}
@@ -200,70 +218,79 @@ export const App: React.FC = () => {
       {connectionError && (
         <div
           role="alert"
+          className="glass-panel"
           style={{
             margin: '0 16px 10px 16px',
-            padding: '8px 14px',
-            background: '#18181b',
-            border: '1px solid #ffffff',
-            borderRadius: '6px',
-            color: '#ffffff',
-            fontSize: '12px',
+            padding: '10px 14px',
+            borderColor: '#ffffff',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
+            gap: '12px',
+            animation: 'none',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <AlertCircle size={14} color="#ffffff" />
-            <span>{connectionError}</span>
+          <div className="flex" style={{ gap: '9px', minWidth: 0 }}>
+            <AlertCircle size={15} color="#ffffff" style={{ flexShrink: 0 }} />
+            <span style={{ fontSize: '12px', color: '#ffffff' }}>{connectionError}</span>
           </div>
-          <button
-            onClick={loadSessions}
-            className="btn btn-secondary"
-            style={{ fontSize: '10.5px', padding: '3px 8px' }}
-          >
-            <RefreshCw size={11} /> Retry
-          </button>
+          <div className="flex" style={{ gap: '6px', flexShrink: 0 }}>
+            <button onClick={loadSessions} className="btn btn-secondary btn-sm">
+              <RefreshCw size={11} /> Retry
+            </button>
+            <button onClick={() => setConnectionError('')} className="btn btn-ghost btn-icon" aria-label="Dismiss alert">
+              <X size={13} />
+            </button>
+          </div>
         </div>
       )}
 
       {/* Main Content Area by Tab */}
-      <main style={{ flex: 1 }}>
-        {activeTab === 'graph' && (
-          <GraphView
-            graphData={graphData || { session_id: currentSession?.session_id || '', nodes: [], edges: [] }}
-            onInspectNode={handleInspectNode}
-            selectedNode={selectedNode}
-            currentSession={currentSession}
-            livePolling={livePolling}
-          />
-        )}
+      <main style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        {showInitialSkeleton ? (
+          <LoadingShell />
+        ) : (
+          <>
+            {activeTab === 'graph' && (
+              <GraphView
+                graphData={graphData || { session_id: currentSession?.session_id || '', nodes: [], edges: [] }}
+                onInspectNode={handleInspectNode}
+                selectedNode={selectedNode}
+                currentSession={currentSession}
+                livePolling={livePolling}
+              />
+            )}
 
-        {activeTab === 'timeline' && (
-          <Timeline events={timeline} onSelectEvent={(e) => {
-            // Find corresponding graph node if available
-            const matchingNode = graphData?.nodes.find((n) => n.data?.event_id === e.event_id || n.label.includes(e.event_type));
-            if (matchingNode) {
-              setSelectedNode(matchingNode);
-              setActiveTab('graph');
-            }
-          }} />
-        )}
+            {activeTab === 'timeline' && (
+              <Timeline
+                events={timeline}
+                onSelectEvent={(e) => {
+                  // Find corresponding graph node if available
+                  const matchingNode = graphData?.nodes.find(
+                    (n) => n.data?.event_id === e.event_id || n.label.includes(e.event_type)
+                  );
+                  if (matchingNode) {
+                    setSelectedNode(matchingNode);
+                    setActiveTab('graph');
+                  }
+                }}
+              />
+            )}
 
-        {activeTab === 'incidents' && (
-          <IncidentPanel
-            findings={findings}
-            causalPaths={causalPaths}
-            onRequestApproval={(f) => setApprovalFinding(f)}
-          />
-        )}
+            {activeTab === 'incidents' && (
+              <IncidentPanel
+                findings={findings}
+                causalPaths={causalPaths}
+                onRequestApproval={(f) => setApprovalFinding(f)}
+              />
+            )}
 
-        {activeTab === 'review_loop' && (
-          <ReviewLoopView />
-        )}
+            {activeTab === 'review_loop' && <ReviewLoopView />}
 
-        {activeTab === 'diff' && (
-          <DiffPanel sessionId={currentSession?.session_id} blastRadius={blastRadius} />
+            {activeTab === 'diff' && (
+              <DiffPanel sessionId={currentSession?.session_id} blastRadius={blastRadius} />
+            )}
+          </>
         )}
       </main>
 
