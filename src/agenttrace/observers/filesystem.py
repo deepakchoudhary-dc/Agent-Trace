@@ -12,12 +12,15 @@ import hashlib
 import logging
 from fnmatch import fnmatch
 from pathlib import Path
-from uuid import UUID
+from typing import TYPE_CHECKING
 
 from watchfiles import Change, awatch
 
 from agenttrace.models.events import ConfidenceLevel, FileMutationEvent
 from agenttrace.observers.base import BaseObserver, EventCallback
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,10 @@ _CHANGE_MAP = {
     Change.modified: "modify",
     Change.deleted: "delete",
 }
+
+# Cap on the in-memory text cache used for before/after diffs. Entries are
+# ≤100 KB each; without a cap a 10k-file repo can pin ~1 GB of RAM.
+_MAX_CONTENT_CACHE = 2048
 
 
 class FilesystemObserver(BaseObserver):
@@ -61,9 +68,18 @@ class FilesystemObserver(BaseObserver):
         """Check if a file path matches any ignore pattern."""
         try:
             rel_path = str(Path(path).relative_to(self.workspace_path)).replace("\\", "/")
-            return any(fnmatch(rel_path, pat) or fnmatch(Path(path).name, pat) for pat in self._ignore_patterns)
+            return any(
+                fnmatch(rel_path, pat) or fnmatch(Path(path).name, pat)
+                for pat in self._ignore_patterns
+            )
         except Exception:
             return False
+
+    def _cache_content(self, path: str, content: str) -> None:
+        """Store a file text in the bounded diff cache, evicting oldest."""
+        if len(self._content_cache) >= _MAX_CONTENT_CACHE:
+            self._content_cache.pop(next(iter(self._content_cache)))
+        self._content_cache[path] = content
 
     @staticmethod
     def _compute_file_hash(path: str) -> str:
@@ -96,7 +112,7 @@ class FilesystemObserver(BaseObserver):
                         file_hash = self._compute_file_hash(path_str)
                         if file_hash:
                             self._hash_cache[path_str] = file_hash
-                            self._content_cache[path_str] = self._read_file_text(path_str)
+                            self._cache_content(path_str, self._read_file_text(path_str))
                             count += 1
         except Exception as e:
             logger.warning("Error building initial filesystem cache: %s", e)
@@ -132,7 +148,7 @@ class FilesystemObserver(BaseObserver):
                         after_hash = self._compute_file_hash(path_str)
                         after_content = self._read_file_text(path_str)
                         self._hash_cache[path_str] = after_hash
-                        self._content_cache[path_str] = after_content
+                        self._cache_content(path_str, after_content)
 
                         if before_content and after_content:
                             diff_lines = list(
@@ -174,3 +190,15 @@ class FilesystemObserver(BaseObserver):
     def snapshot_hashes(self) -> dict[str, str]:
         """Return current file hash cache for baseline generation."""
         return dict(self._hash_cache)
+
+    def seed_hashes(self, hashes: dict[str, str]) -> None:
+        """Seed the hash cache from the baseline graph's SOURCE_FILE nodes.
+
+        Reconciles the two independently-computed hash sources (baseline
+        generator and this observer) so the first watchfiles mutation has a
+        real ``before_hash`` instead of an empty string. Existing entries are
+        never overwritten.
+        """
+        for path, content_hash in hashes.items():
+            if path and content_hash and path not in self._hash_cache:
+                self._hash_cache[path] = content_hash

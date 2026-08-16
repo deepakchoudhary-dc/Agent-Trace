@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.adapters.sdk import SDK_VERSION, AdapterBase
 from agenttrace.models.events import (
@@ -36,7 +36,22 @@ from agenttrace.models.events import (
     ToolResultEvent,
 )
 
+if TYPE_CHECKING:
+    from uuid import UUID
+
 logger = logging.getLogger(__name__)
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse a vendor ISO-8601 timestamp into an aware datetime."""
+    if not isinstance(value, str):
+        return None
+    try:
+        ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=datetime.now().tzinfo)
+
 
 # Tool names whose input is a shell command string
 _SHELL_TOOLS = {"shell", "shell_command", "bash", "local_shell_call"}
@@ -84,6 +99,20 @@ class CodexAdapter(AdapterBase):
 
     # -- Lifecycle --
 
+    def cursor_state(self) -> dict[str, Any]:
+        return {
+            "positions": dict(self._positions),
+            "invoked": sorted(self._invoked),
+        }
+
+    def restore_cursor(self, state: dict[str, Any]) -> None:
+        positions = state.get("positions", {})
+        if isinstance(positions, dict):
+            self._positions = {
+                str(k): int(v) for k, v in positions.items()
+            }
+        self._invoked = set(state.get("invoked", []))
+
     async def start(self) -> None:
         self._running = True
         logger.info(
@@ -118,25 +147,63 @@ class CodexAdapter(AdapterBase):
             path_key = str(rollout)
             if path_key not in self._positions:
                 self._positions[path_key] = 0
-            try:
-                with open(rollout, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(self._positions[path_key])
-                    new_lines = f.readlines()
-                    self._positions[path_key] = f.tell()
-            except OSError:
-                continue
 
-            for line in new_lines:
-                line = line.strip()
+            for raw_line in self._read_new_lines(rollout):
+                if raw_line is None:
+                    break  # tail line truncated mid-write — retry next poll
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     envelope = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                events.extend(self._translate_envelope(rollout, envelope))
+                translated = self._translate_envelope(rollout, envelope)
+                timestamp = _parse_iso(envelope.get("timestamp"))
+                if timestamp is not None:
+                    for ev in translated:
+                        ev.timestamp = timestamp
+                events.extend(translated)
 
         return events
+
+    def _read_new_lines(self, rollout: Path) -> list[str | None]:
+        """Read new rollout lines as text, in binary mode so byte-offset
+        cursors stay exact on Windows.
+
+        A trailing line without a newline that fails to parse is a tail line
+        truncated mid-write: the cursor is rewound to its start so the same
+        line is retried on the next poll instead of being permanently lost.
+        """
+        path_key = str(rollout)
+        try:
+            with open(rollout, "rb") as f:
+                size = f.seek(0, 2)
+                if size < self._positions[path_key]:
+                    # File rotated/truncated while not watched (e.g. during a
+                    # daemon restart) — restart the cursor from the top.
+                    self._positions[path_key] = 0
+                f.seek(self._positions[path_key])
+                raw_lines = f.readlines()
+                new_position = f.tell()
+        except OSError:
+            return []
+        self._positions[path_key] = new_position
+
+        lines: list[str | None] = []
+        for raw in raw_lines:
+            if not raw.endswith(b"\n"):
+                truncated = raw.decode("utf-8", errors="replace").strip()
+                if truncated:
+                    try:
+                        json.loads(truncated)
+                    except json.JSONDecodeError:
+                        self._positions[path_key] = new_position - len(raw)
+                        return [*lines, None]
+                lines.append(truncated)
+            else:
+                lines.append(raw.decode("utf-8", errors="replace"))
+        return lines
 
     # -- Translation --
 
@@ -211,7 +278,11 @@ class CodexAdapter(AdapterBase):
                     actor_id=actor,
                     source_adapter=self.adapter_name,
                     confidence=ConfidenceLevel.HIGH,
-                    payload={**common, "reasoning": str(summary)[:2000], "reasoning_kind": "summary"},
+                    payload={
+                        **common,
+                        "reasoning": str(summary)[:2000],
+                        "reasoning_kind": "summary",
+                    },
                 ))
             return events
 
@@ -257,7 +328,11 @@ class CodexAdapter(AdapterBase):
         events: list[EventBase] = []
         etype = ep.get("type", "")
 
-        if etype in ("exec_result", "function_call_output", "custom_tool_call_result"):
+        if etype in (
+            "exec_result",
+            "function_call_output",
+            "custom_tool_call_result",
+        ):
             output = ep.get("output", "") or ep.get("value", "") or ""
             if isinstance(output, (dict, list)):
                 output = json.dumps(output, ensure_ascii=False)

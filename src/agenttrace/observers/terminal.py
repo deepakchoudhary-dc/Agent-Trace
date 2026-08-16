@@ -11,10 +11,13 @@ import logging
 import os
 import re
 from pathlib import Path
-from uuid import UUID
+from typing import TYPE_CHECKING
 
 from agenttrace.models.events import CommandEvent, ConfidenceLevel
 from agenttrace.observers.base import BaseObserver, EventCallback
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,11 @@ _RISKY_COMMAND_PATTERNS = [
 ]
 
 _POLL_INTERVAL = 2.0
+
+# Cap on the seen-command dedup set; when exceeded the set is cleared so the
+# observer never grows without bound. A cleared set can re-emit old commands
+# only if the history file is re-read from the start — acceptable and rare.
+_MAX_SEEN_COMMANDS = 10_000
 
 
 class TerminalObserver(BaseObserver):
@@ -78,9 +86,12 @@ class TerminalObserver(BaseObserver):
 
         app_data = os.environ.get("APPDATA", "")
         if app_data:
-            ps_hist = Path(app_data) / "Microsoft" / "Windows" / "PowerShell" / "PSReadLine" / "ConsoleHost_history.txt"
-            if ps_hist.exists():
-                found.append(ps_hist)
+            ps_readline = (
+                Path(app_data) / "Microsoft" / "Windows" / "PowerShell"
+                / "PSReadLine" / "ConsoleHost_history.txt"
+            )
+            if ps_readline.exists():
+                found.append(ps_readline)
 
         return found
 
@@ -118,10 +129,16 @@ class TerminalObserver(BaseObserver):
         try:
             current_size = hist_file.stat().st_size
             last_pos = self._history_positions.get(path_key, 0)
+            if current_size < last_pos:
+                # File was rotated/truncated — restart from the top. The
+                # seen-command set prevents duplicate emissions of commands
+                # that were already captured before rotation.
+                last_pos = 0
+                self._history_positions[path_key] = 0
             if current_size <= last_pos:
                 return
 
-            with open(hist_file, "r", encoding="utf-8", errors="replace") as f:
+            with open(hist_file, encoding="utf-8", errors="replace") as f:
                 f.seek(last_pos)
                 new_content = f.read()
 
@@ -133,10 +150,17 @@ class TerminalObserver(BaseObserver):
                     continue
 
                 self._seen_commands.add(command)
+                if len(self._seen_commands) > _MAX_SEEN_COMMANDS:
+                    self._seen_commands.clear()
 
                 # Check if command mentions workspace
-                is_workspace_related = self._workspace_name in command.lower() or self.workspace_path.lower() in command.lower()
-                confidence = ConfidenceLevel.MEDIUM if is_workspace_related else ConfidenceLevel.LOW
+                is_workspace_related = (
+                    self._workspace_name in command.lower()
+                    or self.workspace_path.lower() in command.lower()
+                )
+                confidence = (
+                    ConfidenceLevel.MEDIUM if is_workspace_related else ConfidenceLevel.LOW
+                )
                 actor_id = "terminal" if is_workspace_related else "unattributed_shell"
 
                 event = CommandEvent(

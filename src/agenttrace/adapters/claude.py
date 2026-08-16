@@ -28,9 +28,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.adapters.sdk import SDK_VERSION, AdapterBase
 from agenttrace.models.events import (
@@ -44,7 +44,21 @@ from agenttrace.models.events import (
     ToolResultEvent,
 )
 
+if TYPE_CHECKING:
+    from uuid import UUID
+
 logger = logging.getLogger(__name__)
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse a vendor ISO-8601 timestamp into an aware datetime."""
+    if not isinstance(value, str):
+        return None
+    try:
+        ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=datetime.now().tzinfo)
 
 
 class ClaudeAdapter(AdapterBase):
@@ -118,21 +132,52 @@ class ClaudeAdapter(AdapterBase):
 
     def _belongs_to_workspace(self, transcript: Path) -> bool:
         """A transcript belongs to this session if its session cwd is the
-        audited workspace (or a subdirectory of it)."""
+        audited workspace (or a subdirectory of it).
+
+        Matching is segment-exact: workspace ``C:\\proj`` must NOT ingest a
+        transcript whose cwd is ``C:\\proj2``.
+        """
         try:
-            with open(transcript, "r", encoding="utf-8", errors="replace") as f:
+            with open(transcript, encoding="utf-8", errors="replace") as f:
                 first = f.readline()
             entry = json.loads(first)
             cwd = entry.get("cwd", "")
             if not cwd:
                 return False
-            return str(Path(cwd).resolve()).startswith(
-                str(Path(self.workspace_path).resolve())
-            )
+            try:
+                cwd_path = Path(cwd).resolve()
+                ws_path = Path(self.workspace_path).resolve()
+            except (OSError, ValueError):
+                return False
+            return cwd_path == ws_path or cwd_path.is_relative_to(ws_path)
         except (OSError, json.JSONDecodeError, ValueError):
             return False
 
     # -- Lifecycle --
+
+    def cursor_state(self) -> dict[str, Any]:
+        return {
+            "positions": dict(self._positions),
+            "excluded": sorted(self._excluded),
+            "invoked": sorted(self._invoked),
+            "tool_ids": {k: dict(v) for k, v in self._tool_ids.items()},
+        }
+
+    def restore_cursor(self, state: dict[str, Any]) -> None:
+        positions = state.get("positions", {})
+        if isinstance(positions, dict):
+            self._positions = {
+                str(k): int(v) for k, v in positions.items()
+            }
+        self._excluded = set(state.get("excluded", []))
+        self._invoked = set(state.get("invoked", []))
+        tool_ids = state.get("tool_ids", {})
+        if isinstance(tool_ids, dict):
+            self._tool_ids = {
+                str(k): {"name": str(v.get("name", "")), "uuid": str(v.get("uuid", ""))}
+                for k, v in tool_ids.items()
+                if isinstance(v, dict)
+            }
 
     async def start(self) -> None:
         self._running = True
@@ -161,25 +206,64 @@ class ClaudeAdapter(AdapterBase):
             except OSError:
                 continue
 
-            try:
-                with open(transcript, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(self._positions[str(transcript)])
-                    new_lines = f.readlines()
-                    self._positions[str(transcript)] = f.tell()
-            except OSError:
-                continue
-
-            for line in new_lines:
-                line = line.strip()
+            for raw_line in self._read_new_lines(transcript):
+                if raw_line is None:
+                    break  # tail line was truncated mid-write — retry next poll
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                events.extend(self._translate_entry(transcript, entry))
+                translated = self._translate_entry(transcript, entry)
+                timestamp = _parse_iso(entry.get("timestamp"))
+                if timestamp is not None:
+                    for ev in translated:
+                        ev.timestamp = timestamp
+                events.extend(translated)
 
         return events
+
+    def _read_new_lines(self, transcript: Path) -> list[str | None]:
+        """Read new transcript lines as text, in binary mode so byte-offset
+        cursors stay exact on Windows.
+
+        A trailing line without a newline that fails to parse is a tail line
+        truncated mid-write: the cursor is rewound to its start so the same
+        line is retried on the next poll instead of being permanently lost.
+        """
+        position = self._positions[str(transcript)]
+        try:
+            with open(transcript, "rb") as f:
+                size = f.seek(0, 2)
+                if size < position:
+                    # File rotated/truncated while not watched (e.g. during a
+                    # daemon restart) — restart the cursor from the top.
+                    position = 0
+                f.seek(position)
+                raw_lines = f.readlines()
+                new_position = f.tell()
+        except OSError:
+            return []
+        self._positions[str(transcript)] = new_position
+
+        lines: list[str | None] = []
+        for raw in raw_lines:
+            if not raw.endswith(b"\n"):
+                truncated = raw.decode("utf-8", errors="replace").strip()
+                if truncated:
+                    try:
+                        json.loads(truncated)
+                    except json.JSONDecodeError:
+                        self._positions[str(transcript)] = (
+                            new_position - len(raw)
+                        )
+                        return [*lines, None]
+                lines.append(truncated)
+            else:
+                lines.append(raw.decode("utf-8", errors="replace"))
+        return lines
 
     # -- Translation --
 
@@ -202,19 +286,22 @@ class ClaudeAdapter(AdapterBase):
             content = msg.get("content") if isinstance(msg, dict) else msg
 
             # Plain-text prompt → invocation (once per transcript)
-            if isinstance(content, str) and content.strip():
-                if path_key not in self._invoked:
-                    self._invoked.add(path_key)
-                    events.append(InvocationEvent(
-                        session_id=self.session_id,
-                        actor_id=f"claude:{entry.get('sessionId', 'unknown')}",
-                        source_adapter=self.adapter_name,
-                        confidence=ConfidenceLevel.HIGH,
-                        user_intent=content[:500],
-                        agent_name="claude_code",
-                        agent_version=entry.get("version", ""),
-                        payload=common_payload,
-                    ))
+            if (
+                isinstance(content, str)
+                and content.strip()
+                and path_key not in self._invoked
+            ):
+                self._invoked.add(path_key)
+                events.append(InvocationEvent(
+                    session_id=self.session_id,
+                    actor_id=f"claude:{entry.get('sessionId', 'unknown')}",
+                    source_adapter=self.adapter_name,
+                    confidence=ConfidenceLevel.HIGH,
+                    user_intent=content[:500],
+                    agent_name="claude_code",
+                    agent_version=entry.get("version", ""),
+                    payload=common_payload,
+                ))
 
             # Tool result blocks → ToolResultEvent
             if isinstance(content, list):

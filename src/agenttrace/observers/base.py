@@ -8,13 +8,16 @@ sensing logic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.models.events import EventBase
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +71,8 @@ class BaseObserver(ABC):
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         self._task = None
         logger.info("%s stopped for session %s", self.name, self.session_id)
 

@@ -29,6 +29,32 @@ def session_id():
 class TestEventLedger:
     """Tests for EventLedger operations."""
 
+    def test_adapter_cursor_roundtrip(self, ledger: EventLedger) -> None:
+        sid = uuid4()
+        ledger.create_session(
+            session_id=sid,
+            config_json='{"workspace_path": "/test"}',
+            task_desc="Cursor",
+            started_at="2024-01-01T00:00:00Z",
+        )
+        assert ledger.get_adapter_cursor(sid) is None
+
+        ledger.save_adapter_cursor(
+            sid,
+            "claude_code",
+            {"positions": {"/home/u/.claude/s.jsonl": 12345}, "invoked": ["/x"]},
+        )
+        cursor = ledger.get_adapter_cursor(sid)
+        assert cursor is not None
+        assert cursor["adapter_name"] == "claude_code"
+        assert cursor["cursor"]["positions"]["/home/u/.claude/s.jsonl"] == 12345
+
+        # Upsert replaces the previous cursor in place
+        ledger.save_adapter_cursor(sid, "claude_code", {"positions": {}})
+        cursor2 = ledger.get_adapter_cursor(sid)
+        assert cursor2 is not None
+        assert cursor2["cursor"] == {"positions": {}}
+
     def test_create_session(self, ledger: EventLedger, session_id) -> None:
         ledger.create_session(
             session_id=session_id,

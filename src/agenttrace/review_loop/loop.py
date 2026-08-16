@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from agenttrace.review_loop.planner import Planner
 from agenttrace.review_loop.plan_reviewer import PlanReviewer, PlanReviewResult
+from agenttrace.review_loop.planner import Planner
 from agenttrace.review_loop.reviewer import (
     BaseReviewer,
     ConventionReviewer,
@@ -23,7 +23,7 @@ from agenttrace.review_loop.reviewer import (
     SecurityReviewer,
     SpecComplianceReviewer,
 )
-from agenttrace.review_loop.synthesizer import Synthesizer, SynthesisResult
+from agenttrace.review_loop.synthesizer import SynthesisResult, Synthesizer
 from agenttrace.review_loop.worker import Worker, WorkerResult
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,8 @@ class LoopResult:
 
     loop_id: UUID = field(default_factory=uuid4)
     task_description: str = ""
+    workspace_path: str = ""
+    scope_files: list[str] = field(default_factory=list)
     iterations: list[LoopIteration] = field(default_factory=list)
     final_passed: bool = False
     total_iterations: int = 0
@@ -78,10 +80,12 @@ class ReviewLoop:
         workspace_path: str = "",
         max_iterations: int = _MAX_ITERATIONS,
         gotchas_path: str | None = None,
+        log_lessons: bool = True,
     ) -> None:
         self.workspace_path = workspace_path
         self.max_iterations = max_iterations
-        self._gotchas_path = gotchas_path or str(
+        self.log_lessons = log_lessons
+        self._gotchas_path = gotchas_path if gotchas_path is not None else str(
             Path(workspace_path) / "gotchas.md"
         )
 
@@ -96,17 +100,36 @@ class ReviewLoop:
         self._synthesizer = Synthesizer()
         self._plan_reviewer = PlanReviewer()
 
-    def run(self, task_description: str) -> LoopResult:
+    def run(self, task_description: str, context: dict[str, Any] | None = None) -> LoopResult:
         """Execute the full review loop for a task.
 
         Flow per the architecture diagram:
         Task → Planner → [Worker → Reviewers → Synthesise → Pass?] loop
+
+        `context` may carry the real change scope of the audited work
+        (e.g. ``{"scope_files": [...], "diff_summaries": {...}}``) so the
+        Worker gathers real artifacts instead of assuming completion.
         """
         result = LoopResult(task_description=task_description)
+        result.workspace_path = self.workspace_path
+
+        scope_files: list[str] = []
+        diff_summaries: dict[str, str] = {}
+        if context:
+            raw_files = context.get("scope_files", [])
+            if isinstance(raw_files, list):
+                scope_files = [str(f) for f in raw_files]
+            raw_diffs = context.get("diff_summaries", {})
+            if isinstance(raw_diffs, dict):
+                diff_summaries = {str(k): str(v) for k, v in raw_diffs.items()}
+        result.scope_files = list(scope_files)
 
         # Step 1: Plan
-        plan = self._planner.create_plan(task_description)
+        plan = self._planner.create_plan(task_description, context)
         logger.info("Plan created: %d subtasks", len(plan.subtasks))
+
+        # Step 2: Wire the real change scope into the Worker
+        self._worker.set_review_context(scope_files, diff_summaries)
 
         feedback: dict[str, Any] | None = None
 
@@ -178,7 +201,7 @@ class ReviewLoop:
                 result.lessons_learned.extend(iteration.plan_review.lessons_learned)
 
         # Log lessons to gotchas.md
-        if result.lessons_learned:
+        if result.lessons_learned and self.log_lessons:
             self._log_lessons(result)
 
         if not result.final_passed:

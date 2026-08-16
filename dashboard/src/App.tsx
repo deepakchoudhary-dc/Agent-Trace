@@ -51,6 +51,9 @@ export const App: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(false);
   const [livePolling, setLivePolling] = useState<boolean>(true);
   const [connectionError, setConnectionError] = useState<string>('');
+  // False when the daemon could not be reached for session data — views must
+  // render "UNVERIFIED" instead of treating missing data as compliance.
+  const [dataVerified, setDataVerified] = useState<boolean>(true);
 
   const requestIdRef = useRef<number>(0);
   const currentSessionIdRef = useRef<string | null>(null);
@@ -95,14 +98,15 @@ export const App: React.FC = () => {
 
     try {
       const [graph, time, fnd] = await Promise.all([
-        api.getGraph(sessionId).catch(() => ({ session_id: sessionId, nodes: [], edges: [] })),
-        api.getTimeline(sessionId).catch(() => []),
-        api.getFindings(sessionId).catch(() => []),
+        api.getGraph(sessionId),
+        api.getTimeline(sessionId),
+        api.getFindings(sessionId),
       ]);
 
       // Guard against stale asynchronous response
       if (currentRequestId !== requestIdRef.current) return;
 
+      setDataVerified(true);
       setGraphData(graph);
       setTimeline(time);
       setFindings(fnd);
@@ -123,7 +127,15 @@ export const App: React.FC = () => {
       }
     } catch (err: unknown) {
       if (currentRequestId === requestIdRef.current) {
-        setConnectionError(err instanceof Error ? err.message : 'Failed loading session data');
+        // The daemon is unreachable: do NOT substitute empty data — an empty
+        // timeline/findings view would be read as a clean audit.
+        setDataVerified(false);
+        setGraphData(null);
+        setTimeline([]);
+        setFindings([]);
+        setCausalPaths([]);
+        setBlastRadius(null);
+        setConnectionError(err instanceof Error ? err.message : 'UNVERIFIED — daemon unreachable');
       }
     } finally {
       if (currentRequestId === requestIdRef.current && showSpinner) {
@@ -161,13 +173,18 @@ export const App: React.FC = () => {
     if (selectedNode?.node_id === node.node_id) {
       setSelectedNode(null);
     } else {
+      const currentRequestId = ++requestIdRef.current;
       setSelectedNode(node);
       if (currentSession) {
         try {
           const path = await api.explainNode(currentSession.session_id, node.node_id);
           const br = await api.analyzeBlastRadius(currentSession.session_id, node.node_id);
-          setCausalPaths(path ? [path] : []);
-          setBlastRadius(br);
+          // Guard against stale responses (user inspected another node or
+          // switched sessions while this request was in flight).
+          if (currentRequestId === requestIdRef.current) {
+            setCausalPaths(path ? [path] : []);
+            setBlastRadius(br);
+          }
         } catch {
           // Graceful fallback
         }
@@ -204,6 +221,10 @@ export const App: React.FC = () => {
         onSelectSession={(s) => {
           setCurrentSession(s);
           setSelectedNode(null);
+          // The previous session's causal analysis must not leak into the
+          // newly selected session's views.
+          setCausalPaths([]);
+          setBlastRadius(null);
         }}
         activeTab={activeTab}
         onTabChange={setActiveTab}
@@ -281,11 +302,14 @@ export const App: React.FC = () => {
               <IncidentPanel
                 findings={findings}
                 causalPaths={causalPaths}
+                unverified={!dataVerified}
                 onRequestApproval={(f) => setApprovalFinding(f)}
               />
             )}
 
-            {activeTab === 'review_loop' && <ReviewLoopView />}
+            {activeTab === 'review_loop' && (
+              <ReviewLoopView sessionId={currentSession?.session_id || null} />
+            )}
 
             {activeTab === 'diff' && (
               <DiffPanel sessionId={currentSession?.session_id} blastRadius={blastRadius} />

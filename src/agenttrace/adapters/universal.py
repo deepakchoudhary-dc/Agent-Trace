@@ -1,32 +1,44 @@
 """Universal AI Coding Agent & Tool Sensor.
 
-Provides automated, zero-configuration tracking across ANY AI assistant:
-Cline, Kilo Code, Roo Code, Cursor, Windsurf, Aider, Goose, Copilot,
-Claude Code, Continue.dev, Ollama, LM Studio, or custom local LLMs.
+Provides zero-configuration coverage across AI assistants that have no
+dedicated adapter (Cline, Kilo Code, Roo Code, Cursor, Windsurf, Aider,
+Goose, Continue.dev, ...).
+
+Per the anti-fabrication invariant this adapter NEVER invents user intents:
+it only reports the honest fact that an agent state file changed inside a
+watched directory, marked as an unparsed CONTEXT_BOUNDARY event at LOW
+confidence. Domains with dedicated adapters (claude, codex, copilot) are
+excluded to avoid double-reporting. The file content itself is not read.
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.adapters.sdk import SDK_VERSION, AdapterBase
 from agenttrace.models.events import (
     ConfidenceLevel,
+    ContextBoundaryEvent,
     EventBase,
     EventType,
-    InvocationEvent,
 )
 
+if TYPE_CHECKING:
+    from uuid import UUID
+
 logger = logging.getLogger(__name__)
+
+_MAX_SEEN_ENTRIES = 10_000
 
 
 class UniversalAgentAdapter(AdapterBase):
     """Universal AI coding assistant sensor.
 
-    Dynamically monitors workspace agent configurations, IDE extensions,
-    and local inference streams without requiring bespoke per-tool adapters.
+    Emits low-confidence "agent session file changed" context events for
+    assistants without a dedicated adapter. The observability gap (what the
+    agent actually did) is declared, not fabricated.
     """
 
     @property
@@ -35,7 +47,7 @@ class UniversalAgentAdapter(AdapterBase):
 
     @property
     def adapter_version(self) -> str:
-        return "1.0.0"
+        return "1.1.0"
 
     @property
     def sdk_version(self) -> str:
@@ -43,37 +55,50 @@ class UniversalAgentAdapter(AdapterBase):
 
     @property
     def supported_event_types(self) -> list[EventType]:
-        return [
-            EventType.INVOCATION,
-            EventType.TOOL_REQUEST,
-            EventType.TOOL_RESULT,
-            EventType.CONTEXT_BOUNDARY,
-        ]
+        return [EventType.CONTEXT_BOUNDARY]
 
-    def __init__(self, session_id: UUID, workspace_path: str) -> None:
+    def __init__(
+        self,
+        session_id: UUID,
+        workspace_path: str,
+        watch_dirs: list[Path] | None = None,
+    ) -> None:
         super().__init__(session_id, workspace_path)
         self._workspace = Path(workspace_path)
-        self._watched_agent_dirs: list[Path] = self._discover_agent_dirs()
+        self._watched_agent_dirs: list[Path] = (
+            watch_dirs if watch_dirs is not None else self._discover_agent_dirs()
+        )
         self._seen_entries: set[str] = set()
 
     def _discover_agent_dirs(self) -> list[Path]:
-        """Auto-discover agent workspace config & history folders dynamically."""
+        """Discover agent state dirs for tools WITHOUT a dedicated adapter.
+
+        ``.claude``, ``.codex``, ``.copilot`` are excluded — those domains
+        have dedicated adapters and must not be double-reported.
+        """
         candidates: list[Path] = []
         home = Path.home()
+        names = [".cline", ".kilo", ".roo", ".cursor", ".windsurf", ".aider", ".continue"]
 
         # Workspace-level agent directories
-        for name in [".cline", ".kilo", ".roo", ".cursor", ".windsurf", ".aider", ".continue"]:
+        for name in names:
             ws_agent = self._workspace / name
             if ws_agent.exists():
                 candidates.append(ws_agent)
 
-        # User-level agent directories
-        for name in [".cline", ".kilo", ".roo", ".cursor", ".windsurf", ".aider", ".claude", ".codex", ".copilot", ".ollama"]:
+        # User-level agent directories (same tool set only)
+        for name in names:
             home_agent = home / name
             if home_agent.exists():
                 candidates.append(home_agent)
 
         return candidates
+
+    def cursor_state(self) -> dict[str, Any]:
+        return {"seen_entries": sorted(self._seen_entries)}
+
+    def restore_cursor(self, state: dict[str, Any]) -> None:
+        self._seen_entries = set(state.get("seen_entries", []))
 
     async def start(self) -> None:
         self._running = True
@@ -87,15 +112,19 @@ class UniversalAgentAdapter(AdapterBase):
         logger.info("UniversalAgentAdapter stopped")
 
     async def poll(self) -> list[EventBase]:
-        """Dynamically poll discovered agent channels for invocations and tool actions."""
+        """Report newly-changed agent session files as unparsed context.
+
+        The emitted event says exactly what is known — a session file for
+        agent X changed at path P — and nothing more. Confidence is LOW
+        because the content was not parsed.
+        """
         events: list[EventBase] = []
         if not self._running:
             return events
 
         for agent_dir in self._watched_agent_dirs:
             try:
-                agent_name = agent_dir.name.replace(".", "")
-                # Scan for new prompt/chat log files
+                agent_name = agent_dir.name.lstrip(".")
                 for log_file in agent_dir.rglob("*.json*"):
                     if not log_file.is_file():
                         continue
@@ -104,18 +133,21 @@ class UniversalAgentAdapter(AdapterBase):
                     if key in self._seen_entries:
                         continue
                     self._seen_entries.add(key)
+                    if len(self._seen_entries) > _MAX_SEEN_ENTRIES:
+                        self._seen_entries.clear()
 
-                    events.append(
-                        InvocationEvent(
-                            session_id=self.session_id,
-                            actor_id=f"agent:{agent_name}",
-                            source_adapter=self.adapter_name,
-                            confidence=ConfidenceLevel.HIGH,
-                            user_intent=f"AI Agent interaction via {agent_name}",
-                            prompt=f"Session file updated: {log_file.name}",
-                            payload={"agent": agent_name, "path": str(log_file)},
-                        )
-                    )
+                    events.append(ContextBoundaryEvent(
+                        session_id=self.session_id,
+                        actor_id=f"agent:{agent_name}",
+                        source_adapter=self.adapter_name,
+                        confidence=ConfidenceLevel.LOW,
+                        payload={
+                            "agent": agent_name,
+                            "path": str(log_file),
+                            "size_bytes": log_file.stat().st_size,
+                            "note": "session file detected, content not parsed",
+                        },
+                    ))
             except Exception as e:
                 logger.debug("Error reading agent dir %s: %s", agent_dir, e)
 

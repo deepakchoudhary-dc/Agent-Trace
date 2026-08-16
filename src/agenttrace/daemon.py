@@ -11,7 +11,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
 from agenttrace.adapters.claude import ClaudeAdapter
@@ -129,7 +129,7 @@ class AgentTraceDaemon:
     async def start(self) -> None:
         """Start the daemon and restore historical sessions from storage."""
         self._running = True
-        self._restore_from_storage()
+        await self._restore_from_storage()
         logger.info("AgentTrace daemon started, data_dir=%s", self._data_dir)
 
     async def stop(self) -> None:
@@ -147,7 +147,7 @@ class AgentTraceDaemon:
         self._ledger.close()
         logger.info("AgentTrace daemon stopped")
 
-    def _restore_from_storage(self) -> None:
+    async def _restore_from_storage(self) -> None:
         """Restore sessions, graphs, contracts, and approvals from the SQLite ledger."""
         try:
             stored_sessions = self._ledger.list_sessions()
@@ -242,10 +242,45 @@ class AgentTraceDaemon:
                             continue
 
                     self._graphs[sid] = graph
+
+                    # Zombie sessions: a restored ACTIVE session has live
+                    # state but nothing observing it. Resume observers and
+                    # the adapter (with its persisted cursor) so `status`
+                    # truthfully reflects a watched session.
+                    if session.status == SessionStatus.ACTIVE:
+                        await self._resume_session(session)
                 except Exception as e:
                     logger.warning("Could not restore session record: %s", e)
         except Exception as e:
             logger.warning("Error during daemon storage recovery: %s", e)
+
+    async def _resume_session(self, session: AuditSession) -> None:
+        """Resume observers/adapters for a restored ACTIVE session."""
+        sid = session.session_id
+        try:
+            observers = await self._start_observers(session)
+            self._observers[sid] = observers
+
+            adapter = self._select_adapter(session)
+            cursor_state = self._ledger.get_adapter_cursor(sid)
+            if cursor_state:
+                adapter.restore_cursor(cursor_state.get("cursor", {}))
+            self._adapters[sid] = adapter
+            await adapter.start()
+
+            poll_task = asyncio.create_task(
+                self._adapter_poll_loop(sid, adapter)
+            )
+            self._adapter_tasks[sid] = poll_task
+            logger.info(
+                "Resumed observation for restored ACTIVE session %s (adapter=%s)",
+                sid,
+                adapter.adapter_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not resume observation for session %s: %s", sid, e
+            )
 
     # -- Session management --
 
@@ -398,6 +433,12 @@ class AgentTraceDaemon:
                 for event in events:
                     if adapter.validate_event(event):
                         await self.ingest_event(event)
+                # Persist the cursor after each batch so a restart resumes at
+                # this point (crash windows duplicates at most the in-flight
+                # batch rather than the whole source).
+                self._ledger.save_adapter_cursor(
+                    session_id, adapter.adapter_name, adapter.cursor_state()
+                )
                 await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 break
@@ -422,6 +463,16 @@ class AgentTraceDaemon:
 
         adapter = self._adapters.pop(session_id, None)
         if adapter:
+            # Persist the final cursor so a later resume continues exactly
+            # where observation stopped.
+            try:
+                self._ledger.save_adapter_cursor(
+                    session_id, adapter.adapter_name, adapter.cursor_state()
+                )
+            except Exception:
+                logger.warning(
+                    "Could not persist adapter cursor for session %s", session_id
+                )
             await adapter.stop()
 
         session.status = SessionStatus.STOPPED
@@ -504,7 +555,11 @@ class AgentTraceDaemon:
 
         # 5. Security Policy Evaluation
         policy = self._policies.get(event.session_id)
-        if policy and not isinstance(event, PolicyFindingEvent):
+        if (
+            policy
+            and not isinstance(event, PolicyFindingEvent)
+            and not event.payload.get("gate_proposal")
+        ):
             evaluation = policy.evaluate(event)
             for finding in evaluation.findings:
                 await self.ingest_event(finding)
@@ -805,7 +860,7 @@ class AgentTraceDaemon:
 
     # -- Pre-Execution Mediated Policy Gate (P0-6) --
 
-    def evaluate_proposed_action(
+    async def evaluate_proposed_action(
         self,
         session_id: UUID,
         action_type: str,
@@ -825,6 +880,11 @@ class AgentTraceDaemon:
 
         Reason strings are prefixed with "APPROVAL REQUIRED:" or "BLOCKED:"
         so callers (API, CLI) can distinguish pause from block.
+
+        Network proposals carry the http_method the observer layer can never
+        see; they are recorded as low-confidence events so the incident
+        engine's external_state_change detection can fire on them (without
+        re-running policy — the gate already evaluated it).
         """
         boundary = self._boundaries.get(session_id)
         approvals = self._approvals.get(session_id)
@@ -861,14 +921,23 @@ class AgentTraceDaemon:
         #    credential files, dependency manifests, network egress, git ops)
         policy_blocked = False
         policy_hits: list[tuple[str, str]] = []  # (rule_id, description)
-        if policy:
-            synthetic = self._synthetic_event_for_gate(action_type, target, details)
-            if synthetic is not None:
-                evaluation = policy.evaluate(synthetic)
-                for finding in evaluation.findings:
-                    policy_hits.append((finding.finding_type, finding.description))
-                if evaluation.is_blocked:
-                    policy_blocked = True
+        synthetic: EventBase | None = self._synthetic_event_for_gate(action_type, target, details)
+        if policy and synthetic is not None:
+            evaluation = policy.evaluate(synthetic)
+            for finding in evaluation.findings:
+                policy_hits.append((finding.finding_type, finding.description))
+            if evaluation.is_blocked:
+                policy_blocked = True
+
+        # 2b. Record network proposals as low-confidence evidence. They carry
+        #     http_method — invisible to the observer layer — which the
+        #     incident engine needs for external_state_change detection.
+        #     Policy is NOT re-evaluated on ingestion (gate_proposal flag).
+        if action_type == "network" and isinstance(synthetic, NetworkEvent):
+            synthetic.session_id = session_id
+            synthetic.confidence = ConfidenceLevel.LOW
+            synthetic.payload["gate_proposal"] = True
+            await self.ingest_event(synthetic)
 
         # 3. BLOCK outright (privilege escalation, etc.) — approval cannot override
         if policy_blocked:
@@ -896,6 +965,34 @@ class AgentTraceDaemon:
         return True, "Allowed by policy", ""
 
     @staticmethod
+    def _split_host_port(target: str) -> tuple[str, int]:
+        """Split a ``host:port`` target, supporting IPv6 literals.
+
+        Accepts bracketed IPv6 (``[2001:db8::1]:443``), plain IPv4
+        (``8.8.8.8:53``), and bare hosts (``8.8.8.8``). Unbracketed IPv6
+        literals without a port are returned whole with port 0.
+        """
+        t = target.strip()
+        if not t:
+            return "0.0.0.0", 0
+        if t.startswith("["):
+            end = t.find("]")
+            if end != -1:
+                host = t[1:end]
+                rest = t[end + 1:]
+                if rest.startswith(":"):
+                    port_s = rest[1:]
+                    return host, int(port_s) if port_s.isdigit() else 0
+                return host, 0
+        if t.count(":") == 1:
+            host, _, port_s = t.rpartition(":")
+            if port_s.isdigit():
+                return host or "0.0.0.0", int(port_s)
+            return host, 0
+        # Unbracketed IPv6 literal (or bare host) — no port can be split off
+        return t, 0
+
+    @staticmethod
     def _synthetic_event_for_gate(
         action_type: str,
         target: str,
@@ -919,14 +1016,15 @@ class AgentTraceDaemon:
                 command=target,
             )
         if action_type == "network":
-            ip, _, port = target.partition(":")
+            host, port = AgentTraceDaemon._split_host_port(target)
             return NetworkEvent(
                 session_id=uuid4(),
                 actor_id="gate",
                 source_adapter="gate",
-                destination_ip=ip or "0.0.0.0",
-                destination_port=int(port) if port.isdigit() else 0,
+                destination_ip=host,
+                destination_port=port,
                 protocol=details.get("protocol", "tcp"),
+                http_method=details.get("http_method"),
             )
         if action_type == "git":
             return GitEvent(
@@ -968,6 +1066,25 @@ class AgentTraceDaemon:
             ),
             net_observer,
         ]
+
+        # Reconcile hash sources: seed the observer's hash cache from the
+        # baseline graph's SOURCE_FILE content hashes so the first mutation
+        # has a real before_hash (the baseline generator and the observer
+        # compute hashes independently and must not drift apart).
+        graph = self._graphs.get(session.session_id)
+        if graph is not None:
+            baseline_hashes = {
+                str(node.data.get("path", "")): node.content_hash
+                for node in graph.to_snapshot().nodes
+                if node.node_type == NodeType.SOURCE_FILE
+                and node.content_hash
+                and node.data.get("path")
+            }
+            if baseline_hashes:
+                filesystem_observer = cast(
+                    "FilesystemObserver", observers[0]
+                )
+                filesystem_observer.seed_hashes(baseline_hashes)
 
         for observer in observers:
             await observer.start()

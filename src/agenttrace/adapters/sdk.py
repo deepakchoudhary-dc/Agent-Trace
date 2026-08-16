@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.models.events import EventBase, EventType
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +118,20 @@ class AdapterBase(ABC):
         Returns a list of canonical events translated from vendor format.
         """
         ...
+
+    def cursor_state(self) -> dict[str, Any]:
+        """Serializable position state for resuming after a restart.
+
+        Subclasses tracking file offsets / seen records override this so the
+        daemon can persist the cursor and restore it on the next start —
+        otherwise a restarted session would either replay its whole source
+        (duplicate events) or skip events that happened while it was down.
+        """
+        return {}
+
+    def restore_cursor(self, state: dict[str, Any]) -> None:
+        """Restore position state persisted by :meth:`cursor_state`."""
+        return None
 
     def validate_event(self, event: EventBase) -> bool:
         """Validate that an event meets the SDK contract."""

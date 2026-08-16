@@ -6,8 +6,9 @@ simultaneously to ensure seamless coverage across all developer tools.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from uuid import UUID
+from typing import TYPE_CHECKING
 
 from agenttrace.adapters.claude import ClaudeAdapter
 from agenttrace.adapters.codex import CodexAdapter
@@ -15,6 +16,9 @@ from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.generic import GenericAdapter
 from agenttrace.adapters.sdk import SDK_VERSION, AdapterBase
 from agenttrace.models.events import EventBase, EventType
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +68,8 @@ class CompositeAdapter(AdapterBase):
     async def stop(self) -> None:
         self._running = False
         for adapter in self._sub_adapters:
-            try:
+            with contextlib.suppress(Exception):
                 await adapter.stop()
-            except Exception:
-                pass
         logger.info("CompositeAdapter stopped")
 
     async def poll(self) -> list[EventBase]:

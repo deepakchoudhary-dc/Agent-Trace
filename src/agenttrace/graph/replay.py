@@ -9,15 +9,18 @@ Critical safety invariant: NEVER modifies the user's live workspace.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -26,6 +29,12 @@ from agenttrace.models.events import ConfidenceLevel
 from agenttrace.models.graph import GraphNode, GraphSnapshot, NodeType
 
 logger = logging.getLogger(__name__)
+
+
+def _venv_bin_dir() -> str:
+    """PATH prefix for the active environment's executables (Scripts on Windows)."""
+    scripts = Path(sys.prefix) / ("Scripts" if os.name == "nt" else "bin")
+    return str(scripts) + os.pathsep + os.environ.get("PATH", "")
 
 
 @dataclass
@@ -64,8 +73,10 @@ class ReplayEngine:
     """
 
     # Test runners allowed inside simulations, with their permitted subcommands
-    _PYTHON_MODULES = {"pytest", "unittest"}
+    _PYTHON_MODULES = {"pytest", "unittest", "py_compile"}
     _JS_PACKAGE_MANAGERS = {"npm", "yarn", "pnpm"}
+    # Read-only linters/type checkers: safe to run in a workspace
+    _STATIC_TOOLS = {"pytest", "ruff", "mypy"}
 
     def __init__(self, workspace_path: str) -> None:
         self.workspace_path = Path(workspace_path)
@@ -99,20 +110,21 @@ class ReplayEngine:
         if any("$(" in tok or "${ " in tok for tok in parts):
             return False, "Command substitution is not allowed"
 
-        base = Path(parts[0]).name.lower()
+        base = Path(parts[0]).name.lower().removesuffix(".exe")
 
-        # python -m pytest | python -m unittest
+        # python -m pytest | python -m unittest | python -m py_compile
         if base in ("python", "python3", "py"):
             if (
                 len(parts) >= 3
                 and parts[1] == "-m"
-                and Path(parts[2]).name.lower() in ReplayEngine._PYTHON_MODULES
+                and Path(parts[2]).name.lower().removesuffix(".exe")
+                in ReplayEngine._PYTHON_MODULES
             ):
                 return True, ""
-            return False, "Only `python -m pytest` / `python -m unittest` are allowed"
+            return False, "Only pytest / unittest / py_compile via `python -m` are allowed"
 
-        # pytest ...
-        if base in ("pytest", "pytest.exe"):
+        # pytest ... | ruff ... | mypy ...
+        if base in ReplayEngine._STATIC_TOOLS:
             return True, ""
 
         # npm test | npm run test | yarn test | pnpm test
@@ -133,6 +145,7 @@ class ReplayEngine:
             return True, ""
 
         return False, f"`{command}` is not on the verification allowlist"
+
     def create_simulation(
         self,
         snapshot: GraphSnapshot,
@@ -227,7 +240,11 @@ class ReplayEngine:
 
         git_dir = self.workspace_path / ".git"
         if git_dir.exists():
+            # Only a full 40-hex commit hash is accepted as a target ref;
+            # anything else falls back to HEAD so git never parses API input.
             target_ref = config.commit_hash or "HEAD"
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", target_ref):
+                target_ref = "HEAD"
             try:
                 subprocess.run(
                     ["git", "worktree", "add", str(sim_dir), target_ref],
@@ -256,20 +273,102 @@ class ReplayEngine:
         return sim_dir
 
     def _apply_constraints(self, worktree: Path, constraints: dict[str, Any]) -> None:
-        """Apply modified constraints to the simulation worktree."""
+        """Apply modified constraints to the simulation worktree.
+
+        Patterns must stay inside the worktree: absolute patterns and `..`
+        traversal are rejected, so a simulation can never delete files in the
+        live workspace or anywhere else on disk (fail closed).
+        """
         prohibited = constraints.get("prohibited_paths", [])
         for pat in prohibited:
+            if not self._is_safe_pattern(pat):
+                raise ValueError(
+                    f"Constraint pattern `{pat}` escapes the simulation worktree"
+                )
             for matched in worktree.glob(pat):
+                if not self._is_within_worktree(matched, worktree):
+                    logger.warning(
+                        "Skipping match outside worktree: %s", matched
+                    )
+                    continue
                 if matched.is_file():
                     matched.unlink(missing_ok=True)
 
+    @staticmethod
+    def _is_safe_pattern(pattern: str) -> bool:
+        """Reject absolute patterns or patterns that traverse out of the worktree."""
+        if not pattern:
+            return False
+        normalized = pattern.replace("\\", "/")
+        if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+            return False
+        if ".." in PurePosixPath(normalized).parts:
+            return False
+        return True
+
+    @staticmethod
+    def _is_within_worktree(path: Path, worktree: Path) -> bool:
+        """True if the resolved path stays inside the worktree directory."""
+        try:
+            return path.resolve().is_relative_to(worktree.resolve())
+        except (OSError, ValueError):
+            return False
+
+    def _resolve_command(self, command: str) -> tuple[list[str] | None, str]:
+        """Resolve an allowlisted command to an absolute-executable argv list.
+
+        The raw command text is never passed to a shell; executables are
+        resolved to absolute paths (python -> sys.executable, tools -> PATH)
+        so a worktree-local impostor executable can never be picked up.
+        Returns (argv, "") on success or (None, reason) on failure.
+        """
+        try:
+            parts = shlex.split(command, posix=os.name != "nt")
+        except ValueError:
+            return None, "Unparseable command"
+        if not parts:
+            return None, "Empty command"
+
+        # Defense in depth: shell control operators and substitution must never
+        # survive into argv, even if the allowlist check is bypassed by a caller.
+        if any(tok in parts for tok in ("&&", "||", ";", "|", ">", "<")):
+            return None, "Shell control operators and redirection are not allowed"
+        if any("$(" in tok or "${ " in tok or "`" in tok for tok in parts):
+            return None, "Command substitution is not allowed"
+
+        base = Path(parts[0]).name.lower().removesuffix(".exe")
+
+        if base in ("python", "python3", "py"):
+            return [sys.executable, *parts[1:]], ""
+
+        resolvable = (
+            ReplayEngine._STATIC_TOOLS
+            | ReplayEngine._JS_PACKAGE_MANAGERS
+            | {"cargo", "go", "make"}
+        )
+        if base in resolvable:
+            exe = shutil.which(parts[0], path=_venv_bin_dir())
+            if not exe:
+                return None, f"`{base}` not found on PATH"
+            return [exe, *parts[1:]], ""
+
+        return None, f"`{command}` is not on the verification allowlist"
+
     def _run_command(self, command: str, worktree: Path) -> dict[str, Any]:
         """Run a verification command safely inside the isolated worktree."""
+        argv, error = self._resolve_command(command)
+        if argv is None:
+            return {
+                "command": command,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": error,
+                "success": False,
+            }
         try:
-            cmd_args = shlex.split(command, posix=os.name != "nt")
             result = subprocess.run(
-                cmd_args if cmd_args else command,
-                shell=False if cmd_args else True,
+                argv,
+                shell=False,
                 cwd=str(worktree),
                 capture_output=True,
                 text=True,
@@ -307,21 +406,22 @@ class ReplayEngine:
         for r in removed:
             diffs.append(f"- Node missing: {r}")
 
-        diffs.append(f"Simulation node count: {len(simulation.nodes)} (original: {len(original.nodes)})")
+        diffs.append(
+            f"Simulation node count: {len(simulation.nodes)} "
+            f"(original: {len(original.nodes)})"
+        )
         return diffs
 
     def _cleanup_worktree(self, sim_id: UUID, worktree_path: Path) -> None:
         """Clean up a simulation worktree."""
         self._active_simulations.pop(sim_id, None)
-        try:
+        with contextlib.suppress(Exception):
             subprocess.run(
                 ["git", "worktree", "remove", str(worktree_path), "--force"],
                 cwd=str(self.workspace_path),
                 capture_output=True,
                 timeout=10,
             )
-        except Exception:
-            pass
 
         if worktree_path.exists():
             shutil.rmtree(str(worktree_path), ignore_errors=True)

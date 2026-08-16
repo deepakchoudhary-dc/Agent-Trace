@@ -67,17 +67,26 @@ class Planner:
         - What acceptance criteria apply
         - What's in scope vs. out of scope
         - What verification steps to run
+
+        `context` may carry real scope files (e.g. the files an audited agent
+        actually mutated) so the plan's scope reflects the real change set.
         """
         plan = ReviewPlan(task_description=task_description)
 
+        scope_files: list[str] = []
+        if context:
+            raw = context.get("scope_files", [])
+            if isinstance(raw, list):
+                scope_files = [str(f) for f in raw]
+
         # Decompose into subtasks
-        plan.subtasks = self._decompose_task(task_description)
+        plan.subtasks = self._decompose_task(task_description, scope_files)
 
         # Set acceptance criteria
         plan.acceptance_criteria = self._derive_criteria(task_description, plan.subtasks)
 
         # Define scope
-        plan.scope = self._define_scope(task_description)
+        plan.scope = self._define_scope(task_description, scope_files)
         plan.out_of_scope = self._define_exclusions(task_description)
 
         # Assess risk
@@ -94,17 +103,24 @@ class Planner:
 
         return plan
 
-    def _decompose_task(self, description: str) -> list[Subtask]:
+    def _decompose_task(
+        self, description: str, scope_files: list[str] | None = None
+    ) -> list[Subtask]:
         """Decompose a task into ordered subtasks."""
-        # Heuristic decomposition based on common patterns
+        scope_files = scope_files or []
+        # Subtasks
         subtasks: list[Subtask] = []
 
         # Every task needs implementation
+        # py_compile requires file arguments; verify the real change set.
+        compile_command = (
+            ["python -m py_compile " + " ".join(scope_files)] if scope_files else []
+        )
         subtasks.append(Subtask(
             title="Implementation",
             description=f"Implement: {description}",
             acceptance_criteria=["Code compiles/parses without errors"],
-            verification_commands=["python -m py_compile"],
+            verification_commands=compile_command,
             priority=1,
         ))
 
@@ -145,13 +161,16 @@ class Planner:
 
         return list(dict.fromkeys(criteria))  # Deduplicate, preserve order
 
-    def _define_scope(self, description: str) -> list[str]:
+    def _define_scope(self, description: str, scope_files: list[str] | None = None) -> list[str]:
         """Define what's in scope for this task."""
-        return [
+        scope = [
             f"Changes directly related to: {description}",
             "Supporting test files",
             "Documentation updates for changed code",
         ]
+        if scope_files:
+            scope.extend(f"Changed file: {file_path}" for file_path in scope_files[:50])
+        return scope
 
     def _define_exclusions(self, description: str) -> list[str]:
         """Define what's out of scope."""

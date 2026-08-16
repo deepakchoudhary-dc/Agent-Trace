@@ -31,6 +31,8 @@ from agenttrace.graph.causal_engine import CausalExplanationEngine
 from agenttrace.graph.replay import ReplayEngine
 from agenttrace.models.events import ConfidenceLevel, EventType, FileMutationEvent
 from agenttrace.models.session import AgentType
+from agenttrace.review_loop.loop import ReviewLoop
+from agenttrace.review_loop.serialization import loop_result_to_dict
 from agenttrace.security.token import ApiTokenManager
 
 logger = logging.getLogger(__name__)
@@ -77,11 +79,11 @@ async def require_token(request: Request, call_next: Any) -> Response:
     startup (see daemon_entry.run_server). Verification is constant-time.
     """
     if request.method == "OPTIONS" or request.url.path == "/health":
-        return cast(Response, await call_next(request))
+        return cast("Response", await call_next(request))
     presented = request.headers.get("X-AgentTrace-Token", "")
     if not token_manager.verify(presented):
         return JSONResponse(status_code=401, content={"detail": "Missing or invalid API token"})
-    return cast(Response, await call_next(request))
+    return cast("Response", await call_next(request))
 
 
 @app.get("/health")
@@ -175,6 +177,10 @@ class EvaluateResponse(BaseModel):
     action: str = "allow"  # allow | pause | block
     reason: str
     required_approval_id: str = ""
+
+
+class ReviewRunRequest(BaseModel):
+    max_iterations: int = Field(default=3, ge=1, le=5)
 
 
 # -- Session Endpoints --
@@ -338,6 +344,103 @@ async def get_diffs(session_id: UUID) -> list[DiffItemDTO]:
     return diffs
 
 
+# -- Review Loop (P0-7): real artifacts, real verdicts --
+
+@app.post("/sessions/{session_id}/review")
+def run_session_review(session_id: UUID, req: ReviewRunRequest | None = None) -> dict[str, Any]:
+    """Run the self-improving review loop over a session's real artifacts.
+
+    The Worker gathers the session's actual file mutations as scope, reads
+    real file content, and executes allowlisted verification commands
+    (`pytest`, `ruff`, `mypy`, ...) against the audited workspace. Reviewers
+    judge that real evidence; the result is redacted, persisted encrypted,
+    and returned. Runs in the threadpool (verification commands are slow).
+    """
+    max_iterations = req.max_iterations if req else 3
+    session = daemon.get_session(session_id)
+    stored = daemon._ledger.get_session(session_id)
+    if not session and not stored:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    workspace_path = ""
+    task_description = ""
+    if session:
+        workspace_path = session.config.workspace_path
+        task_description = session.task_description
+    elif stored:
+        try:
+            config = json.loads(stored.get("config_json", "{}"))
+        except (ValueError, TypeError):
+            config = {}
+        workspace_path = str(config.get("workspace_path", ""))
+        task_description = stored.get("task_desc", "")
+
+    scope_files: list[str] = []
+    diff_summaries: dict[str, str] = {}
+    for evt in daemon._ledger.query_events(session_id, event_type=EventType.FILE_MUTATION):
+        if isinstance(evt, FileMutationEvent):
+            if evt.file_path and evt.file_path not in scope_files:
+                scope_files.append(evt.file_path)
+            if evt.file_path and evt.diff_summary:
+                diff_summaries.setdefault(evt.file_path, evt.diff_summary)
+
+    # Only files that still exist can be reviewed — deleted files cannot be
+    # read or compiled, and compiling them would fabricate a failure.
+    if workspace_path:
+        existing: list[str] = []
+        for file_path in scope_files:
+            candidate = (
+                os.path.join(workspace_path, file_path)
+                if not os.path.isabs(file_path)
+                else file_path
+            )
+            if os.path.isfile(candidate):
+                existing.append(file_path)
+        scope_files = existing
+
+    # Never write review lessons into the audited workspace; results are
+    # persisted in the ledger via the response path below.
+    loop = ReviewLoop(
+        workspace_path=workspace_path,
+        max_iterations=max_iterations,
+        log_lessons=False,
+    )
+    result = loop.run(task_description or "Untitled session", context={
+        "scope_files": scope_files,
+        "diff_summaries": diff_summaries,
+    })
+
+    payload = loop_result_to_dict(result)
+    redacted = cast("dict[str, Any]", daemon._redactor.redact_any(payload))
+    daemon._ledger.store_review_run(
+        loop_id=result.loop_id,
+        session_id=session_id,
+        passed=result.final_passed,
+        iterations=result.total_iterations,
+        payload_json=json.dumps(redacted, ensure_ascii=False),
+    )
+    return redacted
+
+
+@app.get("/sessions/{session_id}/review")
+def get_session_review(session_id: UUID) -> dict[str, Any]:
+    """Return the latest persisted review run for a session."""
+    if not daemon.get_session(session_id) and not daemon._ledger.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    runs = daemon._ledger.get_review_runs(session_id)
+    if not runs:
+        raise HTTPException(status_code=404, detail="No review run recorded for this session")
+    latest = runs[0]
+    return {
+        "loop_id": latest["loop_id"],
+        "session_id": latest["session_id"],
+        "passed": latest["passed"],
+        "iterations": latest["iterations"],
+        "created_at": latest["created_at"],
+        "payload": latest["payload"],
+    }
+
+
 # -- Policy Findings & Approvals (P0-4, P1-8) --
 
 @app.get("/sessions/{session_id}/findings", response_model=list[FindingDTO])
@@ -448,7 +551,7 @@ async def evaluate_proposed_action(session_id: UUID, req: EvaluateRequest) -> Ev
     if not session and not daemon._ledger.get_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    allowed, reason, approval_id = daemon.evaluate_proposed_action(
+    allowed, reason, approval_id = await daemon.evaluate_proposed_action(
         session_id, req.action_type, req.target, req.details
     )
 

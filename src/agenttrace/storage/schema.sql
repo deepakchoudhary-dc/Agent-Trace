@@ -118,3 +118,24 @@ CREATE TABLE IF NOT EXISTS task_contracts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_contracts_session ON task_contracts(session_id);
+
+CREATE TABLE IF NOT EXISTS review_runs (
+    loop_id     TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES sessions(session_id),
+    passed      INTEGER NOT NULL DEFAULT 0,
+    iterations  INTEGER NOT NULL DEFAULT 0,
+    payload_enc BLOB NOT NULL,          -- AES-256-GCM encrypted JSON (redacted)
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_runs_session ON review_runs(session_id);
+
+-- Per-session adapter resume state (file offsets, seen records) so a
+-- restarted daemon resumes observation exactly where it left off instead of
+-- replaying the source (duplicates) or skipping downtime activity.
+CREATE TABLE IF NOT EXISTS adapter_cursors (
+    session_id   TEXT PRIMARY KEY REFERENCES sessions(session_id),
+    adapter_name TEXT NOT NULL,
+    cursor_enc   BLOB NOT NULL,          -- AES-256-GCM encrypted JSON
+    updated_at   TEXT NOT NULL
+);

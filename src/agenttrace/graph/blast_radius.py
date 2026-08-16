@@ -8,10 +8,14 @@ builds, configs, and runtime dependencies.
 from __future__ import annotations
 
 import logging
-from uuid import UUID
+from typing import TYPE_CHECKING
 
 from agenttrace.models.graph import BlastRadiusResult, EdgeType, GraphNode, NodeType
-from agenttrace.graph.context_graph import ContextGraph
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from agenttrace.graph.context_graph import ContextGraph
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +72,39 @@ class BlastRadiusAnalyzer:
                 name = node.label or "unknown"
                 result.config_changes.append(name)
 
+        # Files that import the changed file are broken when it is deleted
+        file_node = self._origin_file_node(origin_node_id)
+        if file_node:
+            for edge in self.graph.get_edges_to(file_node.node_id):
+                if edge.edge_type != EdgeType.READS:
+                    continue
+                importer = self.graph.get_node(edge.source_node_id)
+                if importer and importer.node_type == NodeType.SOURCE_FILE:
+                    path = (
+                        importer.data.get("relative_path")
+                        or importer.data.get("path")
+                        or importer.label
+                    )
+                    if path not in result.broken_imports:
+                        result.broken_imports.append(path)
+
         # Calculate risk score based on breadth and depth of impact
         result.risk_score = self._calculate_risk(result)
         return result
+
+    def _origin_file_node(self, origin_node_id: UUID) -> GraphNode | None:
+        """Resolve the origin to a SOURCE_FILE node (directly or via MODIFIES)."""
+        origin = self.graph.get_node(origin_node_id)
+        if not origin:
+            return None
+        if origin.node_type == NodeType.SOURCE_FILE:
+            return origin
+        for edge in self.graph.get_edges_from(origin_node_id):
+            if edge.edge_type == EdgeType.MODIFIES:
+                target = self.graph.get_node(edge.target_node_id)
+                if target and target.node_type == NodeType.SOURCE_FILE:
+                    return target
+        return None
 
     def _forward_traverse(
         self,
@@ -81,7 +115,7 @@ class BlastRadiusAnalyzer:
         visited: set[UUID] = set()
         frontier = {start_id}
 
-        for depth in range(max_depth):
+        for _depth in range(max_depth):
             next_frontier: set[UUID] = set()
             for node_id in frontier:
                 if node_id in visited:
@@ -101,6 +135,9 @@ class BlastRadiusAnalyzer:
             frontier = next_frontier - visited
             if not frontier:
                 break
+
+        # Nodes discovered at the final depth were never expanded — include them
+        visited.update(frontier)
 
         visited.discard(start_id)
         return visited
@@ -139,8 +176,9 @@ class BlastRadiusAnalyzer:
                 if node and node.node_type == NodeType.TEST_RESULT:
                     affected.append(node)
 
-        # Also check descendants for test results
-        for desc_id in self.graph.descendants(file_node_id):
+        # Also check impact-edge descendants for test results (bounded BFS,
+        # never the full transitive closure over every edge type)
+        for desc_id in self._forward_traverse(file_node_id, max_depth=8):
             node = self.graph.get_node(desc_id)
             if node and node.node_type == NodeType.TEST_RESULT:
                 affected.append(node)

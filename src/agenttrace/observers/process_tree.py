@@ -10,15 +10,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 import psutil  # type: ignore[import-untyped]
 
 from agenttrace.models.events import CommandEvent, ConfidenceLevel, ProcessEvent
 from agenttrace.observers.base import BaseObserver, EventCallback
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -47,18 +50,37 @@ _POLL_INTERVAL = 1.5
 # Tools whose invocation is itself evidence worth recording as a CommandEvent.
 # Note: this is a *prefix* match on the process name, so short-lived tools
 # (curl, wget, git fetch) are captured whenever they survive a poll; the
-# shell interpreters (bash/sh/zsh/fish) carry their -c payload in argv.
+# shell interpreters (bash/sh/zsh/fish, cmd.exe, powershell) carry their
+# -c/-Command payload in argv.
 _COMMAND_TOOL_PREFIXES = [
     "git", "npm", "npx", "yarn", "pnpm", "python", "python3", "pip", "pip3",
     "node", "deno", "bun", "tsc", "vite", "esbuild", "webpack", "rollup",
     "pytest", "curl", "wget", "ssh", "scp", "rsync", "cargo", "go", "rustc",
     "gcc", "clang", "make", "cmake", "gem", "twine", "ruby", "perl", "php",
     "java", "mvn", "gradle", "docker", "docker-compose", "kubectl", "helm",
-    "terraform", "aws", "gcloud", "az", "bash", "sh", "zsh", "fish", "cmd.exe",
+    "terraform", "aws", "gcloud", "az", "bash", "sh", "zsh", "fish",
+    "cmd.exe", "powershell", "pwsh",
 ]
 
 # Shell interpreters whose argv carries the actual command (-c payload)
-_SHELL_NAMES = {"bash", "sh", "zsh", "fish"}
+_SHELL_NAMES = {"bash", "sh", "zsh", "fish", "cmd.exe", "powershell", "pwsh"}
+
+# Max entries in the irrelevant-process cache (pid → create_time). A pid
+# whose identity was already deemed irrelevant is skipped without the
+# expensive cwd lookup on Windows. Identities are immutable per create_time,
+# so a cached verdict is final; a recycled pid gets a fresh create_time and
+# is re-evaluated.
+_MAX_IRRELEVANT = 8192
+
+
+def _is_shell(name: str) -> bool:
+    """True for shell interpreters whose argv carries the real command."""
+    return (
+        name in _SHELL_NAMES
+        or name.startswith("cmd")
+        or name.startswith("powershell")
+        or name.startswith("pwsh")
+    )
 
 
 class ProcessTreeObserver(BaseObserver):
@@ -79,7 +101,8 @@ class ProcessTreeObserver(BaseObserver):
         super().__init__(session_id, workspace_path, callback)
         self._poll_interval = poll_interval
         self._on_pids_updated = on_pids_updated
-        self._tracked_pids: dict[int, dict[str, str | int | None]] = {}
+        self._tracked_pids: dict[int, dict[str, str | int | float | None]] = {}
+        self._irrelevant: dict[int, float] = {}
         self._workspace_resolved = Path(workspace_path).resolve()
 
     async def _run(self) -> None:
@@ -96,10 +119,19 @@ class ProcessTreeObserver(BaseObserver):
             logger.exception("ProcessTreeObserver error")
 
     async def _scan_processes(self) -> None:
-        """Scan running processes for workspace-scoped activity."""
-        current_pids: set[int] = set()
+        """Scan running processes for workspace-scoped activity.
 
-        for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "cwd"]):
+        Two-phase scan: cheap attributes (pid/ppid/name/cmdline/create_time)
+        are fetched for every process; the expensive cwd lookup is only done
+        for candidates that could plausibly relate to the workspace, and a
+        cached "irrelevant" verdict (keyed by pid identity = create_time)
+        skips even that.
+        """
+        current_pids: set[int] = set()
+        workspace_l = str(self._workspace_resolved).lower()
+        ws_raw_l = self.workspace_path.lower()
+
+        for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]):
             try:
                 info = proc.info
                 pid = info["pid"]
@@ -108,26 +140,63 @@ class ProcessTreeObserver(BaseObserver):
 
                 name = (info.get("name") or "").lower()
                 cmdline = info.get("cmdline") or []
-                cwd = info.get("cwd") or ""
+                create_time = info.get("create_time")
+
+                # Skip identities already judged irrelevant (no cwd lookup)
+                if create_time is not None and self._irrelevant.get(pid) == create_time:
+                    continue
+
+                # Cheap pre-filter before the expensive cwd syscall:
+                # name hints, shell/terminal interpreters, or the workspace
+                # path appearing in the command line.
+                cmdline_str = " ".join(cmdline).lower()
+                hints_cmdline = (
+                    workspace_l in cmdline_str or ws_raw_l in cmdline_str
+                )
+                hints_name = (
+                    any(sig in name for sig in _UNIVERSAL_AGENT_SIGNATURES)
+                    or any(prefix in name for prefix in _COMMAND_TOOL_PREFIXES)
+                    or _is_shell(name)
+                )
+                if not hints_cmdline and not hints_name:
+                    if create_time is not None:
+                        self._cache_irrelevant(pid, create_time)
+                    continue
+
+                cwd = self._safe_cwd(proc)
 
                 if not self._is_relevant(name, cmdline, cwd):
+                    if create_time is not None:
+                        self._cache_irrelevant(pid, create_time)
                     continue
 
                 current_pids.add(pid)
                 if pid in self._tracked_pids:
-                    continue
+                    # Canonical process identity = (pid, start time). A pid
+                    # reused by a NEW process (the old one exited between
+                    # polls) must not be merged with the old record — emit
+                    # the termination for the previous identity first.
+                    if self._is_pid_reused(self._tracked_pids[pid], info):
+                        await self._emit_terminated(pid, self._tracked_pids[pid])
+                        self._tracked_pids.pop(pid)
+                    else:
+                        continue
 
                 # New relevant workspace process found
-                proc_info: dict[str, str | int | None] = {
+                proc_info: dict[str, str | int | float | None] = {
                     "pid": pid,
                     "ppid": info.get("ppid"),
                     "name": name,
                     "cmdline": " ".join(cmdline) if cmdline else name,
                     "cwd": cwd,
+                    "started_at": create_time,
                 }
                 self._tracked_pids[pid] = proc_info
 
                 actor_id = self._classify_actor(name, str(proc_info["cmdline"]))
+                started_at = datetime.now(timezone.utc)
+                if isinstance(create_time, (int, float)) and create_time > 0:
+                    started_at = datetime.fromtimestamp(create_time, tz=timezone.utc)
                 event = ProcessEvent(
                     session_id=self.session_id,
                     actor_id=actor_id,
@@ -137,20 +206,21 @@ class ProcessTreeObserver(BaseObserver):
                     ppid=info.get("ppid") or 0,
                     command_line=str(proc_info["cmdline"]),
                     working_dir=cwd,
-                    started_at=datetime.now(timezone.utc),
+                    started_at=started_at,
                     payload={"process_name": name, "actor": actor_id},
                 )
                 await self.emit(event)
 
                 # If process is a discrete command, also emit CommandEvent for
-                # graph correlation. Shell interpreters with a -c payload carry
-                # the *actual* command the agent ran in argv — extract it so the
-                # boundary/policy engines see the real string, not just "bash".
+                # graph correlation. Shell interpreters with a -c/-Command
+                # payload carry the *actual* command the agent ran in argv —
+                # extract it so the boundary/policy engines see the real
+                # string, not just "bash" / "cmd.exe" / "powershell".
                 clean_cmd = str(proc_info["cmdline"])
                 if any(tool_prefix in name for tool_prefix in _COMMAND_TOOL_PREFIXES):
                     command = clean_cmd[:300]
-                    if name in _SHELL_NAMES:
-                        extracted = self._extract_shell_payload(cmdline)
+                    if _is_shell(name):
+                        extracted = self._extract_shell_payload(name, cmdline)
                         if extracted:
                             command = extracted[:300]
                     cmd_event = CommandEvent(
@@ -171,37 +241,87 @@ class ProcessTreeObserver(BaseObserver):
         terminated = set(self._tracked_pids.keys()) - current_pids
         for pid in terminated:
             proc_info = self._tracked_pids.pop(pid)
-            name = str(proc_info.get("name") or "")
-            actor_id = self._classify_actor(name, str(proc_info.get("cmdline") or ""))
-            event = ProcessEvent(
-                session_id=self.session_id,
-                actor_id=actor_id,
-                source_adapter="process_tree_observer",
-                confidence=ConfidenceLevel.HIGH,
-                pid=pid,
-                ppid=int(proc_info.get("ppid") or 0),
-                command_line=str(proc_info.get("cmdline") or ""),
-                working_dir=str(proc_info.get("cwd") or ""),
-                ended_at=datetime.now(timezone.utc),
-                payload={"terminated": True, "actor": actor_id},
-            )
-            await self.emit(event)
+            await self._emit_terminated(pid, proc_info)
 
         # Notify network observer of current active PIDs
         if self._on_pids_updated:
             self._on_pids_updated(set(self._tracked_pids.keys()))
 
-    @staticmethod
-    def _extract_shell_payload(cmdline: list[str]) -> str:
-        """Extract the actual command from `bash -c '<cmd>' ...` argv.
+    def _cache_irrelevant(self, pid: int, create_time: float) -> None:
+        """Cache an irrelevant-process verdict, bounding the cache size."""
+        if len(self._irrelevant) >= _MAX_IRRELEVANT:
+            self._irrelevant.clear()
+        self._irrelevant[pid] = create_time
 
-        psutil returns argv as a list, so the `-c` payload is a single element
-        (e.g. ``["bash", "-c", "rm -rf /tmp/x"]``). We return that element
-        verbatim — the boundary/policy engines see the real command string.
-        """
+    @staticmethod
+    def _safe_cwd(proc: Any) -> str:
+        """Fetch a process cwd, tolerating races and access denials."""
         try:
-            idx = cmdline.index("-c")
-        except ValueError:
+            return str(proc.cwd() or "")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            return ""
+
+    @staticmethod
+    def _is_pid_reused(
+        prev_info: dict[str, str | int | float | None],
+        current_info: dict[str, Any],
+    ) -> bool:
+        """True when a tracked pid now belongs to a different process identity.
+
+        A pid is canonical only together with its start time (create_time).
+        When the tracked start time differs from the live process, the old
+        identity has exited and the pid was recycled.
+        """
+        prev_started = prev_info.get("started_at")
+        cur_started = current_info.get("create_time")
+        if prev_started is None or cur_started is None:
+            return False
+        return bool(prev_started != cur_started)
+
+    async def _emit_terminated(
+        self,
+        pid: int,
+        proc_info: dict[str, str | int | float | None],
+    ) -> None:
+        """Emit a ProcessEvent marking the end of a tracked process identity."""
+        name = str(proc_info.get("name") or "")
+        actor_id = self._classify_actor(name, str(proc_info.get("cmdline") or ""))
+        event = ProcessEvent(
+            session_id=self.session_id,
+            actor_id=actor_id,
+            source_adapter="process_tree_observer",
+            confidence=ConfidenceLevel.HIGH,
+            pid=pid,
+            ppid=int(proc_info.get("ppid") or 0),
+            command_line=str(proc_info.get("cmdline") or ""),
+            working_dir=str(proc_info.get("cwd") or ""),
+            ended_at=datetime.now(timezone.utc),
+            payload={"terminated": True, "actor": actor_id},
+        )
+        await self.emit(event)
+
+    @staticmethod
+    def _extract_shell_payload(name: str, cmdline: list[str]) -> str:
+        """Extract the actual command from shell argv.
+
+        psutil returns argv as a list, so the payload is a single element:
+
+        - POSIX shells: ``["bash", "-c", "rm -rf /tmp/x"]``
+        - cmd.exe:     ``["cmd.exe", "/c", "rmdir /s /q C:\\tmp\\x"]``
+        - PowerShell:  ``["powershell.exe", "-Command", "Remove-Item -Recurse ..."]``
+
+        The payload is returned verbatim — the boundary/policy engines see
+        the real command string, not just the interpreter name.
+        """
+        flags: tuple[str, ...]
+        if name.startswith("cmd") or name.startswith("powershell") or name.startswith("pwsh"):
+            flags = ("/c", "-c", "-command", "/command")
+        else:
+            flags = ("-c",)
+        lowered = [arg.lower() for arg in cmdline]
+        try:
+            idx = next(i for i, arg in enumerate(lowered) if arg in flags)
+        except StopIteration:
             return ""
         if idx + 1 < len(cmdline):
             return cmdline[idx + 1].strip()
@@ -213,7 +333,11 @@ class ProcessTreeObserver(BaseObserver):
         if cwd:
             try:
                 proc_cwd = Path(cwd).resolve()
-                if proc_cwd == self._workspace_resolved or self._workspace_resolved in proc_cwd.parents:
+                within = (
+                    proc_cwd == self._workspace_resolved
+                    or self._workspace_resolved in proc_cwd.parents
+                )
+                if within:
                     return True
             except (ValueError, TypeError, OSError):
                 pass
@@ -221,7 +345,8 @@ class ProcessTreeObserver(BaseObserver):
         # 2. Check if command line contains workspace path explicitly
         if cmdline and self.workspace_path:
             cmdline_str = " ".join(cmdline).lower()
-            if str(self._workspace_resolved).lower() in cmdline_str or self.workspace_path.lower() in cmdline_str:
+            resolved_l = str(self._workspace_resolved).lower()
+            if resolved_l in cmdline_str or self.workspace_path.lower() in cmdline_str:
                 return True
 
         # 3. Known or detected AI agent tool executing within or pointing to workspace
@@ -262,7 +387,9 @@ class ProcessTreeObserver(BaseObserver):
 
         # 2. Extract VS Code / IDE extension name dynamically
         # e.g., "extensions\publisher.extension-name\..."
-        ext_match = re.search(r"extensions[\\/]([a-zA-Z0-9_\-\.]+)[\\/]", cmdline_str, re.IGNORECASE)
+        ext_match = re.search(
+            r"extensions[\\/]([a-zA-Z0-9_\-\.]+)[\\/]", cmdline_str, re.IGNORECASE
+        )
         if ext_match:
             ext_full = ext_match.group(1).lower()
             ext_short = ext_full.split(".")[-1]
@@ -273,7 +400,11 @@ class ProcessTreeObserver(BaseObserver):
             return "terminal:developer"
 
         # 4. Standard developer build tools, compilers, and runtimes
-        if any(k in name.lower() for k in ["git", "npm", "node", "python", "pytest", "tsc", "vite", "esbuild", "pip", "cargo", "go", "docker", "make"]):
+        tool_keys = [
+            "git", "npm", "node", "python", "pytest", "tsc", "vite",
+            "esbuild", "pip", "cargo", "go", "docker", "make",
+        ]
+        if any(k in name.lower() for k in tool_keys):
             clean_name = name.lower().replace(".exe", "")
             return f"tool:{clean_name}"
 

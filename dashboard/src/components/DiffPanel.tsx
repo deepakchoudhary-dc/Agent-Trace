@@ -27,28 +27,32 @@ export const DiffPanel: React.FC<DiffPanelProps> = ({ sessionId, blastRadius }) 
   const [diffs, setDiffs] = useState<DiffItem[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
+  // Guards against stale responses when switching sessions quickly.
+  const requestIdRef = useRef(0);
 
   useEffect(() => {
-    if (sessionId) {
-      loadDiffs(sessionId);
-    }
     // Reset selection when switching sessions
     setSelectedFile(null);
     setDiffs([]);
+    if (sessionId) {
+      loadDiffs(sessionId);
+    }
   }, [sessionId]);
 
   const loadDiffs = async (sid: string) => {
+    const currentRequestId = ++requestIdRef.current;
     setLoading(true);
     try {
       const data = await api.getDiffs(sid);
+      if (currentRequestId !== requestIdRef.current) return;
       setDiffs(data);
       if (data.length > 0) {
         setSelectedFile(data[0].file_path);
       }
     } catch {
-      setDiffs([]);
+      if (currentRequestId === requestIdRef.current) setDiffs([]);
     } finally {
-      setLoading(false);
+      if (currentRequestId === requestIdRef.current) setLoading(false);
     }
   };
 

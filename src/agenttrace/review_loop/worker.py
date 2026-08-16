@@ -1,8 +1,15 @@
 """Worker — resident agent that executes plans and accepts feedback.
 
-The Worker is a persistent agent that implements the plan's subtasks,
-produces artifacts, and iterates based on reviewer feedback until
-all acceptance criteria are met.
+The Worker gathers REAL evidence for the review loop:
+- code artifacts: the actual content of files in scope (from the session's
+  recorded FILE_MUTATION events), bounded in size
+- verification artifacts: real output of allowlisted verification commands
+  (`pytest`, `ruff`, `mypy`, `py_compile`, ...) run against the audited
+  workspace
+
+On feedback iterations, only commands that previously failed, errored, or
+were rejected by the allowlist are re-run — the loop converges on real
+verification outcomes instead of fabricating artifacts.
 """
 
 from __future__ import annotations
@@ -10,12 +17,19 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from agenttrace.review_loop.planner import ReviewPlan, Subtask
+if TYPE_CHECKING:
+    from agenttrace.review_loop.planner import ReviewPlan, Subtask
+    from agenttrace.review_loop.verification import VerificationResult
+
+from agenttrace.review_loop.verification import VerificationRunner
 
 logger = logging.getLogger(__name__)
+
+_MAX_FILE_CHARS = 65536
 
 
 @dataclass
@@ -23,12 +37,24 @@ class WorkerArtifact:
     """An artifact produced by the Worker."""
 
     artifact_id: UUID = field(default_factory=uuid4)
-    artifact_type: str = ""  # code | test | doc | config
+    artifact_type: str = ""  # code | verification
     file_path: str = ""
     content: str = ""
+    command: str = ""
+    exit_code: int | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
     subtask_id: UUID | None = None
     iteration: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether this verification artifact reflects a passing run."""
+        return (
+            self.artifact_type == "verification"
+            and self.evidence.get("allowed", True)
+            and self.exit_code == 0
+        )
 
 
 @dataclass
@@ -45,24 +71,26 @@ class WorkerResult:
 
 
 class Worker:
-    """Resident agent that implements the review plan.
+    """Resident agent that gathers real evidence for the review plan.
 
     The Worker:
-    1. Receives a plan with subtasks and acceptance criteria
-    2. Executes subtasks in priority order
-    3. Produces artifacts (code, tests, docs)
+    1. Reads the plan's subtasks and scope (real changed files)
+    2. Produces code artifacts from actual file content
+    3. Runs allowlisted verification commands against the workspace
     4. Accepts feedback from reviewers
-    5. Iterates until convergence
-
-    The Worker tracks its iteration count and the feedback it has
-    incorporated, enabling convergence detection.
+    5. Iterates until convergence (re-running only failed verification)
     """
 
-    def __init__(self, workspace_path: str = "") -> None:
+    def __init__(self, workspace_path: str = "", max_file_chars: int = _MAX_FILE_CHARS) -> None:
         self.workspace_path = workspace_path
+        self.max_file_chars = max_file_chars
         self._iteration = 0
         self._feedback_history: list[dict[str, Any]] = []
         self._artifacts: list[WorkerArtifact] = []
+        self._scope_files: list[str] = []
+        self._diff_summaries: dict[str, str] = {}
+        self._verification: dict[str, VerificationResult] = {}
+        self._runner: VerificationRunner | None = None
 
     @property
     def iteration(self) -> int:
@@ -72,35 +100,52 @@ class Worker:
     def feedback_history(self) -> list[dict[str, Any]]:
         return list(self._feedback_history)
 
+    def set_review_context(
+        self,
+        scope_files: list[str] | None = None,
+        diff_summaries: dict[str, str] | None = None,
+    ) -> None:
+        """Set the real scope of the review (files changed by the audited agent)."""
+        self._scope_files = list(scope_files or [])
+        self._diff_summaries = dict(diff_summaries or {})
+
+    def _runner_for(self) -> VerificationRunner:
+        if self._runner is None:
+            self._runner = VerificationRunner(self.workspace_path)
+        return self._runner
+
     def execute(
         self,
         plan: ReviewPlan,
         feedback: dict[str, Any] | None = None,
     ) -> WorkerResult:
-        """Execute one iteration of the plan.
-
-        If feedback is provided (from a previous review cycle),
-        incorporate it before working on subtasks.
-        """
+        """Execute one iteration of the plan."""
         self._iteration += 1
         result = WorkerResult(iteration=self._iteration)
 
         # Apply feedback if provided
         if feedback:
             self._feedback_history.append(feedback)
-            applied = self._apply_feedback(feedback)
-            result.feedback_applied = applied
+            result.feedback_applied = self._apply_feedback(feedback)
+
+        # Which verification commands to run this iteration: on the first
+        # iteration all plan commands; afterwards only the ones that failed
+        # or were rejected previously, plus commands from newly added subtasks.
+        run_set = self._commands_to_run(plan)
 
         # Execute subtasks in priority order
         sorted_subtasks = sorted(plan.subtasks, key=lambda s: s.priority)
         for subtask in sorted_subtasks:
-            artifact = self._execute_subtask(subtask)
-            if artifact:
+            artifacts, complete, note = self._execute_subtask(subtask, run_set)
+            for artifact in artifacts:
                 result.artifacts.append(artifact)
                 self._artifacts.append(artifact)
+            if complete:
                 result.completed_subtasks.append(subtask.subtask_id)
             else:
                 result.pending_subtasks.append(subtask.subtask_id)
+            if note:
+                result.notes = (result.notes + "; " + note) if result.notes else note
 
         logger.info(
             "Worker iteration %d: %d artifacts, %d completed, %d pending",
@@ -111,6 +156,23 @@ class Worker:
         )
 
         return result
+
+    def _commands_to_run(self, plan: ReviewPlan) -> set[str]:
+        """Collect verification commands for this iteration."""
+        all_commands = {
+            cmd
+            for subtask in plan.subtasks
+            for cmd in subtask.verification_commands
+        }
+        if self._iteration <= 1:
+            return all_commands
+
+        retry = {
+            cmd for cmd, r in self._verification.items()
+            if not r.succeeded
+        }
+        never_run = all_commands - set(self._verification)
+        return retry | never_run
 
     def _apply_feedback(self, feedback: dict[str, Any]) -> list[str]:
         """Incorporate reviewer feedback into the work."""
@@ -127,23 +189,106 @@ class Worker:
         logger.info("Applied %d feedback items", len(applied))
         return applied
 
-    def _execute_subtask(self, subtask: Subtask) -> WorkerArtifact | None:
-        """Execute a single subtask and produce an artifact.
+    def _execute_subtask(
+        self,
+        subtask: Subtask,
+        run_set: set[str],
+    ) -> tuple[list[WorkerArtifact], bool, str]:
+        """Execute one subtask, producing real code and verification artifacts.
 
-        In a real AI-powered system, this would invoke an LLM to
-        generate code. In the framework, it records the subtask
-        execution and produces a structured artifact.
+        Returns (artifacts, completed, note).
         """
-        artifact = WorkerArtifact(
-            artifact_type="code",
-            subtask_id=subtask.subtask_id,
-            iteration=self._iteration,
+        artifacts: list[WorkerArtifact] = []
+        note = ""
+
+        # Real file content for the subtask in scope
+        if subtask.title == "Implementation":
+            for file_path in self._scope_files:
+                content = self._read_scope_file(file_path)
+                if content is None:
+                    continue
+                artifacts.append(
+                    WorkerArtifact(
+                        artifact_type="code",
+                        file_path=file_path,
+                        content=content,
+                        evidence={"diff_summary": self._diff_summaries.get(file_path, "")},
+                        subtask_id=subtask.subtask_id,
+                        iteration=self._iteration,
+                    )
+                )
+
+        # Real verification evidence
+        for command in subtask.verification_commands:
+            if command not in run_set:
+                continue
+            verification = self._run_verification(command, subtask.subtask_id)
+            artifacts.append(
+                WorkerArtifact(
+                    artifact_type="verification",
+                    file_path=command,
+                    content=verification.output,
+                    command=command,
+                    exit_code=verification.exit_code,
+                    evidence={
+                        "allowed": verification.allowed,
+                        "rejection_reason": verification.rejection_reason,
+                        "duration_ms": verification.duration_ms,
+                        "error": verification.error,
+                    },
+                    subtask_id=subtask.subtask_id,
+                    iteration=self._iteration,
+                )
+            )
+
+        # Completion: all its verification commands succeeded (or none were
+        # expected), and implementation subtasks also need scope files.
+        verification_results = [
+            self._verification[cmd] for cmd in subtask.verification_commands
+        ]
+        if subtask.verification_commands and not verification_results:
+            return artifacts, False, f"No verification ran for: {subtask.title}"
+
+        all_passed = all(r.succeeded for r in verification_results)
+        implementation_has_files = (
+            subtask.title != "Implementation" or bool(self._scope_files)
         )
+        complete = all_passed and implementation_has_files
 
-        # The actual work would be done here by an AI agent or developer
-        artifact.content = f"# Implementation for: {subtask.title}\n# {subtask.description}"
+        if not all_passed and verification_results:
+            failed = [
+                r.command for r in verification_results
+                if not r.succeeded
+            ]
+            note = f"Failed verification for {subtask.title}: {', '.join(failed)}"
+        elif subtask.title == "Implementation" and not self._scope_files:
+            note = f"No changed files in scope for: {subtask.title}"
 
-        return artifact
+        return artifacts, complete, note
+
+    def _run_verification(self, command: str, subtask_id: UUID | None) -> VerificationResult:
+        """Run one verification command, updating the per-iteration cache."""
+        verification = self._runner_for().run(command)
+        self._verification[command] = verification
+        return verification
+
+    def _read_scope_file(self, file_path: str) -> str | None:
+        """Read real file content, bounded; None if unreadable or out of scope."""
+        try:
+            path = Path(file_path)
+            if not path.is_absolute():
+                path = Path(self.workspace_path) / path
+            if not path.exists():
+                return None
+            content = path.read_text(encoding="utf-8", errors="replace")
+            if len(content) > self.max_file_chars:
+                content = (
+                    content[: self.max_file_chars]
+                    + f"\n... [truncated, {len(content)} chars total]"
+                )
+            return content
+        except OSError:
+            return None
 
     def get_artifacts(self) -> list[WorkerArtifact]:
         """Get all artifacts produced across all iterations."""
@@ -152,14 +297,25 @@ class Worker:
     def get_convergence_metrics(self) -> dict[str, Any]:
         """Calculate convergence metrics for the review loop.
 
-        Higher convergence means fewer changes between iterations,
+        Higher convergence means fewer failures between iterations,
         indicating the work is stabilizing.
         """
+        total_artifacts = len(self._artifacts)
+        feedback_rounds = len(self._feedback_history)
+        verification_runs = len(self._verification)
+        failed_verification = sum(
+            1 for r in self._verification.values() if not r.succeeded
+        )
+
         if self._iteration <= 1:
             return {
                 "iteration": self._iteration,
                 "convergence_score": 0.0,
                 "feedback_trend": "initial",
+                "total_artifacts": total_artifacts,
+                "feedback_rounds": feedback_rounds,
+                "verification_runs": verification_runs,
+                "failed_verification": failed_verification,
             }
 
         # Calculate feedback trend
@@ -188,6 +344,8 @@ class Worker:
             "iteration": self._iteration,
             "convergence_score": round(score, 2),
             "feedback_trend": trend,
-            "total_artifacts": len(self._artifacts),
-            "feedback_rounds": len(self._feedback_history),
+            "total_artifacts": total_artifacts,
+            "feedback_rounds": feedback_rounds,
+            "verification_runs": verification_runs,
+            "failed_verification": failed_verification,
         }

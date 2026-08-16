@@ -77,8 +77,11 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
   if (!session) return null;
 
   const isChainValid = verification ? verification.verified : false;
+  // Never fabricate a chain root: without a verified head hash the report
+  // shows an explicit gap instead of a fake all-zeros digest.
   const lastEventHash =
-    verification?.last_event_hash || (timeline.length > 0 ? timeline[timeline.length - 1].event_hash : '0'.repeat(64));
+    verification?.last_event_hash ||
+    (timeline.length > 0 ? timeline[timeline.length - 1].event_hash : '');
 
   const handleExportJSON = () => {
     setDownloading(true);
@@ -215,8 +218,13 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
             Head Event Hash (Chain Root)
           </label>
           <div className="code-block" style={{ fontSize: '11px', color: '#d4d4d8', wordBreak: 'break-all' }}>
-            {lastEventHash}
+            {lastEventHash || '—'}
           </div>
+          {!lastEventHash && (
+            <p style={{ fontSize: '10.5px', color: 'var(--text-dim)' }}>
+              No chain root — no events have been sealed and verified for this session.
+            </p>
+          )}
         </div>
 
         {/* Action Buttons */}

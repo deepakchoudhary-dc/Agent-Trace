@@ -8,19 +8,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from uuid import UUID
+import time
+from typing import TYPE_CHECKING
 
 import psutil  # type: ignore[import-untyped]
 
 from agenttrace.models.events import ConfidenceLevel, NetworkEvent
 from agenttrace.observers.base import BaseObserver, EventCallback
 
+if TYPE_CHECKING:
+    from uuid import UUID
+
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 4.0
 
-# Common local addresses to filter out
+# Common local addresses to filter out (IPv4-mapped IPv6 forms included)
 _LOCAL_ADDRS = {"127.0.0.1", "::1", "0.0.0.0", "::", "localhost", ""}
+
+# A (pid, ip, port, type) seen again within this window is the same
+# connection still alive (or its TIME_WAIT residue) — suppress it. After the
+# window a NEW egress to the same destination is a fresh event. Long-lived
+# connections keep refreshing their timestamp, so they stay suppressed.
+_DEDUP_WINDOW = 120.0
+
+# psutil socket type constants → protocol label
+_PROTOCOL_BY_TYPE = {
+    1: "tcp",
+    2: "udp",
+    3: "raw",
+}
 
 # Connection states that prove an *outbound* connection to the destination.
 # TIME_WAIT/CLOSE_WAIT/FIN_WAIT linger after completion (~60s), so a
@@ -30,6 +47,18 @@ _OUTBOUND_STATUSES = {
     "ESTABLISHED", "SYN_SENT", "SYN-RECEIVED", "CLOSE_WAIT", "LAST_ACK",
     "FIN_WAIT1", "FIN_WAIT2", "TIME_WAIT", "CLOSING",
 }
+
+
+def _normalize_ip(ip: str) -> str:
+    """Normalize an IP literal for local-address filtering.
+
+    Strips the IPv4-mapped IPv6 prefix (``::ffff:127.0.0.1`` → ``127.0.0.1``)
+    so mapped forms cannot bypass the local-address filter.
+    """
+    lowered = ip.lower()
+    if lowered.startswith("::ffff:"):
+        return lowered[len("::ffff:"):]
+    return lowered
 
 
 class NetworkObserver(BaseObserver):
@@ -50,8 +79,9 @@ class NetworkObserver(BaseObserver):
         super().__init__(session_id, workspace_path, callback)
         self._poll_interval = poll_interval
         self._tracked_pids = tracked_pids if tracked_pids is not None else set()
-        # Track connections we've already reported to avoid duplicates
-        self._seen_connections: set[tuple[int, str, int, str]] = set()
+        # Connections recently reported — (pid, ip, port, type) → last seen
+        # monotonic timestamp. Entries older than _DEDUP_WINDOW are re-emitted.
+        self._seen_connections: dict[tuple[int, str, int, str], float] = {}
 
     def update_tracked_pids(self, pids: set[int]) -> None:
         """Update the set of PIDs to monitor for network activity."""
@@ -90,20 +120,25 @@ class NetworkObserver(BaseObserver):
             if pid is None or pid not in self._tracked_pids:
                 continue
 
-            remote_ip = conn.raddr.ip if conn.raddr else ""
-            remote_port = conn.raddr.port if conn.raddr else 0
+            remote_ip = _normalize_ip(conn.raddr.ip)
+            remote_port = conn.raddr.port
 
-            # Skip local-only connections
+            # Skip local-only connections (mapped IPv6 forms already stripped)
             if remote_ip in _LOCAL_ADDRS:
                 continue
 
-            # Dedup key
+            # Dedup within a time window: same (pid, dest) while the
+            # connection is alive is one egress; a fresh connection to the
+            # same destination after the window is a new event.
+            now = time.monotonic()
             conn_key = (pid, remote_ip, remote_port, str(conn.type))
-            if conn_key in self._seen_connections:
+            last_seen = self._seen_connections.get(conn_key)
+            if last_seen is not None and now - last_seen < _DEDUP_WINDOW:
+                self._seen_connections[conn_key] = now
                 continue
-            self._seen_connections.add(conn_key)
+            self._seen_connections[conn_key] = now
 
-            protocol = "tcp" if conn.type == 1 else "udp"
+            protocol = _PROTOCOL_BY_TYPE.get(int(conn.type), "unknown")
             direction = (
                 "outbound"
                 if (conn.status or "").upper() in _OUTBOUND_STATUSES

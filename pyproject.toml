@@ -38,11 +38,11 @@ packages = ["src/agenttrace"]
 
 [tool.mypy]
 strict = true
-python_version = "3.11"
+python_version = "3.10"
 plugins = ["pydantic.mypy"]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]

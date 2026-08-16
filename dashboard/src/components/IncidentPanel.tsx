@@ -11,6 +11,7 @@ import {
 interface IncidentPanelProps {
   findings: PolicyFinding[];
   causalPaths: EvidencePath[];
+  unverified?: boolean;
   onRequestApproval: (finding: PolicyFinding) => void;
 }
 
@@ -30,6 +31,7 @@ const severityBadge = (severity: string) => {
 export const IncidentPanel: React.FC<IncidentPanelProps> = ({
   findings,
   causalPaths,
+  unverified = false,
   onRequestApproval,
 }) => {
   return (
@@ -50,15 +52,30 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
             <span className="panel-title">Active Policy Findings</span>
             <span className="chip">{findings.length}</span>
           </div>
-          {findings.length > 0 ? (
+          {unverified ? (
+            <span className="badge badge-high" title="The daemon is unreachable — observed state cannot be verified">
+              UNVERIFIED — DAEMON UNREACHABLE
+            </span>
+          ) : findings.length > 0 ? (
             <span className="badge badge-critical">GATED BY POLICY</span>
           ) : (
-            <span className="badge badge-high">CLEAN & COMPLIANT</span>
+            <span className="badge badge-low">CLEAN & COMPLIANT</span>
           )}
         </div>
 
         <div className="scroll-thin" style={{ flex: 1, overflowY: 'auto', padding: '14px' }}>
-          {findings.length === 0 ? (
+          {unverified ? (
+            <div className="empty-state">
+              <ShieldAlert size={34} color="#71717a" />
+              <h3 className="font-heading" style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
+                Data Unavailable — Daemon Unreachable
+              </h3>
+              <p style={{ fontSize: '11.5px' }}>
+                Nothing observed means nothing verified. Reconnect to the daemon to confirm
+                the session is clean.
+              </p>
+            </div>
+          ) : findings.length === 0 ? (
             <div className="empty-state">
               <ShieldCheck size={34} color="#ffffff" />
               <h3 className="font-heading" style={{ fontSize: '14px', color: 'var(--text-muted)' }}>

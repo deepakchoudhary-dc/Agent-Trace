@@ -37,6 +37,14 @@ const TABS = [
   { id: 'diff', label: 'Diff & Blast Radius', icon: FileCode },
 ];
 
+// DPAPI key protection exists only on Windows; on other platforms the local
+// key store differs. The chip must not claim platform features it does not
+// use.
+const IS_WINDOWS =
+  typeof navigator !== 'undefined' &&
+  /win/i.test(navigator.platform || navigator.userAgent || '');
+const CRYPTO_LABEL = IS_WINDOWS ? 'DPAPI + AES-256' : 'OS keyring + AES-256';
+
 export const Navbar: React.FC<NavbarProps> = ({
   sessions,
   currentSession,
@@ -156,7 +164,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           <div className="flex" style={{ gap: '8px' }}>
             <div className="chip" style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
               <Lock size={11} color="#ffffff" />
-              <span style={{ color: '#ffffff' }}>DPAPI + AES-256</span>
+              <span style={{ color: '#ffffff' }}>{CRYPTO_LABEL}</span>
             </div>
 
             <button

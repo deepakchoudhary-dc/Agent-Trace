@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from agenttrace.review_loop.planner import ReviewPlan
-from agenttrace.review_loop.synthesizer import SynthesisResult
+if TYPE_CHECKING:
+    from agenttrace.review_loop.planner import ReviewPlan
+    from agenttrace.review_loop.synthesizer import SynthesisResult
 
 logger = logging.getLogger(__name__)
 
@@ -108,15 +110,19 @@ class PlanReviewer:
 
         # Security issues that weren't in the plan
         for finding in synthesis.slop_findings:
-            if "security" in finding.lower() or "injection" in finding.lower():
-                if not any("security" in c.lower() for c in plan.acceptance_criteria):
-                    missing.append("Security checks should be explicit criteria")
+            flagged = "security" in finding.lower() or "injection" in finding.lower()
+            if flagged and not any(
+                "security" in c.lower() for c in plan.acceptance_criteria
+            ):
+                missing.append("Security checks should be explicit criteria")
 
         # Convention issues that weren't covered
         for finding in synthesis.slop_findings:
-            if "convention" in finding.lower() or "naming" in finding.lower():
-                if not any("convention" in c.lower() for c in plan.acceptance_criteria):
-                    missing.append("Convention compliance should be an explicit criterion")
+            flagged = "convention" in finding.lower() or "naming" in finding.lower()
+            if flagged and not any(
+                "convention" in c.lower() for c in plan.acceptance_criteria
+            ):
+                missing.append("Convention compliance should be an explicit criterion")
 
         return missing
 

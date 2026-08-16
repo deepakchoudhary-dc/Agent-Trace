@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -120,3 +121,144 @@ async def test_graph_nodes_never_contain_secrets(client, tmp_path):
     serialized = str(body)
     assert "sk-secretvalue12345" not in serialized
     assert any(n["node_type"] == "command" for n in body.get("nodes", []))
+
+
+# -- Review loop endpoints (P0-7) --
+
+GOOD_MODULE = '''\
+"""Math utilities."""
+
+from __future__ import annotations
+
+
+def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+'''
+
+GOOD_TEST = '''\
+"""Tests for math utilities."""
+
+from __future__ import annotations
+
+from math_utils import add
+
+
+def test_add() -> None:
+    """Addition works."""
+    assert add(1, 2) == 3
+'''
+
+
+def _make_workspace(tmp_path) -> str:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "math_utils.py").write_text(GOOD_MODULE, encoding="utf-8")
+    (ws / "test_math_utils.py").write_text(GOOD_TEST, encoding="utf-8")
+    return str(ws)
+
+
+async def _append_file_mutation(client, tokens, sid: str, workspace: str) -> None:
+    from agenttrace.models.events import FileMutationEvent
+
+    session = api.daemon.get_session(UUID(sid))
+    assert session is not None
+    await api.daemon.ingest_event(
+        FileMutationEvent(
+            session_id=session.session_id,
+            actor_id="test-agent",
+            source_adapter="test",
+            file_path="math_utils.py",
+            mutation_type="modify",
+            before_hash="",
+            after_hash="abc",
+            diff_summary="added add()",
+        )
+    )
+    _ = client, tokens, workspace
+
+
+@pytest.mark.asyncio
+async def test_review_run_endpoint_produces_real_verdicts(client, tmp_path):
+    c, (test_daemon, tokens) = client
+    workspace = _make_workspace(tmp_path)
+    sid = _create_session(c, tokens, workspace)
+    await _append_file_mutation(c, tokens, sid, workspace)
+
+    res = c.post(f"/sessions/{sid}/review", headers=_auth_headers(tokens))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["loop_id"]
+    assert body["final_passed"] is True
+    assert body["total_iterations"] >= 1
+    assert body["iterations"][0]["review_results"]
+    names = {r["reviewer_name"] for r in body["iterations"][0]["review_results"]}
+    assert names == {"spec_compliance", "security", "convention"}
+    assert any("math_utils.py" in s for s in body["scope_files"])
+
+
+@pytest.mark.asyncio
+async def test_review_run_endpoint_redacts_secrets(client, tmp_path):
+    c, (test_daemon, tokens) = client
+    workspace = _make_workspace(tmp_path)
+    # A real file in the audited workspace containing a credential
+    (Path(workspace) / "app_config.py").write_text(
+        'token = "sk-verysecretapikey12345"\n',
+        encoding="utf-8",
+    )
+    sid = _create_session(c, tokens, workspace)
+    from agenttrace.models.events import FileMutationEvent
+
+    session = test_daemon.get_session(UUID(sid))
+    assert session is not None
+    await test_daemon.ingest_event(
+        FileMutationEvent(
+            session_id=session.session_id,
+            actor_id="test-agent",
+            source_adapter="test",
+            file_path="app_config.py",
+            mutation_type="create",
+            before_hash="",
+            after_hash="def",
+            diff_summary="added app config",
+        )
+    )
+
+    res = c.post(f"/sessions/{sid}/review", headers=_auth_headers(tokens))
+    assert res.status_code == 200, res.text
+    assert "sk-verysecretapikey12345" not in str(res.json())
+
+
+@pytest.mark.asyncio
+async def test_review_run_persisted_and_fetchable(client, tmp_path):
+    c, (test_daemon, tokens) = client
+    workspace = _make_workspace(tmp_path)
+    sid = _create_session(c, tokens, workspace)
+    await _append_file_mutation(c, tokens, sid, workspace)
+
+    res = c.post(f"/sessions/{sid}/review", headers=_auth_headers(tokens))
+    assert res.status_code == 200, res.text
+    loop_id = res.json()["loop_id"]
+
+    got = c.get(f"/sessions/{sid}/review", headers=_auth_headers(tokens))
+    assert got.status_code == 200
+    stored = got.json()
+    assert stored["loop_id"] == loop_id
+    assert stored["passed"] is True
+    assert stored["payload"]["final_passed"] is True
+
+
+def test_review_run_requires_existing_session(client):
+    c, (_, tokens) = client
+    res = c.post(
+        f"/sessions/{UUID(int=1)}/review",
+        headers=_auth_headers(tokens),
+    )
+    assert res.status_code == 404
+
+
+def test_review_run_missing_record_returns_404(client, tmp_path):
+    c, (_, tokens) = client
+    sid = _create_session(c, tokens, str(tmp_path))
+    res = c.get(f"/sessions/{sid}/review", headers=_auth_headers(tokens))
+    assert res.status_code == 404

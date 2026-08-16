@@ -7,13 +7,21 @@ Context Graph to build ranked evidence paths explaining what led to it.
 from __future__ import annotations
 
 import logging
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.models.events import ConfidenceLevel
 from agenttrace.models.graph import EdgeType, EvidencePath, GraphNode, NodeType
-from agenttrace.graph.context_graph import ContextGraph
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from agenttrace.graph.context_graph import ContextGraph
 
 logger = logging.getLogger(__name__)
+
+# Hard budget on total node expansions per explain() call — protects against
+# path explosion in dense graphs (a naive DFS can enumerate 10^N paths).
+_MAX_EXPLORED_NODES = 2000
 
 # Edge types that indicate causal flow (backward traversal follows these)
 _CAUSAL_EDGES = {
@@ -72,14 +80,20 @@ class CausalExplanationEngine:
         """Find and rank causal evidence paths to a target node.
 
         Performs backward BFS/DFS from the target, collecting all paths
-        that reach a root-cause node type or the maximum depth.
+        that reach a root-cause node type or the maximum depth. The search
+        is bounded by a node-expansion budget and by `max_paths` so dense
+        graphs cannot trigger exponential path enumeration.
         """
         target = self.graph.get_node(target_node_id)
         if not target:
             logger.warning("Target node %s not found", target_node_id)
             return []
 
-        paths: list[EvidencePath] = []
+        state: dict[str, Any] = {
+            "paths": [],
+            "budget": _MAX_EXPLORED_NODES,
+            "max_paths": max_paths,
+        }
         self._traverse_backward(
             current_id=target_node_id,
             visited=set(),
@@ -88,10 +102,11 @@ class CausalExplanationEngine:
             current_confidence=1.0,
             depth=0,
             max_depth=max_depth,
-            paths=paths,
+            max_paths=max_paths,
+            state=state,
         )
 
-        # Sort by confidence (highest first) and limit
+        paths: list[EvidencePath] = state["paths"]
         paths.sort(key=lambda p: p.overall_confidence, reverse=True)
         return paths[:max_paths]
 
@@ -104,29 +119,38 @@ class CausalExplanationEngine:
         current_confidence: float,
         depth: int,
         max_depth: int,
-        paths: list[EvidencePath],
+        max_paths: int,
+        state: dict[str, Any],
     ) -> None:
-        """Recursive backward traversal."""
+        """Recursive backward traversal with hard budgets."""
         if depth >= max_depth:
-            self._emit_path(current_path, current_edges, current_confidence, paths)
+            self._emit_path(current_path, current_edges, current_confidence, state)
+            return
+        if state["budget"] <= 0 or len(state["paths"]) >= max_paths:
             return
 
+        state["budget"] -= 1
         visited.add(current_id)
         incoming_edges = self.graph.get_edges_to(current_id)
 
         # If we reached a root cause type, emit the path
         current_node = self.graph.get_node(current_id)
         if current_node and current_node.node_type in _ROOT_CAUSE_TYPES and depth > 0:
-            self._emit_path(current_path, current_edges, current_confidence, paths)
+            self._emit_path(current_path, current_edges, current_confidence, state)
             # Don't return — continue exploring for longer paths
 
         # If no incoming edges, this is a natural root
         if not incoming_edges:
-            if depth > 0:
-                self._emit_path(current_path, current_edges, current_confidence, paths)
+            emitted_as_root = bool(
+                current_node and current_node.node_type in _ROOT_CAUSE_TYPES
+            )
+            if depth > 0 and not emitted_as_root:
+                self._emit_path(current_path, current_edges, current_confidence, state)
             return
 
         for edge in incoming_edges:
+            if len(state["paths"]) >= max_paths or state["budget"] <= 0:
+                return
             if edge.source_node_id in visited:
                 continue
 
@@ -153,7 +177,8 @@ class CausalExplanationEngine:
                 current_confidence=path_confidence,
                 depth=depth + 1,
                 max_depth=max_depth,
-                paths=paths,
+                max_paths=max_paths,
+                state=state,
             )
 
     def _emit_path(
@@ -161,9 +186,12 @@ class CausalExplanationEngine:
         node_ids: list[UUID],
         edge_ids: list[UUID],
         confidence: float,
-        paths: list[EvidencePath],
+        state: dict[str, Any],
     ) -> None:
         """Create an EvidencePath from the traversal."""
+        paths = state["paths"]
+        if len(paths) >= state["max_paths"]:
+            return
         # Build description from node labels
         descriptions: list[str] = []
         for nid in node_ids:
@@ -180,15 +208,36 @@ class CausalExplanationEngine:
         )
         paths.append(path)
 
-    def what_changed_after(self, node_id: UUID) -> list[GraphNode]:
-        """Get all nodes that were affected after a given node.
+    def what_changed_after(
+        self, node_id: UUID, max_depth: int = 8
+    ) -> list[GraphNode]:
+        """Get nodes causally impacted by a given node.
 
-        Uses forward traversal through causal edges to find everything
-        that was impacted by the given node.
+        Forward traversal through CAUSAL edges only (never the full
+        transitive closure over every edge type), bounded by max_depth.
         """
-        descendants = self.graph.descendants(node_id)
+        visited: set[UUID] = set()
+        frontier = {node_id}
+
+        for _ in range(max_depth):
+            next_frontier: set[UUID] = set()
+            for nid in frontier:
+                if nid in visited:
+                    continue
+                visited.add(nid)
+                for edge in self.graph.get_edges_from(nid):
+                    if edge.edge_type in _CAUSAL_EDGES:
+                        next_frontier.add(edge.target_node_id)
+            frontier = next_frontier - visited
+            if not frontier:
+                break
+
+        # Nodes discovered at the final depth were never expanded — include them
+        visited.update(frontier)
+
+        visited.discard(node_id)
         nodes: list[GraphNode] = []
-        for desc_id in descendants:
+        for desc_id in visited:
             node = self.graph.get_node(desc_id)
             if node:
                 nodes.append(node)

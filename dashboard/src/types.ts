@@ -179,3 +179,103 @@ export interface SessionInfo {
   adapter?: string;
   observability_gaps?: string[];
 }
+
+// -- Review loop (P0-7): real artifacts & verdicts --
+
+export type ReviewVerdict = 'PASSED' | 'FAILED' | 'PARTIAL';
+
+export interface CriterionVerdict {
+  criterion: string;
+  verdict: ReviewVerdict;
+  file_refs: string[];
+  line_refs: number[];
+  notes: string;
+}
+
+export interface WorkerArtifactData {
+  artifact_id: string;
+  artifact_type: 'code' | 'verification' | '';
+  file_path: string;
+  content: string;
+  command: string;
+  exit_code: number | null;
+  evidence: Record<string, unknown>;
+  subtask_id: string | null;
+  iteration: number;
+  created_at: string;
+}
+
+export interface ReviewResultData {
+  reviewer_name: string;
+  reviewer_type: string;
+  results: CriterionVerdict[];
+  suggestions: string[];
+  slop_findings: string[];
+  overall_verdict: ReviewVerdict;
+  confidence: number;
+  review_time_ms: number;
+  created_at: string;
+}
+
+export interface SynthesisData {
+  passed: boolean;
+  overall_confidence: number;
+  passed_criteria: string[];
+  failed_criteria: string[];
+  partial_criteria: string[];
+  slop_findings: string[];
+  suggestions: string[];
+  feedback_for_worker: Record<string, unknown>;
+  deliverable_summary: string;
+}
+
+export interface PlanReviewData {
+  plan_adequate: boolean;
+  scope_issues: string[];
+  missing_criteria: string[];
+  unnecessary_criteria: string[];
+  proposed_amendments: string[];
+  lessons_learned: string[];
+}
+
+export interface ReviewIterationData {
+  iteration: number;
+  worker_result: {
+    iteration: number;
+    artifacts: WorkerArtifactData[];
+    completed_subtasks: string[];
+    pending_subtasks: string[];
+    feedback_applied: string[];
+    notes: string;
+  } | null;
+  review_results: ReviewResultData[];
+  synthesis: SynthesisData | null;
+  plan_review: PlanReviewData | null;
+  passed: boolean;
+  timestamp: string;
+}
+
+export interface ReviewRunData {
+  loop_id: string;
+  task_description: string;
+  workspace_path: string;
+  scope_files: string[];
+  iterations: ReviewIterationData[];
+  final_passed: boolean;
+  total_iterations: number;
+  convergence_metrics: Record<string, unknown>;
+  lessons_learned: string[];
+  deliverable_summary: string;
+  escalation_reason: string;
+  started_at: string;
+  completed_at: string | null;
+}
+
+export interface ReviewRunRecord {
+  loop_id: string;
+  session_id: string;
+  passed: boolean;
+  iterations: number;
+  created_at: string;
+  payload: ReviewRunData;
+}

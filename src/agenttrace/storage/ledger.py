@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -407,6 +408,46 @@ class EventLedger:
                 d["config"] = {}
             result.append(d)
         return result
+
+    # -- Adapter resume cursors --
+
+    def save_adapter_cursor(
+        self, session_id: UUID, adapter_name: str, cursor: dict[str, Any]
+    ) -> None:
+        """Persist an adapter's resume state (file offsets, seen records)."""
+        cursor_enc = self._encryption.encrypt_json(cursor or {})
+        self._conn.execute(
+            """INSERT INTO adapter_cursors (session_id, adapter_name, cursor_enc, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                   adapter_name = excluded.adapter_name,
+                   cursor_enc = excluded.cursor_enc,
+                   updated_at = excluded.updated_at""",
+            (
+                str(session_id),
+                adapter_name,
+                cursor_enc,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self._conn.commit()
+
+    def get_adapter_cursor(self, session_id: UUID) -> dict[str, Any] | None:
+        """Load a session's persisted adapter cursor, or None if never saved."""
+        row = self._conn.execute(
+            "SELECT adapter_name, cursor_enc FROM adapter_cursors WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            cursor = self._encryption.decrypt_json(row["cursor_enc"])
+        except Exception:
+            cursor = {}
+        return {
+            "adapter_name": row["adapter_name"],
+            "cursor": cursor,
+        }
 
     # -- Event ledger --
 
@@ -1048,6 +1089,57 @@ class EventLedger:
 
         return d
 
+    # -- Review loop runs --
+
+    def store_review_run(
+        self,
+        loop_id: UUID,
+        session_id: UUID,
+        passed: bool,
+        iterations: int,
+        payload_json: str,
+    ) -> None:
+        """Persist a review loop result (encrypted, redacted payload)."""
+        payload = self._encryption.encrypt_str(payload_json)
+        self._conn.execute(
+            """INSERT OR REPLACE INTO review_runs
+               (loop_id, session_id, passed, iterations, payload_enc, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                str(loop_id),
+                str(session_id),
+                int(passed),
+                iterations,
+                payload,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self._conn.commit()
+
+    def get_review_runs(self, session_id: UUID) -> list[dict[str, Any]]:
+        """Return all review runs for a session, newest first (decrypted)."""
+        rows = self._conn.execute(
+            "SELECT loop_id, session_id, passed, iterations, payload_enc, created_at "
+            "FROM review_runs WHERE session_id = ? ORDER BY created_at DESC",
+            (str(session_id),),
+        ).fetchall()
+        runs: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                payload = json.loads(self._encryption.decrypt_str(r["payload_enc"]))
+            except Exception as e:  # noqa: BLE001 — corrupt rows must not crash reads
+                logger.warning("Failed to decrypt review run %s: %s", r["loop_id"], e)
+                continue
+            runs.append({
+                "loop_id": r["loop_id"],
+                "session_id": r["session_id"],
+                "passed": bool(r["passed"]),
+                "iterations": r["iterations"],
+                "payload": payload,
+                "created_at": r["created_at"],
+            })
+        return runs
+
     # -- Blob indexing --
 
     def store_blob_index(
@@ -1085,6 +1177,7 @@ class EventLedger:
             "tools_enc",
             "notes_enc",
         ),
+        "review_runs": ("payload_enc",),
     }
 
     def rotate_encryption(

@@ -10,6 +10,8 @@ import {
   EvidencePath,
   ForensicReport,
   PolicyFinding,
+  ReviewRunData,
+  ReviewRunRecord,
   SessionInfo,
   TimelineEvent,
   VerificationResult,
@@ -133,5 +135,17 @@ export const api = {
 
   async analyzeBlastRadius(sessionId: string, nodeId: string): Promise<BlastRadiusResult> {
     return request<BlastRadiusResult>(`/sessions/${sessionId}/blast_radius/${nodeId}`);
+  },
+
+  // Review loop (P0-7): real artifacts & verdicts
+  async runReview(sessionId: string, maxIterations = 3): Promise<ReviewRunData> {
+    return request<ReviewRunData>(`/sessions/${sessionId}/review`, {
+      method: 'POST',
+      body: JSON.stringify({ max_iterations: maxIterations }),
+    });
+  },
+
+  async getReviewRun(sessionId: string): Promise<ReviewRunRecord> {
+    return request<ReviewRunRecord>(`/sessions/${sessionId}/review`);
   },
 };

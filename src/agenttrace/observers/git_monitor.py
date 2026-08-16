@@ -10,11 +10,13 @@ import asyncio
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.models.events import ConfidenceLevel, GitEvent
 from agenttrace.observers.base import BaseObserver, EventCallback
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,7 @@ class GitMonitor(BaseObserver):
         self._poll_interval = poll_interval
         self._last_head: str = ""
         self._last_branch: str = ""
-        self._last_index_hash: str = ""
+        self._last_index_dirty: bool = False
 
     def _git_cmd(self, *args: str) -> str:
         """Run a git command and return stdout."""
@@ -64,9 +66,24 @@ class GitMonitor(BaseObserver):
         """Get current branch name."""
         return self._git_cmd("rev-parse", "--abbrev-ref", "HEAD")
 
-    def _get_index_hash(self) -> str:
-        """Get a hash representing the current index state."""
-        return self._git_cmd("write-tree")
+    def _get_index_dirty(self) -> bool:
+        """True when the index differs from HEAD (staged changes exist).
+
+        Read-only: uses ``git diff --cached --quiet`` (exit code 1 = staged
+        changes). Never ``git write-tree`` — a "read-only" monitor must not
+        write objects into ``.git/objects`` on every poll.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=self.workspace_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return result.returncode == 1
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return False
 
     def _get_commit_info(self, commit_hash: str) -> dict[str, str]:
         """Get commit metadata."""
@@ -108,7 +125,7 @@ class GitMonitor(BaseObserver):
         # Initialize state
         self._last_head = self._get_head()
         self._last_branch = self._get_branch()
-        self._last_index_hash = self._get_index_hash()
+        self._last_index_dirty = self._get_index_dirty()
         logger.info("GitMonitor started: HEAD=%s branch=%s", self._last_head[:8], self._last_branch)
 
         try:
@@ -124,7 +141,7 @@ class GitMonitor(BaseObserver):
         """Check for git state changes and emit events."""
         current_head = self._get_head()
         current_branch = self._get_branch()
-        current_index = self._get_index_hash()
+        current_index_dirty = self._get_index_dirty()
 
         # Detect new commit
         if current_head and current_head != self._last_head:
@@ -165,8 +182,8 @@ class GitMonitor(BaseObserver):
             await self.emit(event)
             self._last_branch = current_branch
 
-        # Detect staging changes
-        if current_index and current_index != self._last_index_hash:
+        # Detect staging changes (transition into a dirty index)
+        if current_index_dirty and not self._last_index_dirty:
             event = GitEvent(
                 session_id=self.session_id,
                 actor_id="git",
@@ -177,4 +194,4 @@ class GitMonitor(BaseObserver):
                 commit_hash=current_head,
             )
             await self.emit(event)
-            self._last_index_hash = current_index
+        self._last_index_dirty = current_index_dirty

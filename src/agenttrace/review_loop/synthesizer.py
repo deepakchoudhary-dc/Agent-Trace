@@ -98,7 +98,12 @@ class Synthesizer:
             for s in result.slop_findings
         )
 
-        result.passed = mandatory_pass and not has_critical_slop
+        # PARTIAL criteria are incomplete work — a passing synthesis requires
+        # every criterion to be satisfied (e.g. failing tests must block the
+        # loop from converging, not merely be flagged as advisory).
+        incomplete = bool(result.partial_criteria) or bool(result.failed_criteria)
+
+        result.passed = mandatory_pass and not has_critical_slop and not incomplete
 
         # Calculate confidence
         if review_results:
