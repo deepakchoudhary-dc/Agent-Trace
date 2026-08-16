@@ -10,12 +10,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agenttrace.daemon import AgentTraceDaemon
@@ -24,6 +31,7 @@ from agenttrace.graph.causal_engine import CausalExplanationEngine
 from agenttrace.graph.replay import ReplayEngine
 from agenttrace.models.events import ConfidenceLevel, EventType, FileMutationEvent
 from agenttrace.models.session import AgentType
+from agenttrace.security.token import ApiTokenManager
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,20 @@ app = FastAPI(
     description="Local daemon API for the AgentTrace causal auditor",
     version="0.2.0",
 )
+
+daemon = AgentTraceDaemon(os.environ.get("AGENTTRACE_DATA_DIR"))
+
+token_manager = ApiTokenManager(daemon._data_dir)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Bind daemon lifecycle to the ASGI server's startup/shutdown."""
+    await daemon.start()
+    try:
+        yield
+    finally:
+        await daemon.stop()
 
 # Bind CORS to local loopback UI development servers only
 app.add_middleware(
@@ -46,7 +68,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-daemon = AgentTraceDaemon()
+
+@app.middleware("http")
+async def require_token(request: Request, call_next: Any) -> Response:
+    """Authenticate every request except /health via X-AgentTrace-Token.
+
+    The token is scoped to the data directory and created by the daemon at
+    startup (see daemon_entry.run_server). Verification is constant-time.
+    """
+    if request.method == "OPTIONS" or request.url.path == "/health":
+        return cast(Response, await call_next(request))
+    presented = request.headers.get("X-AgentTrace-Token", "")
+    if not token_manager.verify(presented):
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid API token"})
+    return cast(Response, await call_next(request))
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Liveness probe used by the CLI to detect a running daemon (unauthenticated)."""
+    return {"status": "ok"}
 
 
 # -- Request & Response DTO Models --
@@ -136,18 +177,6 @@ class EvaluateResponse(BaseModel):
     required_approval_id: str = ""
 
 
-# -- Lifecycle --
-
-@app.on_event("startup")
-async def startup() -> None:
-    await daemon.start()
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    await daemon.stop()
-
-
 # -- Session Endpoints --
 
 @app.post("/sessions", response_model=CreateSessionResponse)
@@ -167,7 +196,7 @@ async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
         )
     except Exception as e:
         logger.exception("Failed to create session: %s", e)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     adapter = daemon._adapters.get(session.session_id)
     gaps = adapter.observability_gaps if adapter else []
@@ -202,14 +231,29 @@ async def list_sessions() -> list[dict[str, Any]]:
 
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: UUID) -> dict[str, Any]:
-    """Get session details."""
+    """Get session details (clean DTO — never raw storage rows)."""
     session = daemon.get_session(session_id)
     if not session:
-        # Check storage directly
+        # Check storage directly; rebuild the DTO so encrypted columns and
+        # internal storage fields are never exposed.
         stored = daemon._ledger.get_session(session_id)
         if not stored:
             raise HTTPException(status_code=404, detail="Session not found")
-        return stored
+        try:
+            config: dict[str, Any] = json.loads(stored.get("config_json", "{}"))
+        except (ValueError, TypeError):
+            config = {}
+        config = daemon._redactor.redact_any(config)
+        return {
+            "session_id": str(session_id),
+            "workspace_path": str(config.get("workspace_path", "")),
+            "status": stored.get("status", "unknown"),
+            "task_description": stored.get("task_desc", ""),
+            "event_count": stored.get("event_count", 0),
+            "last_event_hash": stored.get("last_event_hash", ""),
+            "started_at": stored.get("started_at", ""),
+            "stopped_at": stored.get("stopped_at"),
+        }
 
     return {
         "session_id": str(session.session_id),
@@ -228,6 +272,18 @@ async def stop_session(session_id: UUID) -> dict[str, str]:
     """Stop an active session."""
     await daemon.stop_session(session_id)
     return {"status": "stopped", "session_id": str(session_id)}
+
+
+@app.post("/shutdown")
+async def shutdown_daemon() -> dict[str, str]:
+    """Stop all sessions, seal the ledger, and exit the daemon process.
+
+    The response is flushed before the process exits (daemon.stop() has
+    already persisted and closed the ledger, so no state is lost).
+    """
+    await daemon.stop()
+    threading.Timer(0.5, lambda: os._exit(0)).start()  # noqa: SLF001 (deliberate hard exit after clean close)
+    return {"status": "stopped", "message": "AgentTrace daemon shutting down"}
 
 
 # -- Verification & Integrity Endpoints (P0-1, P0-5) --
@@ -563,7 +619,7 @@ async def get_causal_chain(session_id: UUID, target_node_id: UUID) -> dict[str, 
         nodes_data = daemon._ledger.get_graph_nodes(session_id)
         edges_data = daemon._ledger.get_graph_edges(session_id)
         from agenttrace.graph.context_graph import ContextGraph
-        from agenttrace.models.graph import GraphNode, GraphEdge, NodeType, EdgeType
+        from agenttrace.models.graph import EdgeType, GraphEdge, GraphNode, NodeType
         graph = ContextGraph(session_id)
         for n in nodes_data:
             try:
@@ -618,7 +674,7 @@ async def get_blast_radius(session_id: UUID, node_id: UUID) -> dict[str, Any]:
         nodes_data = daemon._ledger.get_graph_nodes(session_id)
         edges_data = daemon._ledger.get_graph_edges(session_id)
         from agenttrace.graph.context_graph import ContextGraph
-        from agenttrace.models.graph import GraphNode, GraphEdge, NodeType, EdgeType
+        from agenttrace.models.graph import EdgeType, GraphEdge, GraphNode, NodeType
         graph = ContextGraph(session_id)
         for n in nodes_data:
             try:

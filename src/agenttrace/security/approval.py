@@ -37,7 +37,40 @@ class ApprovalManager:
         affected_paths: list[str] | None = None,
         affected_commands: list[str] | None = None,
     ) -> str:
-        """Create an approval request. Returns the finding ID."""
+        """Create an approval request. Returns the finding ID.
+
+        The request is persisted as a hash-chained ledger event plus a
+        status='requested' approval record, so pending requests survive
+        daemon restarts and can be resolved later.
+        """
+        event = ApprovalEvent(
+            session_id=self.session_id,
+            actor_id="policy_engine",
+            source_adapter="approval_manager",
+            confidence=ConfidenceLevel.HIGH,
+            finding_id=finding_id,
+            approved=False,
+            reason=description,
+            scope="",
+            expiry=None,
+            affected_paths=affected_paths or [],
+            affected_commands=affected_commands or [],
+        )
+        event_hash = self._ledger.append_event(event)
+        self._ledger.store_approval(
+            approval_id=event.event_id,
+            session_id=self.session_id,
+            finding_id=finding_id,
+            approved=False,
+            reason=description,
+            scope="",
+            expiry=None,
+            affected_paths=affected_paths or [],
+            affected_commands=affected_commands or [],
+            created_at=event.timestamp.isoformat(),
+            event_hash=event_hash,
+            status="requested",
+        )
         logger.info("Approval requested: %s — %s", finding_id, description)
         return finding_id
 
@@ -54,7 +87,8 @@ class ApprovalManager:
         """Record a user's approval or denial.
 
         The approval is stored as a ledger event (hash-chained) and
-        as a queryable approval record.
+        as a queryable approval record — resolving any pending request
+        for the same finding in place.
         """
         expiry = datetime.now(timezone.utc) + timedelta(minutes=expiry_minutes)
 
@@ -88,6 +122,7 @@ class ApprovalManager:
             affected_commands=affected_commands or [],
             created_at=event.timestamp.isoformat(),
             event_hash=event_hash,
+            status="granted" if approved else "denied",
         )
 
         if approved:
@@ -116,6 +151,12 @@ class ApprovalManager:
         - the action's path / command scope (so a user who approved a finding
           covering `/workspace/.env` is not re-prompted for the same file).
 
+        Path scopes match segment-exactly (approving `/a/.env` never covers
+        `/a/.env.bak`); command scopes match as a whitespace token prefix
+        (`git commit` covers `git commit -m x`, never `git commit-evil`).
+        Typed scope strings ("path:...", "command:...", "network:...") are
+        honored alongside the structured affected lists.
+
         Expired approvals are pruned from the active cache on access.
         """
         now = datetime.now(timezone.utc)
@@ -133,17 +174,80 @@ class ApprovalManager:
             if finding_id and (fid == finding_id or approval.finding_id == finding_id):
                 return True
 
+            scoped_paths, scoped_commands = self._approval_scopes(approval)
+
             # Scope match on path
-            if path and approval.affected_paths:
-                if any(p in path for p in approval.affected_paths):
+            if path and scoped_paths:
+                if any(self._path_in_scope(p, path) for p in scoped_paths):
                     return True
 
             # Scope match on command
-            if command and approval.affected_commands:
-                if any(c in command for c in approval.affected_commands):
+            if command and scoped_commands:
+                if any(self._command_in_scope(c, command) for c in scoped_commands):
                     return True
 
         return False
+
+    @staticmethod
+    def _approval_scopes(approval: ApprovalEvent) -> tuple[list[str], list[str]]:
+        """Extract typed path/command scopes from an approval event.
+
+        Honors both the structured affected lists and typed scope strings
+        ("path:/a/b", "command:git commit", "network:host:443"). Network
+        scopes are not matched here — they are enforced by the network
+        policy layer.
+        """
+        paths: list[str] = []
+        commands: list[str] = []
+        for p in approval.affected_paths or []:
+            if isinstance(p, str) and p:
+                paths.append(p)
+        for c in approval.affected_commands or []:
+            if isinstance(c, str) and c:
+                commands.append(c)
+        for item in approval.scope.split(","):
+            item = item.strip()
+            if item.startswith("path:"):
+                paths.append(item[len("path:"):].strip())
+            elif item.startswith("command:"):
+                commands.append(item[len("command:"):].strip())
+        return paths, commands
+
+    @staticmethod
+    def _normalize_path(p: str) -> str:
+        """Normalize separators for cross-platform matching without touching disk."""
+        return p.replace("\\", "/").rstrip("/")
+
+    @classmethod
+    def _path_in_scope(cls, approved_path: str, action_path: str) -> bool:
+        """Segment-exact path scope match.
+
+        `approved_path` covers `action_path` only when the action is the
+        approved path itself or a descendant at a separator boundary —
+        `/a/.env` never covers `/a/.env.bak` or `/a/.env-2`.
+        """
+        approved = cls._normalize_path(approved_path)
+        action = cls._normalize_path(action_path)
+        if not approved or not action:
+            return False
+        if action == approved:
+            return True
+        return action.startswith(approved + "/")
+
+    @staticmethod
+    def _command_in_scope(approved_command: str, action_command: str) -> bool:
+        """Whitespace token-prefix command scope match.
+
+        `git commit` covers `git commit -m "x"` and `git commit --amend`,
+        but never `git commit-evil` or `git commit; rm -rf .`.
+        """
+        approved_tokens = approved_command.split()
+        action_tokens = action_command.split()
+        if not approved_tokens or not action_tokens:
+            return False
+        if len(approved_tokens) > len(action_tokens):
+            return False
+        return action_tokens[: len(approved_tokens)] == approved_tokens
 
     # Backwards-compatible alias: earlier daemon code referenced is_approved()
     is_approved = check_approval
@@ -161,7 +265,7 @@ class ApprovalManager:
         restored = 0
 
         for rec in records:
-            if not rec.get("approved"):
+            if rec.get("status") != "granted":
                 continue
 
             try:

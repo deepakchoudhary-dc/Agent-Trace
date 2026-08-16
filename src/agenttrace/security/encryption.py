@@ -8,13 +8,14 @@ and strict OS permissions on non-Windows platforms.
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes
-from ctypes import wintypes
 import json
 import logging
 import os
 import secrets
 import sys
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
@@ -32,11 +33,25 @@ class EncryptionError(Exception):
 
 # --- Windows DPAPI Helper Structures & Functions ---
 
-class _DATA_BLOB(ctypes.Structure):
+class DataBlob(ctypes.Structure):
     _fields_ = [
         ("cbData", wintypes.DWORD),
         ("pbData", ctypes.POINTER(ctypes.c_byte)),
     ]
+
+
+def _make_blob(data: bytes) -> tuple[DataBlob, ctypes.Array[ctypes.c_char]]:
+    """Build a DPAPI DATA_BLOB keeping the backing buffer alive.
+
+    The buffer must stay referenced for the duration of the DPAPI call;
+    returning both keeps the raw pointer from dangling.
+    """
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob = DataBlob(
+        cbData=len(data),
+        pbData=ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte)),
+    )
+    return blob, buf
 
 
 def _win32_dpapi_protect(data: bytes, description: str = "AgentTrace Master Key") -> bytes:
@@ -52,11 +67,8 @@ def _win32_dpapi_protect(data: bytes, description: str = "AgentTrace Master Key"
         crypt32 = ctypes.windll.crypt32
         kernel32 = ctypes.windll.kernel32
 
-        data_in = _DATA_BLOB(
-            cbData=len(data),
-            pbData=ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_byte)),
-        )
-        data_out = _DATA_BLOB()
+        data_in, _buffer = _make_blob(data)
+        data_out = DataBlob()
 
         desc_p = ctypes.c_wchar_p(description)
         ret = crypt32.CryptProtectData(
@@ -96,11 +108,8 @@ def _win32_dpapi_unprotect(data: bytes) -> bytes:
         crypt32 = ctypes.windll.crypt32
         kernel32 = ctypes.windll.kernel32
 
-        data_in = _DATA_BLOB(
-            cbData=len(data),
-            pbData=ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_byte)),
-        )
-        data_out = _DATA_BLOB()
+        data_in, _buffer = _make_blob(data)
+        data_out = DataBlob()
 
         ret = crypt32.CryptUnprotectData(
             ctypes.byref(data_in),
@@ -134,6 +143,25 @@ class EncryptionManager:
         self._key_dir.mkdir(parents=True, exist_ok=True)
         self._key = self._load_or_create_key()
         self._cipher = AESGCM(self._key)
+        # Keys retired by rotation, retained so data that was not yet
+        # re-encrypted (or a partially completed rotation) still decrypts.
+        # master.key.old is re-imported at startup so the guarantee survives
+        # a restart after a crash mid-rotation.
+        self._retired_keys = self._load_retired_keys()
+
+    def _load_retired_keys(self) -> list[bytes]:
+        """Load the pre-rotation key backup (master.key.old) if present."""
+        backup_path = self._key_dir / "master.key.old"
+        if not backup_path.exists():
+            return []
+        try:
+            raw = backup_path.read_bytes()
+        except OSError:
+            return []
+        key = self._try_load_key(backup_path, raw)
+        if key is not None and key != self._key:
+            return [key]
+        return []
 
     @staticmethod
     def _default_key_dir() -> Path:
@@ -217,10 +245,8 @@ class EncryptionManager:
     @staticmethod
     def _restrict_permissions(key_path: Path) -> None:
         """Enforce restrictive file permissions on the key file."""
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(str(key_path), 0o600)
-        except OSError:
-            pass
 
     def encrypt(self, plaintext: bytes, associated_data: bytes | None = None) -> bytes:
         """Encrypt data using AES-256-GCM.
@@ -235,6 +261,7 @@ class EncryptionManager:
         """Decrypt AES-256-GCM encrypted data.
 
         Expects: nonce (12 bytes) + ciphertext + tag.
+        Tries the current master key first, then keys retired by rotation.
         """
         if len(data) < _NONCE_SIZE:
             raise EncryptionError("Data too short to contain nonce")
@@ -242,8 +269,30 @@ class EncryptionManager:
         nonce = data[:_NONCE_SIZE]
         ciphertext = data[_NONCE_SIZE:]
 
+        last_error: Exception | None = None
+        for key in (self._key, *self._retired_keys):
+            try:
+                return AESGCM(key).decrypt(nonce, ciphertext, associated_data)
+            except Exception as e:
+                last_error = e
+        raise EncryptionError(f"Decryption failed or data tampered: {last_error}")
+
+    @staticmethod
+    def encrypt_with(key: bytes, plaintext: bytes, associated_data: bytes | None = None) -> bytes:
+        """Encrypt with an explicit key (used during key rotation)."""
+        nonce = secrets.token_bytes(_NONCE_SIZE)
+        ciphertext = AESGCM(key).encrypt(nonce, plaintext, associated_data)
+        return nonce + ciphertext
+
+    @staticmethod
+    def decrypt_with(key: bytes, data: bytes, associated_data: bytes | None = None) -> bytes:
+        """Decrypt with an explicit key (used during key rotation)."""
+        if len(data) < _NONCE_SIZE:
+            raise EncryptionError("Data too short to contain nonce")
+        nonce = data[:_NONCE_SIZE]
+        ciphertext = data[_NONCE_SIZE:]
         try:
-            return self._cipher.decrypt(nonce, ciphertext, associated_data)
+            return AESGCM(key).decrypt(nonce, ciphertext, associated_data)
         except Exception as e:
             raise EncryptionError(f"Decryption failed or data tampered: {e}") from e
 
@@ -265,17 +314,59 @@ class EncryptionManager:
         plaintext = self.decrypt(encrypted, associated_data)
         return json.loads(plaintext)
 
-    def rotate_key(self) -> bytes:
-        """Generate a new key. Returns the old key for data re-encryption."""
-        old_key = self._key
-        new_key = secrets.token_bytes(_KEY_SIZE)
+    def prepare_rotation(self) -> bytes:
+        """Generate a new master key WITHOUT switching anything.
+
+        Data must be re-encrypted with the returned key first (see
+        EventLedger.rotate_encryption); only then should commit_rotation()
+        be called. Nothing on disk changes here, so a failed rotation
+        leaves the system fully intact.
+        """
+        return secrets.token_bytes(_KEY_SIZE)
+
+    def commit_rotation(self, new_key: bytes) -> None:
+        """Atomically swap the master key file and in-memory key.
+
+        The previous key file is preserved as `master.key.old` and the old
+        key is retired in memory so any data that escaped re-encryption
+        still decrypts. If the new key file cannot be written, the old
+        file is restored and the in-memory key is left untouched.
+        """
+        if len(new_key) != _KEY_SIZE:
+            raise EncryptionError("Refusing to commit an invalid key (wrong size)")
+
+        key_path = self._key_path()
         encoded_key = base64.b64encode(new_key)
         protected_bytes = _win32_dpapi_protect(encoded_key)
 
-        key_path = self._key_path()
-        key_path.write_bytes(protected_bytes)
+        # 1. Back up the current key file
+        backup_path = self._key_dir / "master.key.old"
+        if key_path.exists():
+            try:
+                key_path.replace(backup_path)
+            except OSError as e:
+                raise EncryptionError(f"Failed to back up current key file: {e}") from e
 
+        # 2. Write the new key file; restore the backup on failure
+        try:
+            key_path.write_bytes(protected_bytes)
+        except OSError as e:
+            if backup_path.exists() and not key_path.exists():
+                backup_path.replace(key_path)
+            raise EncryptionError(f"Failed to write new key file: {e}") from e
+        self._restrict_permissions(key_path)
+
+        # 3. Swap in-memory state; retire the old key
+        self._retired_keys.append(self._key)
         self._key = new_key
         self._cipher = AESGCM(self._key)
-        logger.info("Master encryption key rotated")
-        return old_key
+        logger.info("Master encryption key rotated (previous key retired)")
+
+    def rotate_key(self) -> bytes:
+        """DEPRECATED: rotation must re-encrypt data before swapping keys.
+
+        Use prepare_rotation() + EventLedger.rotate_encryption() +
+        commit_rotation(). This method returns the NEW key so callers can
+        drive the full sequence themselves.
+        """
+        return self.prepare_rotation()

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from pathlib import Path
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.models.events import (
     EventBase,
@@ -22,7 +22,12 @@ from agenttrace.models.events import (
 from agenttrace.security.encryption import EncryptionManager
 from agenttrace.security.redaction import SecretRedactor
 
+if TYPE_CHECKING:
+    from uuid import UUID
+
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+logger = logging.getLogger(__name__)
 
 
 class LedgerError(Exception):
@@ -47,10 +52,13 @@ class EventLedger:
         self._encryption = encryption_mgr or EncryptionManager()
         self._redactor = redactor or SecretRedactor()
 
-        self._conn = sqlite3.connect(str(self._db_path))
+        # Single-writer by design (only the daemon writes); threaded ASGI
+        # servers (and TestClient) may touch it from different threads.
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -69,6 +77,234 @@ class EventLedger:
             self._conn.execute(
                 "ALTER TABLE events ADD COLUMN canonical_json_hash TEXT NOT NULL DEFAULT ''"
             )
+        if "index_binding_hash" not in cols:
+            self._conn.execute(
+                "ALTER TABLE events ADD COLUMN index_binding_hash TEXT NOT NULL DEFAULT ''"
+            )
+
+        approval_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(approvals)")
+        }
+        if "status" not in approval_cols:
+            self._conn.execute(
+                "ALTER TABLE approvals ADD COLUMN status TEXT NOT NULL DEFAULT 'granted'"
+            )
+            # Backfill: pre-status rows were either granted or denied
+            self._conn.execute(
+                "UPDATE approvals SET status = CASE WHEN approved = 1 "
+                "THEN 'granted' ELSE 'denied' END "
+                "WHERE status = 'granted' AND approved = 0"
+            )
+        # Enforce a single canonical chain per session. A pre-existing database
+        # may already contain duplicate (session_id, seq) rows from the old
+        # race-prone append path — do not fail the upgrade; the verification
+        # pass will surface them.
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_seq_unique "
+                "ON events(session_id, seq)"
+            )
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "events(session_id, seq) not unique in existing database; "
+                "skipping unique index creation"
+            )
+        self._backfill_index_bindings()
+
+    def _backfill_index_bindings(self) -> None:
+        """Compute binding hashes for rows written before the column existed."""
+        rows = self._conn.execute(
+            "SELECT event_id, session_id, event_type, timestamp, actor_id, "
+            "source_adapter, confidence, seq, prev_hash, event_hash "
+            "FROM events WHERE index_binding_hash = ''"
+        ).fetchall()
+        for r in rows:
+            binding = self._compute_index_binding_hash(
+                event_id=r["event_id"],
+                session_id=r["session_id"],
+                event_type=r["event_type"],
+                timestamp=r["timestamp"],
+                actor_id=r["actor_id"],
+                source_adapter=r["source_adapter"],
+                confidence=r["confidence"],
+                seq=r["seq"],
+                prev_hash=r["prev_hash"],
+                event_hash=r["event_hash"],
+            )
+            self._conn.execute(
+                "UPDATE events SET index_binding_hash = ? WHERE event_id = ?",
+                (binding, r["event_id"]),
+            )
+
+    @staticmethod
+    def _compute_index_binding_hash(
+        *,
+        event_id: str,
+        session_id: str,
+        event_type: str,
+        timestamp: str,
+        actor_id: str,
+        source_adapter: str,
+        confidence: str,
+        seq: int,
+        prev_hash: str,
+        event_hash: str,
+    ) -> str:
+        """SHA-256 over the indexed projection of a stored event row.
+
+        The indexed columns are the query surface of the ledger (WHERE/ORDER
+        BY on event_type, actor_id, timestamp, seq). They are stored plaintext,
+        so write access to the DB could rewrite them without touching the
+        encrypted envelope. The binding hash authenticates the projection to
+        the chain so verification detects any drift.
+        """
+        projection = {
+            "event_id": event_id,
+            "session_id": session_id,
+            "event_type": event_type,
+            "timestamp": timestamp,
+            "actor_id": actor_id,
+            "source_adapter": source_adapter,
+            "confidence": confidence,
+            "seq": seq,
+            "prev_hash": prev_hash,
+            "event_hash": event_hash,
+        }
+        canonical = json.dumps(
+            projection,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _verify_row_integrity(self, row: Any) -> str:
+        """Verify every authenticated property of one stored event row.
+
+        Returns "" when the row is fully verified, otherwise a descriptive
+        error message naming the tampered property.
+        """
+        stored_seq = row["seq"]
+        stored_event_id = row["event_id"]
+
+        # 1. Index binding — authenticates the plaintext indexed projection
+        if row["index_binding_hash"]:
+            recomputed_binding = self._compute_index_binding_hash(
+                event_id=row["event_id"],
+                session_id=row["session_id"],
+                event_type=row["event_type"],
+                timestamp=row["timestamp"],
+                actor_id=row["actor_id"],
+                source_adapter=row["source_adapter"],
+                confidence=row["confidence"],
+                seq=row["seq"],
+                prev_hash=row["prev_hash"],
+                event_hash=row["event_hash"],
+            )
+            if recomputed_binding != row["index_binding_hash"]:
+                return (
+                    f"Index binding tamper detected at seq={stored_seq} "
+                    f"(event {stored_event_id}): "
+                    f"stored_binding={row['index_binding_hash']}, "
+                    f"recomputed_binding={recomputed_binding}"
+                )
+
+        # 2. Envelope decryption + tamper hash
+        try:
+            canonical_json = self._read_canonical_json(row)
+        except Exception as e:
+            return (
+                f"Envelope decryption failed at seq={stored_seq} "
+                f"(event {stored_event_id}): {e}"
+            )
+
+        if row["canonical_json_hash"]:
+            recomputed_canonical_hash = hashlib.sha256(
+                canonical_json.encode("utf-8")
+            ).hexdigest()
+            if recomputed_canonical_hash != row["canonical_json_hash"]:
+                return (
+                    f"Envelope tamper detected at seq={stored_seq} "
+                    f"(event {stored_event_id}): "
+                    f"stored_canonical_hash={row['canonical_json_hash']}, "
+                    f"recomputed_canonical_hash={recomputed_canonical_hash}"
+                )
+
+        # 3. Event hash recomputation over the canonical envelope
+        try:
+            event_data = json.loads(canonical_json)
+            event_data["event_hash"] = row["event_hash"]
+            evt = event_from_dict(event_data)
+            recomputed_hash = evt.compute_hash()
+        except Exception as e:
+            return (
+                f"Failed to recompute hash at seq={stored_seq} "
+                f"(event {stored_event_id}): {e}"
+            )
+
+        if recomputed_hash != row["event_hash"]:
+            return (
+                f"Cryptographic tamper detected at seq={stored_seq} "
+                f"(event {stored_event_id}): "
+                f"stored_hash={row['event_hash']}, "
+                f"recomputed_hash={recomputed_hash}"
+            )
+
+        # 4. Indexed columns must agree with the authenticated envelope
+        envelope_fields = evt.model_dump(mode="json")
+        drift_checks = [
+            ("event_id", envelope_fields["event_id"], row["event_id"]),
+            ("session_id", envelope_fields["session_id"], row["session_id"]),
+            ("event_type", envelope_fields["event_type"], row["event_type"]),
+            ("actor_id", envelope_fields["actor_id"], row["actor_id"]),
+            ("source_adapter", envelope_fields["source_adapter"], row["source_adapter"]),
+            ("confidence", envelope_fields["confidence"], row["confidence"]),
+            ("seq", envelope_fields["seq"], row["seq"]),
+            ("prev_hash", envelope_fields["prev_hash"], row["prev_hash"]),
+        ]
+        for field, envelope_value, column_value in drift_checks:
+            if envelope_value != column_value:
+                return (
+                    f"Indexed column drift detected at seq={stored_seq} "
+                    f"(event {stored_event_id}): envelope {field}={envelope_value!r}, "
+                    f"column {field}={column_value!r}"
+                )
+
+        # Timestamps may serialize as "Z" (pydantic JSON) or "+00:00"
+        # (datetime.isoformat) — normalize before comparing.
+        envelope_ts = envelope_fields["timestamp"]
+        column_ts = row["timestamp"]
+        envelope_ts = envelope_ts[:-1] + "+00:00" if envelope_ts.endswith("Z") else envelope_ts
+        column_ts = column_ts[:-1] + "+00:00" if column_ts.endswith("Z") else column_ts
+        if envelope_ts != column_ts:
+            return (
+                f"Indexed column drift detected at seq={stored_seq} "
+                f"(event {stored_event_id}): envelope timestamp={envelope_ts!r}, "
+                f"column timestamp={column_ts!r}"
+            )
+
+        # 5. Payload cross-check — payload_enc must decrypt to the envelope payload
+        envelope_payload = envelope_fields.get("payload") or {}
+        if row["payload_enc"]:
+            try:
+                stored_payload = self._encryption.decrypt_json(row["payload_enc"])
+            except Exception as e:
+                return (
+                    f"Payload decryption failed at seq={stored_seq} "
+                    f"(event {stored_event_id}): {e}"
+                )
+            if stored_payload != envelope_payload:
+                return (
+                    f"Payload drift detected at seq={stored_seq} "
+                    f"(event {stored_event_id}): payload_enc does not match envelope payload"
+                )
+        elif envelope_payload and row["canonical_json_enc"]:
+            return (
+                f"Payload drift detected at seq={stored_seq} "
+                f"(event {stored_event_id}): envelope carries payload but payload_enc is empty"
+            )
+
+        return ""
 
     def close(self) -> None:
         """Close the database connection."""
@@ -107,7 +343,9 @@ class EventLedger:
         )
         self._conn.commit()
 
-    def update_session_status(self, session_id: UUID, status: str, stopped_at: str | None = None) -> None:
+    def update_session_status(
+        self, session_id: UUID, status: str, stopped_at: str | None = None
+    ) -> None:
         """Update session status."""
         if stopped_at:
             self._conn.execute(
@@ -193,74 +431,110 @@ class EventLedger:
 
         Redacts sensitive data, seals with previous hash & sequence,
         encrypts payload, and stores the full canonical JSON.
+
+        The append runs inside an IMMEDIATE write transaction so concurrent
+        appends cannot observe the same tail and duplicate a sequence number.
         """
         # Redact any sensitive content in the event dictionary
         raw_dict = event.model_dump(mode="json")
         redacted_dict = self._redactor.redact_any(raw_dict)
         clean_event = event_from_dict(redacted_dict)
 
-        prev_hash = self.get_last_hash(clean_event.session_id)
-        seq = self.get_next_seq(clean_event.session_id)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
 
-        clean_event.seal(prev_hash=prev_hash, seq=seq)
-        event.prev_hash = clean_event.prev_hash
-        event.event_hash = clean_event.event_hash
-        event.seq = clean_event.seq
+            prev_hash = self.get_last_hash(clean_event.session_id)
+            seq = self.get_next_seq(clean_event.session_id)
 
-        # Encrypt the payload
-        payload_enc: bytes | None = None
-        if clean_event.payload:
-            payload_enc = self._encryption.encrypt_json(clean_event.payload)
+            clean_event.seal(prev_hash=prev_hash, seq=seq)
+            event.prev_hash = clean_event.prev_hash
+            event.event_hash = clean_event.event_hash
+            event.seq = clean_event.seq
 
-        # The canonical envelope is the full event content (commands, prompts,
-        # tool args, diffs). It is AES-256-GCM encrypted at rest; its SHA-256 is
-        # stored separately so tamper verification never needs the plaintext.
-        canonical_json = json.dumps(
-            clean_event.canonical_dict(),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        canonical_json_enc = self._encryption.encrypt_str(canonical_json)
-        canonical_json_hash = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+            # Encrypt the payload
+            payload_enc: bytes | None = None
+            if clean_event.payload:
+                payload_enc = self._encryption.encrypt_json(clean_event.payload)
 
-        self._conn.execute(
-            """INSERT INTO events
-               (event_id, session_id, event_type, timestamp, actor_id,
-                source_adapter, confidence, canonical_json, canonical_json_enc,
-                canonical_json_hash, payload_enc, event_hash, prev_hash, seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(clean_event.event_id),
-                str(clean_event.session_id),
-                clean_event.event_type.value if hasattr(clean_event.event_type, "value") else str(clean_event.event_type),
-                clean_event.timestamp.isoformat(),
-                clean_event.actor_id,
-                clean_event.source_adapter,
-                clean_event.confidence.value if hasattr(clean_event.confidence, "value") else str(clean_event.confidence),
-                "",  # canonical_json (legacy column) intentionally left empty
-                canonical_json_enc,
-                canonical_json_hash,
-                payload_enc,
-                clean_event.event_hash,
-                clean_event.prev_hash,
-                seq,
-            ),
-        )
+            # The canonical envelope is the full event content (commands, prompts,
+            # tool args, diffs). It is AES-256-GCM encrypted at rest; its SHA-256 is
+            # stored separately so tamper verification never needs the plaintext.
+            canonical_json = json.dumps(
+                clean_event.canonical_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            canonical_json_enc = self._encryption.encrypt_str(canonical_json)
+            canonical_json_hash = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
-        # Update session counters
-        self._conn.execute(
-            """UPDATE sessions
-               SET event_count = event_count + 1,
-                   last_event_hash = ?
-               WHERE session_id = ?""",
-            (clean_event.event_hash, str(clean_event.session_id)),
-        )
-        self._conn.commit()
+            index_binding_hash = self._compute_index_binding_hash(
+                event_id=str(clean_event.event_id),
+                session_id=str(clean_event.session_id),
+                event_type=clean_event.event_type.value
+                if hasattr(clean_event.event_type, "value")
+                else str(clean_event.event_type),
+                timestamp=clean_event.timestamp.isoformat(),
+                actor_id=clean_event.actor_id,
+                source_adapter=clean_event.source_adapter,
+                confidence=clean_event.confidence.value
+                if hasattr(clean_event.confidence, "value")
+                else str(clean_event.confidence),
+                seq=seq,
+                prev_hash=clean_event.prev_hash,
+                event_hash=clean_event.event_hash,
+            )
+
+            self._conn.execute(
+                """INSERT INTO events
+                   (event_id, session_id, event_type, timestamp, actor_id,
+                    source_adapter, confidence, canonical_json, canonical_json_enc,
+                    canonical_json_hash, payload_enc, event_hash, prev_hash, seq,
+                    index_binding_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(clean_event.event_id),
+                    str(clean_event.session_id),
+                    clean_event.event_type.value
+                    if hasattr(clean_event.event_type, "value")
+                    else str(clean_event.event_type),
+                    clean_event.timestamp.isoformat(),
+                    clean_event.actor_id,
+                    clean_event.source_adapter,
+                    clean_event.confidence.value
+                    if hasattr(clean_event.confidence, "value")
+                    else str(clean_event.confidence),
+                    "",  # canonical_json (legacy column) intentionally left empty
+                    canonical_json_enc,
+                    canonical_json_hash,
+                    payload_enc,
+                    clean_event.event_hash,
+                    clean_event.prev_hash,
+                    seq,
+                    index_binding_hash,
+                ),
+            )
+
+            # Update session counters
+            self._conn.execute(
+                """UPDATE sessions
+                   SET event_count = event_count + 1,
+                       last_event_hash = ?
+                   WHERE session_id = ?""",
+                (clean_event.event_hash, str(clean_event.session_id)),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return clean_event.event_hash
 
     def get_event(self, event_id: UUID) -> EventBase | None:
-        """Retrieve a single event by ID, deserializing to its concrete Event class."""
+        """Retrieve a single event by ID, deserializing to its concrete Event class.
+
+        Raises LedgerError if the stored row fails integrity verification —
+        tampered rows are surfaced, never silently returned.
+        """
         row = self._conn.execute(
             "SELECT * FROM events WHERE event_id = ?",
             (str(event_id),),
@@ -268,16 +542,19 @@ class EventLedger:
         if not row:
             return None
 
+        integrity_error = self._verify_row_integrity(row)
+        if integrity_error:
+            raise LedgerError(
+                f"Event {event_id} failed integrity verification: {integrity_error}"
+            )
+
         event_data = json.loads(self._read_canonical_json(row))
         event_data["event_hash"] = row["event_hash"]
         event = event_from_dict(event_data)
 
-        # Decrypt payload if stored separately
+        # Decrypt payload if stored separately (integrity already verified)
         if row["payload_enc"]:
-            try:
-                event.payload = self._encryption.decrypt_json(row["payload_enc"])
-            except Exception:
-                pass
+            event.payload = self._encryption.decrypt_json(row["payload_enc"])
 
         return event
 
@@ -288,9 +565,14 @@ class EventLedger:
         actor_id: str | None = None,
         after: str | None = None,
         before: str | None = None,
-        limit: int = 1000,
+        limit: int | None = 1000,
     ) -> list[EventBase]:
-        """Query events with optional filters."""
+        """Query events with optional filters.
+
+        Every returned row is verified on read; a tampered row raises
+        LedgerError instead of being silently skipped. Pass limit=None to
+        disable the default cap.
+        """
         conditions = ["session_id = ?"]
         params: list[Any] = [str(session_id)]
 
@@ -307,28 +589,33 @@ class EventLedger:
             conditions.append("timestamp < ?")
             params.append(before)
 
-        params.append(limit)
         where = " AND ".join(conditions)
 
-        rows = self._conn.execute(
-            f"SELECT * FROM events WHERE {where} ORDER BY seq ASC LIMIT ?",
-            params,
-        ).fetchall()
+        if limit is None:
+            rows = self._conn.execute(
+                f"SELECT * FROM events WHERE {where} ORDER BY seq ASC",
+                params,
+            ).fetchall()
+        else:
+            params.append(limit)
+            rows = self._conn.execute(
+                f"SELECT * FROM events WHERE {where} ORDER BY seq ASC LIMIT ?",
+                params,
+            ).fetchall()
 
         events: list[EventBase] = []
         for r in rows:
-            try:
-                event_data = json.loads(self._read_canonical_json(r))
-                event_data["event_hash"] = r["event_hash"]
-                evt = event_from_dict(event_data)
-                if r["payload_enc"]:
-                    try:
-                        evt.payload = self._encryption.decrypt_json(r["payload_enc"])
-                    except Exception:
-                        pass
-                events.append(evt)
-            except Exception:
-                continue
+            integrity_error = self._verify_row_integrity(r)
+            if integrity_error:
+                raise LedgerError(
+                    f"Event {r['event_id']} failed integrity verification: {integrity_error}"
+                )
+            event_data = json.loads(self._read_canonical_json(r))
+            event_data["event_hash"] = r["event_hash"]
+            evt = event_from_dict(event_data)
+            if r["payload_enc"]:
+                evt.payload = self._encryption.decrypt_json(r["payload_enc"])
+            events.append(evt)
 
         return events
 
@@ -369,7 +656,6 @@ class EventLedger:
             stored_hash = row["event_hash"]
             stored_prev_hash = row["prev_hash"]
             stored_seq = row["seq"]
-            stored_canonical_hash = row["canonical_json_hash"]
 
             # 1. Verify sequence monotonicity
             if stored_seq != expected_seq:
@@ -385,35 +671,11 @@ class EventLedger:
                     f"expected prev_hash={expected_prev_hash!r}, got {stored_prev_hash!r}"
                 )
 
-            # 3. Full hash recomputation over canonical data
-            try:
-                canonical_json = self._read_canonical_json(row)
-
-                # 3a. Verify the stored envelope tamper hash (encrypted rows only)
-                if stored_canonical_hash:
-                    recomputed_canonical_hash = hashlib.sha256(
-                        canonical_json.encode("utf-8")
-                    ).hexdigest()
-                    if recomputed_canonical_hash != stored_canonical_hash:
-                        return False, (
-                            f"Envelope tamper detected at seq={stored_seq} (event {row['event_id']}): "
-                            f"stored_canonical_hash={stored_canonical_hash}, "
-                            f"recomputed_canonical_hash={recomputed_canonical_hash}"
-                        )
-
-                # 3b. Recompute the event's own hash over the decrypted envelope
-                event_data = json.loads(canonical_json)
-                event_data["event_hash"] = stored_hash
-                evt = event_from_dict(event_data)
-                recomputed_hash = evt.compute_hash()
-
-                if recomputed_hash != stored_hash:
-                    return False, (
-                        f"Cryptographic tamper detected at seq={stored_seq} (event {row['event_id']}): "
-                        f"stored_hash={stored_hash}, recomputed_hash={recomputed_hash}"
-                    )
-            except Exception as e:
-                return False, f"Failed to recompute hash at seq={stored_seq}: {e}"
+            # 3. Verify binding hash, envelope tamper hash, event hash,
+            #    indexed-column drift, and payload cross-check
+            integrity_error = self._verify_row_integrity(row)
+            if integrity_error:
+                return False, integrity_error
 
             expected_prev_hash = stored_hash
             expected_seq += 1
@@ -604,8 +866,14 @@ class EventLedger:
         affected_commands: list[str] | None = None,
         created_at: str = "",
         event_hash: str = "",
+        status: str = "granted",
     ) -> None:
-        """Store an approval record with encrypted reason, scope, and scope items."""
+        """Store an approval record with encrypted reason, scope, and scope items.
+
+        If a pending (status='requested') record already exists for the same
+        (session_id, finding_id), the decision updates it in place instead of
+        creating a duplicate — a request followed by its verdict is one record.
+        """
         redacted_reason = self._redactor.redact(reason)
         reason_enc = self._encryption.encrypt_str(redacted_reason)
         scope_enc = self._encryption.encrypt_str(scope)
@@ -614,24 +882,50 @@ class EventLedger:
             "commands": affected_commands or [],
         })
 
-        self._conn.execute(
-            """INSERT INTO approvals
-               (approval_id, session_id, finding_id, approved, reason_enc,
-                scope_enc, expiry, affected_enc, created_at, event_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(approval_id),
-                str(session_id),
-                finding_id,
-                1 if approved else 0,
-                reason_enc,
-                scope_enc,
-                expiry,
-                affected_enc,
-                created_at,
-                event_hash,
-            ),
-        )
+        pending = self._conn.execute(
+            "SELECT approval_id FROM approvals "
+            "WHERE session_id = ? AND finding_id = ? AND status = 'requested' "
+            "ORDER BY created_at ASC LIMIT 1",
+            (str(session_id), finding_id),
+        ).fetchone()
+
+        if pending:
+            self._conn.execute(
+                """UPDATE approvals
+                   SET approved = ?, status = ?, reason_enc = ?, scope_enc = ?,
+                       expiry = ?, affected_enc = ?, event_hash = ?
+                   WHERE approval_id = ?""",
+                (
+                    1 if approved else 0,
+                    status,
+                    reason_enc,
+                    scope_enc,
+                    expiry,
+                    affected_enc,
+                    event_hash,
+                    pending["approval_id"],
+                ),
+            )
+        else:
+            self._conn.execute(
+                """INSERT INTO approvals
+                   (approval_id, session_id, finding_id, approved, status,
+                    reason_enc, scope_enc, expiry, affected_enc, created_at, event_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(approval_id),
+                    str(session_id),
+                    finding_id,
+                    1 if approved else 0,
+                    status,
+                    reason_enc,
+                    scope_enc,
+                    expiry,
+                    affected_enc,
+                    created_at,
+                    event_hash,
+                ),
+            )
         self._conn.commit()
 
     def get_approvals(self, session_id: UUID) -> list[dict[str, Any]]:
@@ -772,3 +1066,65 @@ class EventLedger:
             (blob_hash, str(session_id), file_path, size_bytes, created_at),
         )
         self._conn.commit()
+
+    # -- Key rotation --
+
+    # Every encrypted column, grouped by table. Table and column names are
+    # constants — never interpolated from caller input.
+    _ENCRYPTED_COLUMNS: dict[str, tuple[str, ...]] = {
+        "sessions": ("config_enc", "task_desc_enc", "metadata_enc"),
+        "events": ("canonical_json_enc", "payload_enc"),
+        "graph_nodes": ("label_enc", "data_enc"),
+        "graph_edges": ("data_enc",),
+        "approvals": ("reason_enc", "scope_enc", "affected_enc"),
+        "task_contracts": (
+            "goal_enc",
+            "allowed_enc",
+            "prohibited_enc",
+            "tests_enc",
+            "tools_enc",
+            "notes_enc",
+        ),
+    }
+
+    def rotate_encryption(
+        self,
+        new_key: bytes,
+        blob_store: Any = None,
+    ) -> None:
+        """Re-encrypt ALL encrypted data with a new master key.
+
+        Decrypts every encrypted column (and every blob file, if a BlobStore
+        is supplied) with the current key and re-encrypts with `new_key`,
+        inside one write transaction. Nothing on disk changes for the key
+        itself — callers must invoke EncryptionManager.commit_rotation()
+        AFTER this succeeds, so a failure rolls back cleanly.
+
+        Blobs are re-encrypted before the transaction commits; a failure
+        during blob re-encryption aborts the whole rotation.
+        """
+        if blob_store is not None:
+            blob_store.reencrypt_all(new_key)
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            for table, columns in self._ENCRYPTED_COLUMNS.items():
+                for column in columns:
+                    self._reencrypt_column(table, column, new_key)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _reencrypt_column(self, table: str, column: str, new_key: bytes) -> None:
+        """Re-encrypt one column: decrypt with the current key, encrypt with the new one."""
+        rows = self._conn.execute(
+            f"SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            plaintext = self._encryption.decrypt(r[column])
+            new_cipher = self._encryption.encrypt_with(new_key, plaintext)
+            self._conn.execute(
+                f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                (new_cipher, r["rowid"]),
+            )

@@ -234,3 +234,290 @@ class TestEventLedger:
 
         events = ledger.query_events(session_id)
         assert any(isinstance(e, CommandEvent) and e.command == secret_command for e in events)
+
+    def test_tamper_detection_on_index_binding(self, ledger: EventLedger, session_id) -> None:
+        """Adversarial test: rewriting an indexed column without touching the
+        envelope is detected — the binding hash authenticates the projection."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+        event = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="git push",
+        )
+        ledger.append_event(event)
+
+        # Rewrite an indexed column (e.g. re-attribute the action to another
+        # actor). The encrypted envelope still holds the true actor_id, so the
+        # old code's hash-chain verification would pass.
+        conn = sqlite3.connect(str(ledger._db_path))
+        conn.execute(
+            "UPDATE events SET actor_id = 'innocent_user' WHERE event_id = ?",
+            (str(event.event_id),),
+        )
+        conn.commit()
+        conn.close()
+
+        is_valid, error = ledger.verify_chain(session_id)
+        assert not is_valid
+        assert "Index binding tamper detected" in error
+
+    def test_tamper_detection_on_seq_rewrite(self, ledger: EventLedger, session_id) -> None:
+        """Row-order swaps are blocked at two levels: the UNIQUE(session_id,
+        seq) index rejects the direct swap, and the binding hash catches a
+        stepwise swap that keeps monotonicity and prev links superficially
+        valid — which the old chain checks would have passed completely."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+        e1 = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="cmd 1")
+        e2 = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="cmd 2")
+        h1 = ledger.append_event(e1)
+        ledger.append_event(e2)
+
+        conn = sqlite3.connect(str(ledger._db_path))
+
+        # Level 1: the unique index rejects the direct swap outright
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE events SET seq = 0 WHERE event_id = ?",
+                (str(e2.event_id),),
+            )
+        conn.rollback()
+
+        # Level 2: a stepwise swap (temporary seq avoids the unique index)
+        # with patched prev_hash columns still trips the binding hash.
+        conn.execute("UPDATE events SET seq = 2 WHERE event_id = ?", (str(e2.event_id),))
+        conn.execute("UPDATE events SET seq = 1, prev_hash = ? WHERE event_id = ?", (h1, str(e1.event_id)))
+        conn.execute("UPDATE events SET seq = 0, prev_hash = '' WHERE event_id = ?", (str(e2.event_id),))
+        conn.commit()
+        conn.close()
+
+        is_valid, error = ledger.verify_chain(session_id)
+        assert not is_valid
+        assert "Index binding tamper detected" in error
+
+    def test_read_path_rejects_tampered_event(self, ledger: EventLedger, session_id) -> None:
+        """The read path must surface tampering instead of silently returning
+        or skipping a compromised row."""
+        from agenttrace.storage.ledger import LedgerError
+
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+        event = FileMutationEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="filesystem",
+            file_path="app.py",
+            mutation_type="modify",
+        )
+        ledger.append_event(event)
+
+        conn = sqlite3.connect(str(ledger._db_path))
+        conn.execute(
+            "UPDATE events SET canonical_json_hash = ? WHERE event_id = ?",
+            ("0" * 64, str(event.event_id)),
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(LedgerError):
+            ledger.get_event(event.event_id)
+        with pytest.raises(LedgerError):
+            ledger.query_events(session_id)
+
+    def test_payload_drift_detected(self, ledger: EventLedger, session_id) -> None:
+        """A payload_enc that no longer matches the envelope payload is drift."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+        event = ToolRequestEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="codex",
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            payload={"rollout": "r1"},
+        )
+        ledger.append_event(event)
+
+        # Swap payload_enc with an encryption of different content
+        from agenttrace.security.encryption import EncryptionManager
+
+        conn = sqlite3.connect(str(ledger._db_path))
+        swapped = EncryptionManager().encrypt_json({"rollout": "FORGED"})
+        conn.execute(
+            "UPDATE events SET payload_enc = ? WHERE event_id = ?",
+            (swapped, str(event.event_id)),
+        )
+        conn.commit()
+        conn.close()
+
+        is_valid, error = ledger.verify_chain(session_id)
+        assert not is_valid
+        assert "Payload drift detected" in error
+
+    def test_query_events_limit_none(self, ledger: EventLedger, session_id) -> None:
+        """limit=None returns the full session chain, no truncation."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+        for i in range(5):
+            ledger.append_event(CommandEvent(
+                session_id=session_id,
+                actor_id="agent",
+                source_adapter="terminal",
+                command=f"cmd {i}",
+            ))
+
+        assert len(ledger.query_events(session_id, limit=None)) == 5
+        assert len(ledger.query_events(session_id, limit=2)) == 2
+        assert [e.seq for e in ledger.query_events(session_id, limit=None)] == [0, 1, 2, 3, 4]
+
+    def test_unique_seq_per_session_enforced(self, ledger: EventLedger, session_id) -> None:
+        """(session_id, seq) is unique — duplicate chains are impossible."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+        event = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="cmd")
+        ledger.append_event(event)
+
+        conn = sqlite3.connect(str(ledger._db_path))
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO events
+                   (event_id, session_id, event_type, timestamp, actor_id,
+                    source_adapter, confidence, canonical_json, canonical_json_enc,
+                    canonical_json_hash, payload_enc, event_hash, prev_hash, seq,
+                    index_binding_hash)
+                   VALUES (?, ?, 'command', '2024-01-01T00:00:00+00:00', 'x',
+                           'terminal', 'high', '', NULL, '', NULL, 'f' * 64, 'e' * 64,
+                           0, '')""",
+                (str(uuid4()), str(session_id)),
+            )
+        conn.close()
+
+    def test_append_transaction_rolls_back_on_failure(self, ledger: EventLedger, session_id) -> None:
+        """A failing append must not leave a partial row or corrupt the chain."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+        good = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="ok")
+        ledger.append_event(good)
+
+        # A second event with the same event_id collides on the PK
+        duplicate = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="collision",
+        )
+        duplicate.event_id = good.event_id
+        with pytest.raises(sqlite3.IntegrityError):
+            ledger.append_event(duplicate)
+
+        is_valid, error = ledger.verify_chain(session_id)
+        assert is_valid, f"Chain must stay valid after a rolled-back append: {error}"
+        assert ledger.get_session(session_id)["event_count"] == 1
+
+    def test_rotate_encryption_reencrypts_everything(self, tmp_path: Path, session_id) -> None:
+        """Full key rotation: all data readable under the new key, chain intact."""
+        from agenttrace.security.encryption import EncryptionManager
+
+        key_dir = tmp_path / "keys"
+        ledger = EventLedger(tmp_path / "rot.db", encryption_mgr=EncryptionManager(key_dir))
+
+        ledger.create_session(
+            session_id, '{"workspace": "/ws"}', "secret task", "2024-01-01T00:00:00Z"
+        )
+        event = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="git push --force",
+            payload={"extra": "sensitive"},
+        )
+        ledger.append_event(event)
+        ledger.store_approval(
+            approval_id=uuid4(),
+            session_id=session_id,
+            finding_id="f-1",
+            approved=True,
+            reason="approved because secret_token_abc",
+        )
+        ledger.store_graph_node(
+            node_id=uuid4(),
+            session_id=session_id,
+            node_type="file",
+            label="src/main.py",
+            timestamp="2024-01-01T00:00:00Z",
+        )
+        ledger.store_task_contract(
+            contract_id=uuid4(),
+            session_id=session_id,
+            goal="build feature",
+        )
+
+        new_key = ledger._encryption.prepare_rotation()
+        ledger.rotate_encryption(new_key)
+        ledger._encryption.commit_rotation(new_key)
+
+        # Everything still readable and the chain verifies
+        assert ledger.get_session(session_id)["task_desc"] == "secret task"
+        retrieved = ledger.get_event(event.event_id)
+        assert retrieved is not None and retrieved.command == "git push --force"
+        assert retrieved.payload == {"extra": "sensitive"}
+        assert ledger.get_approvals(session_id)[0]["reason"].endswith("secret_token_abc")
+        assert ledger.get_graph_nodes(session_id)[0]["label"] == "src/main.py"
+        assert ledger.get_task_contract(session_id)["goal"] == "build feature"
+        is_valid, error = ledger.verify_chain(session_id)
+        assert is_valid, f"Chain must verify after rotation: {error}"
+
+    def test_rotate_encryption_failure_rolls_back(self, tmp_path: Path, session_id) -> None:
+        """A rotation that fails mid-way must leave every row under the OLD key."""
+        from agenttrace.security.encryption import EncryptionError, EncryptionManager
+
+        ledger = EventLedger(
+            tmp_path / "rot_fail.db",
+            encryption_mgr=EncryptionManager(tmp_path / "keys_fail"),
+        )
+        ledger.create_session(session_id, "{}", "task", "2024-01-01T00:00:00Z")
+        event = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="keep me",
+            payload={"k": "v"},
+        )
+        ledger.append_event(event)
+        old_key = ledger._encryption._key
+
+        new_key = ledger._encryption.prepare_rotation()
+        original_decrypt = ledger._encryption.decrypt
+
+        def broken_decrypt(data: bytes, associated_data: bytes | None = None) -> bytes:
+            raise EncryptionError("simulated mid-rotation failure")
+
+        ledger._encryption.decrypt = broken_decrypt  # type: ignore[method-assign]
+        try:
+            with pytest.raises(EncryptionError):
+                ledger.rotate_encryption(new_key)
+        finally:
+            ledger._encryption.decrypt = original_decrypt
+
+        # Nothing was committed: rows still decrypt with the old key
+        assert ledger._encryption._key == old_key
+        retrieved = ledger.get_event(event.event_id)
+        assert retrieved is not None and retrieved.command == "keep me"
+        assert ledger.get_session(session_id)["task_desc"] == "task"
+
+    def test_rotation_survives_fresh_manager_on_same_key_dir(self, tmp_path: Path) -> None:
+        """After rotation, a brand-new manager (fresh load from disk) reads data."""
+        from agenttrace.security.encryption import EncryptionManager
+
+        key_dir = tmp_path / "keys"
+        db_path = tmp_path / "rot.db"
+        mgr1 = EncryptionManager(key_dir)
+        ledger = EventLedger(db_path, encryption_mgr=mgr1)
+        sid = uuid4()
+        ledger.create_session(sid, "{}", "rotate me", "2024-01-01T00:00:00Z")
+        evt = CommandEvent(session_id=sid, actor_id="a", source_adapter="t", command="cmd")
+        ledger.append_event(evt)
+
+        new_key = mgr1.prepare_rotation()
+        ledger.rotate_encryption(new_key)
+        mgr1.commit_rotation(new_key)
+
+        mgr2 = EncryptionManager(key_dir)  # loads the NEW key file
+        ledger2 = EventLedger(db_path, encryption_mgr=mgr2)
+        assert ledger2.get_session(sid)["task_desc"] == "rotate me"
+        assert ledger2.get_event(evt.event_id).command == "cmd"  # type: ignore[union-attr]

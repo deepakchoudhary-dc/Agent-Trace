@@ -49,18 +49,34 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("env_secret", re.compile(r"(?:SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL)[_A-Z]*\s*=\s*['\"]?([A-Za-z0-9\-_.+/=]{16,200})['\"]?", re.IGNORECASE)),
 ]
 
-# Sensitive key substrings in JSON / dictionaries
-_SENSITIVE_KEY_SUBSTRINGS = (
+# Sensitive dictionary keys, matched component-exactly after normalization
+# (lowercase + strip non-alphanumeric). "author" and "tokens" never match;
+# "clientSecret" and "api_key" both normalize to set members.
+_SENSITIVE_KEY_NAMES = frozenset({
     "password",
-    "secret",
-    "apikey",
-    "api_key",
-    "token",
-    "credential",
-    "auth",
-    "private_key",
     "passwd",
-)
+    "pwd",
+    "secret",
+    "token",
+    "sensitivetoken",
+    "apikey",
+    "apisecret",
+    "credential",
+    "privatekey",
+    "clientsecret",
+    "accesskey",
+    "accesssecret",
+    "auth",
+    "authorization",
+    "authentication",
+    "bearer",
+    "passphrase",
+    "oauth",
+    "oauthtoken",
+    "accesstoken",
+    "refreshtoken",
+    "sessiontoken",
+})
 
 
 @dataclass
@@ -91,26 +107,56 @@ class SecretRedactor:
         return list(self._redaction_log)
 
     def redact(self, text: str) -> str:
-        """Redact all detected secrets from text."""
+        """Redact all detected secrets from text.
+
+        Every match is collected against the ORIGINAL text and applied
+        end-to-start, so the audit log always references original positions
+        and no match is skewed by earlier replacements.
+        """
         if not text or not isinstance(text, str):
             return text
 
-        result = text
-        for pattern_name, pattern in _SECRET_PATTERNS:
-            for match in pattern.finditer(result):
-                start = max(0, match.start() - 10)
-                end = min(len(result), match.end() + 10)
-                context = result[start:match.start()] + _REDACTED + result[match.end():end]
+        spans: list[tuple[int, int, str]] = []
 
-                record = RedactionRecord(
+        # 1. Known secret formats
+        for pattern_name, pattern in _SECRET_PATTERNS:
+            for match in pattern.finditer(text):
+                spans.append((match.start(), match.end(), pattern_name))
+
+        # 2. High-entropy credential tokens (entropy test on the write path)
+        for token_match in re.finditer(r"\S+", text):
+            if self._is_high_entropy_credential(token_match.group(0)):
+                spans.append(
+                    (token_match.start(), token_match.end(), "high_entropy_credential")
+                )
+
+        # Merge overlapping spans, keeping the wider one
+        merged: list[tuple[int, int, str]] = []
+        for start, end, name in sorted(spans, key=lambda s: (s[0], -(s[1] - s[0]))):
+            if merged and start < merged[-1][1]:
+                if end > merged[-1][1]:
+                    merged[-1] = (merged[-1][0], end, merged[-1][2])
+                continue
+            merged.append((start, end, name))
+
+        result = text
+        for start, end, pattern_name in reversed(merged):
+            if start >= end:
+                continue
+            context = (
+                text[max(0, start - 10):start]
+                + _REDACTED
+                + text[end:min(len(text), end + 10)]
+            )
+            self._redaction_log.append(
+                RedactionRecord(
                     pattern_name=pattern_name,
-                    position=match.start(),
-                    length=match.end() - match.start(),
+                    position=start,
+                    length=end - start,
                     context_preview=context[:100],
                 )
-                self._redaction_log.append(record)
-
-            result = pattern.sub(_REDACTED, result)
+            )
+            result = result[:start] + _REDACTED + result[end:]
 
         return result
 
@@ -122,14 +168,16 @@ class SecretRedactor:
             redacted_dict: dict[str, Any] = {}
             for k, v in value.items():
                 k_str = str(k)
-                # If key name itself indicates sensitive credential, redact value directly
-                if any(sub in k_str.lower() for sub in _SENSITIVE_KEY_SUBSTRINGS) and isinstance(v, str) and len(v) >= 4:
+                # A sensitive key name makes the whole value a credential —
+                # redact regardless of its type (strings, numbers, nested
+                # structures all carry the secret).
+                if self._is_sensitive_key(k_str) and self._has_content(v):
                     redacted_dict[k] = _REDACTED
                     self._redaction_log.append(
                         RedactionRecord(
                             pattern_name=f"sensitive_key:{k_str}",
                             position=0,
-                            length=len(v),
+                            length=len(str(v)),
                             context_preview=f"{k_str}={_REDACTED}",
                         )
                     )
@@ -157,14 +205,58 @@ class SecretRedactor:
             if pattern.search(text):
                 return True
 
-        # Also check for high-entropy strings
-        words = text.split()
-        for word in words:
-            clean_word = word.strip("\"'()[]{}:;,")
-            if len(clean_word) >= 20 and self._shannon_entropy(clean_word) > self._entropy_threshold:
+        for token_match in re.finditer(r"\S+", text):
+            if self._is_high_entropy_credential(token_match.group(0)):
                 return True
 
         return False
+
+    @staticmethod
+    def _normalize_key(key: str) -> str:
+        """Normalize a dictionary key for sensitive-name matching.
+
+        Lowercases and strips non-alphanumeric characters so snake_case,
+        camelCase, and spaced forms of the same credential name all match.
+        """
+        return re.sub(r"[^a-z0-9]", "", key.lower())
+
+    @classmethod
+    def _is_sensitive_key(cls, key: str) -> bool:
+        """Component-exact sensitive key test.
+
+        Substring matching misclassified benign keys ("author", "tokens",
+        "tokenizers"). Normalizing then testing exact membership keeps the
+        precision without losing snake_case/camelCase coverage.
+        """
+        return cls._normalize_key(key) in _SENSITIVE_KEY_NAMES
+
+    @staticmethod
+    def _has_content(value: Any) -> bool:
+        """Whether a value could carry a secret (empty values cannot)."""
+        if value is None:
+            return False
+        if isinstance(value, (str, list, tuple, set, dict)):
+            return len(value) > 0
+        return True
+
+    def _is_high_entropy_credential(self, token: str) -> bool:
+        """Full-value-domain entropy test for standalone credential tokens.
+
+        A token must be long (>=16), high-entropy (>4.5 bits/char), and contain
+        at least one digit or symbol — or be mixed-case and very long (>=24).
+        Plain prose, hex hashes, and short identifiers never trip it.
+        """
+        clean = token.strip("\"'()[]{}:;,")
+        if len(clean) < 16:
+            return False
+        if self._shannon_entropy(clean) <= self._entropy_threshold:
+            return False
+        has_digit = any(c.isdigit() for c in clean)
+        has_symbol = any(not c.isalnum() for c in clean)
+        has_mixed_case = any(c.islower() for c in clean) and any(c.isupper() for c in clean)
+        if has_digit or has_symbol:
+            return True
+        return has_mixed_case and len(clean) >= 24
 
     @staticmethod
     def _shannon_entropy(text: str) -> float:

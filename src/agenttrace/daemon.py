@@ -11,13 +11,12 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from agenttrace.adapters.claude import ClaudeAdapter
 from agenttrace.adapters.codex import CodexAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
-from agenttrace.adapters.sdk import AdapterBase
 from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.context_graph import ContextGraph
@@ -45,7 +44,6 @@ from agenttrace.models.session import (
     SessionStatus,
 )
 from agenttrace.models.task_contract import RiskLevel, ScopeDriftResult, TaskContract
-from agenttrace.observers.base import BaseObserver
 from agenttrace.observers.filesystem import FilesystemObserver
 from agenttrace.observers.git_monitor import GitMonitor
 from agenttrace.observers.network import NetworkObserver
@@ -58,10 +56,28 @@ from agenttrace.security.redaction import SecretRedactor
 from agenttrace.storage.blob_store import BlobStore
 from agenttrace.storage.ledger import EventLedger
 
+if TYPE_CHECKING:
+    from agenttrace.adapters.sdk import AdapterBase
+    from agenttrace.observers.base import BaseObserver
+
 logger = logging.getLogger(__name__)
 
 
 _DEFAULT_DATA_DIR = Path.home() / ".agenttrace"
+
+# Shell-capable tool names whose tool requests may legitimately explain a
+# CommandEvent (used for explicit command↔tool-request correlation).
+_SHELL_TOOL_NAMES = frozenset({
+    "bash",
+    "shell",
+    "shell_command",
+    "local_shell_call",
+    "terminal",
+    "cmd",
+    "powershell",
+    "windows_terminal",
+    "run_shell_command",
+})
 
 
 class DaemonError(Exception):
@@ -365,7 +381,12 @@ class AgentTraceDaemon:
         self._adapter_tasks[session.session_id] = poll_task
 
         self._sessions[session.session_id] = session
-        logger.info("Session %s active for %s (adapter=%s)", session.session_id, config.workspace_path, adapter.adapter_name)
+        logger.info(
+            "Session %s active for %s (adapter=%s)",
+            session.session_id,
+            config.workspace_path,
+            adapter.adapter_name,
+        )
         return session
 
     async def _adapter_poll_loop(self, session_id: UUID, adapter: AdapterBase) -> None:
@@ -544,7 +565,9 @@ class AgentTraceDaemon:
         if not node_type:
             return
 
-        label = self._make_node_label(event)
+        # Redact at projection: the in-memory graph and every API response
+        # derived from it must never contain unredacted event content.
+        label = self._redactor.redact(self._make_node_label(event))
         node = GraphNode(
             node_type=node_type,
             label=label,
@@ -553,7 +576,7 @@ class AgentTraceDaemon:
             source_adapter=event.source_adapter,
             confidence=event.confidence,
             session_id=event.session_id,
-            data=event.canonical_dict(),
+            data=self._redactor.redact_any(event.canonical_dict()),
         )
         graph.add_node(node)
 
@@ -576,7 +599,9 @@ class AgentTraceDaemon:
         # Multi-Hop Causal Edge Inference
         new_edges: list[GraphEdge] = []
 
-        def link_edge(source_id: UUID, edge_type: EdgeType, confidence: ConfidenceLevel = ConfidenceLevel.HIGH) -> GraphEdge:
+        def link_edge(
+            source_id: UUID, edge_type: EdgeType, confidence: ConfidenceLevel = ConfidenceLevel.HIGH
+        ) -> GraphEdge:
             """Helper: edge from a cause node to the just-added node."""
             return GraphEdge(
                 source_node_id=source_id,
@@ -607,14 +632,18 @@ class AgentTraceDaemon:
             if req_node:
                 new_edges.append(link_edge(req_node.node_id, EdgeType.EXECUTES))
 
-        # 4. Commands connect to the most recent agent session and matching tool request
+        # 4. Commands connect to the most recent agent session and the matching
+        #    shell tool request. Correlation is explicit: the tool request must
+        #    be a shell-type tool (never an arbitrary substring scan).
         elif isinstance(event, CommandEvent):
             s_node = self._latest_matching(graph, NodeType.AGENT_SESSION, actor_id=event.actor_id)
             if s_node:
                 new_edges.append(link_edge(s_node.node_id, EdgeType.EXECUTES))
             req_node = self._latest_matching(
                 graph, NodeType.TOOL_REQUEST,
-                predicate=lambda n: event.command in str(n.data),
+                predicate=lambda n: str(n.data.get("tool_name", "")).lower()
+                in _SHELL_TOOL_NAMES
+                and event.command in self._tool_request_command(n.data),
             )
             if req_node:
                 new_edges.append(link_edge(req_node.node_id, EdgeType.EXECUTES))
@@ -623,7 +652,9 @@ class AgentTraceDaemon:
         elif isinstance(event, FileMutationEvent):
             cmd_node = self._latest_matching(graph, NodeType.COMMAND)
             if cmd_node:
-                new_edges.append(link_edge(cmd_node.node_id, EdgeType.MODIFIES, ConfidenceLevel.MEDIUM))
+                new_edges.append(
+                    link_edge(cmd_node.node_id, EdgeType.MODIFIES, ConfidenceLevel.MEDIUM)
+                )
 
             for file_node in graph.get_nodes_by_type(NodeType.SOURCE_FILE):
                 if file_node.data.get("path") == event.file_path:
@@ -648,17 +679,21 @@ class AgentTraceDaemon:
                 if p_node:
                     new_edges.append(link_edge(p_node.node_id, EdgeType.SPAWNS))
 
-        # 7. Policy findings connect to the triggering node
+        # 7. Policy findings link VIOLATES to the node that actually triggered
+        #    them (matching command/path), never to an arbitrary recent node.
         elif isinstance(event, PolicyFindingEvent):
-            for candidate in reversed(list(graph._nodes.values())):
-                if candidate.node_id != node.node_id:
-                    new_edges.append(link_edge(candidate.node_id, EdgeType.VIOLATES))
-                    break
+            trigger = self._policy_trigger_node(graph, event)
+            if trigger:
+                new_edges.append(link_edge(trigger.node_id, EdgeType.VIOLATES))
 
         # 8. Approvals connect to findings (approval node → finding node)
         elif isinstance(event, ApprovalEvent):
             for f_node in graph.get_nodes_by_type(NodeType.POLICY_FINDING):
-                if f_node.data.get("event_id") == event.finding_id or f_node.data.get("finding_type") == event.finding_id:
+                is_target = (
+                    f_node.data.get("event_id") == event.finding_id
+                    or f_node.data.get("finding_type") == event.finding_id
+                )
+                if is_target:
                     new_edges.append(GraphEdge(
                         source_node_id=node.node_id,
                         target_node_id=f_node.node_id,
@@ -726,7 +761,47 @@ class AgentTraceDaemon:
             return f"net: {event.destination_ip}:{event.destination_port}"
         elif isinstance(event, PolicyFindingEvent):
             return f"finding: {event.finding_type} ({event.severity})"
-        return event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type)
+        return (
+            event.event_type.value
+            if hasattr(event.event_type, "value")
+            else str(event.event_type)
+        )
+
+    @staticmethod
+    def _tool_request_command(data: dict[str, Any]) -> str:
+        """Extract the shell command embedded in a tool request's arguments."""
+        args = data.get("tool_args")
+        if isinstance(args, dict):
+            for key in ("command", "cmd", "shell_command"):
+                value = args.get(key)
+                if isinstance(value, str):
+                    return value
+            return str(args)
+        if isinstance(args, str):
+            return args
+        return ""
+
+    def _policy_trigger_node(
+        self, graph: ContextGraph, event: PolicyFindingEvent
+    ) -> GraphNode | None:
+        """Find the node that triggered a policy finding, by exact content match.
+
+        Matches the finding's affected_command against recorded COMMAND nodes
+        and its affected_path against FILESYSTEM_MUTATION nodes; falls back to
+        the most recent NETWORK_REQUEST node for network findings. Returns None
+        when nothing matches, so findings never get arbitrarily attributed.
+        """
+        if event.affected_command:
+            for n in graph.get_nodes_by_type(NodeType.COMMAND):
+                if event.affected_command == str(n.data.get("command", "")):
+                    return n
+        if event.affected_path:
+            for n in graph.get_nodes_by_type(NodeType.FILESYSTEM_MUTATION):
+                if event.affected_path == str(n.data.get("file_path", "")):
+                    return n
+        if "network" in str(event.finding_type).lower():
+            return self._latest_matching(graph, NodeType.NETWORK_REQUEST)
+        return None
 
     # -- Pre-Execution Mediated Policy Gate (P0-6) --
 
@@ -756,19 +831,30 @@ class AgentTraceDaemon:
         policy = self._policies.get(session_id)
 
         # 1. Task-boundary scope checks (file paths, destructive/privilege/network commands)
-        boundary_hits: list[tuple[str, str, str, str]] = []  # (drift_type, description, path, command)
+        boundary_hits: list[tuple[str, str, str, str]] = []
+        # (drift_type, description, path, command)
         if boundary:
             if action_type == "file_mutation":
                 mutation_type = (details or {}).get("mutation_type", "modify")
                 drift = boundary.check_file_mutation(target, mutation_type)
                 if drift:
                     boundary_hits.append(
-                        (drift.drift_type.value, drift.description, drift.affected_path, drift.affected_command)
+                        (
+                            drift.drift_type.value,
+                            drift.description,
+                            drift.affected_path,
+                            drift.affected_command,
+                        )
                     )
             elif action_type == "command":
                 for drift in boundary.check_command(target):
                     boundary_hits.append(
-                        (drift.drift_type.value, drift.description, drift.affected_path, drift.affected_command)
+                        (
+                            drift.drift_type.value,
+                            drift.description,
+                            drift.affected_path,
+                            drift.affected_command,
+                        )
                     )
 
         # 2. Full policy engine over a synthetic event (destructive ops,
@@ -854,7 +940,8 @@ class AgentTraceDaemon:
     # -- Observers & Adapter Selection --
 
     async def _start_observers(self, session: AuditSession) -> list[BaseObserver]:
-        callback = lambda event, payload=None: self.ingest_event(event, payload)
+        def callback(event: EventBase, payload: bytes | None = None) -> Any:
+            return self.ingest_event(event, payload)
         workspace = session.config.workspace_path
 
         net_observer = NetworkObserver(session.session_id, workspace, callback)
@@ -868,7 +955,9 @@ class AgentTraceDaemon:
         )
 
         observers: list[BaseObserver] = [
-            FilesystemObserver(session.session_id, workspace, callback, session.config.ignore_patterns),
+            FilesystemObserver(
+                session.session_id, workspace, callback, session.config.ignore_patterns
+            ),
             proc_observer,
             GitMonitor(session.session_id, workspace, callback),
             TerminalObserver(

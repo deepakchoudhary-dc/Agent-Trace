@@ -9,6 +9,7 @@ belong in the SQLite ledger.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 from agenttrace.security.encryption import EncryptionManager
@@ -139,3 +140,20 @@ class BlobStore:
                 self.delete_blob(content_hash)
                 removed += 1
         return removed
+
+    def reencrypt_all(self, new_key: bytes) -> None:
+        """Re-encrypt every blob with a new master key.
+
+        Part of key rotation: decrypts with the current key and re-encrypts
+        in place (temp file + atomic rename per blob, as in store_blob).
+        No-ops without an EncryptionManager.
+        """
+        if self._encryption is None:
+            return
+        for content_hash in self.list_blobs():
+            blob_path = self._blob_path(content_hash)
+            plaintext = self._encryption.decrypt(blob_path.read_bytes())
+            new_cipher = self._encryption.encrypt_with(new_key, plaintext)
+            tmp_path = blob_path.with_suffix(".tmp")
+            tmp_path.write_bytes(new_cipher)
+            os.replace(tmp_path, blob_path)

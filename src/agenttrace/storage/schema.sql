@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS events (
     payload_enc         BLOB,                      -- AES-256-GCM encrypted payload
     event_hash          TEXT NOT NULL UNIQUE,
     prev_hash           TEXT NOT NULL DEFAULT '',
-    seq                 INTEGER NOT NULL           -- Strict monotonic 0-based sequence
+    seq                 INTEGER NOT NULL,          -- Strict monotonic 0-based sequence
+    index_binding_hash  TEXT NOT NULL DEFAULT ''   -- SHA-256 binding over the indexed projection
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     session_id      TEXT NOT NULL REFERENCES sessions(session_id),
     finding_id      TEXT NOT NULL,
     approved        INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'granted',  -- requested | granted | denied
     reason_enc      BLOB NOT NULL,          -- AES-256-GCM encrypted text
     scope_enc       BLOB NOT NULL,          -- AES-256-GCM encrypted text
     expiry          TEXT,

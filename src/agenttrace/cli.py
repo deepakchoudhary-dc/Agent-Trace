@@ -1,29 +1,33 @@
 """AgentTrace CLI — Click-based command-line interface.
 
+The CLI is a thin client over the local daemon API. All state lives in the
+daemon process (data_dir); commands fail loudly — never silently fall back to
+direct ledger access — when the daemon is not running.
+
 Commands:
   agenttrace start --workspace <path> --task "<request>" [--agent auto|codex|claude|copilot]
+  agenttrace daemon [--port N]                # run daemon in the foreground
+  agenttrace daemon stop                      # stop daemon + all sessions
+  agenttrace stop [session-id]
+  agenttrace status
   agenttrace approve <finding-id> --scope <scoped-policy> [--session-id <id>]
+  agenttrace gate <action-type> <target> [--session-id <id>]
   agenttrace verify <session-id>
   agenttrace report <session-id> [--output <file>]
-  agenttrace status
-  agenttrace stop [session-id]
+  agenttrace incidents <session-id>
+  agenttrace shield check|run|install <session-id> <command...>
 """
 
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import json
 import logging
-import urllib.request
+import os
+import subprocess
 import urllib.error
+import urllib.request
 from pathlib import Path
-import sys
-
-# Ensure src directory is on sys.path for direct invocation
-_SRC_DIR = str(Path(__file__).resolve().parent.parent)
-if _SRC_DIR not in sys.path:
-    sys.path.insert(0, _SRC_DIR)
-
 from typing import Any
 from uuid import UUID
 
@@ -32,38 +36,68 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from agenttrace.daemon import AgentTraceDaemon
-from agenttrace.models.session import AgentType
+from agenttrace.daemon_entry import DEFAULT_PORT, is_running, spawn_daemon, wait_until_running
 
 console = Console()
 logger = logging.getLogger(__name__)
-_DEFAULT_API_URL = "http://127.0.0.1:8000"
 
 
-def _call_api(endpoint: str, method: str = "GET", data: dict[str, Any] | None = None) -> dict[str, Any] | list[Any] | None:
-    """Attempt to query local daemon REST API."""
-    url = f"{_DEFAULT_API_URL}{endpoint}"
+class ApiError(Exception):
+    """Raised when the daemon API rejects or cannot be reached."""
+
+
+def _data_dir() -> Path:
+    return Path(os.environ.get("AGENTTRACE_DATA_DIR") or Path.home() / ".agenttrace")
+
+
+def _api_url() -> str:
+    port = os.environ.get("AGENTTRACE_PORT", str(DEFAULT_PORT))
+    return f"http://127.0.0.1:{port}"
+
+
+def _read_token() -> str:
+    try:
+        return (_data_dir() / "api_token").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _call_api(
+    endpoint: str, method: str = "GET", data: dict[str, Any] | None = None
+) -> dict[str, Any] | list[Any]:
+    """Call the local daemon API; raise ApiError on any failure.
+
+    The daemon is the single writer of the ledger: there is intentionally no
+    direct-storage fallback, so a failed call can never masquerade as success.
+    """
+    url = f"{_api_url()}{endpoint}"
     req = urllib.request.Request(url, method=method)
     req.add_header("Content-Type", "application/json")
+    token = _read_token()
+    if token:
+        req.add_header("X-AgentTrace-Token", token)
     body = json.dumps(data).encode("utf-8") if data else None
 
     try:
-        with urllib.request.urlopen(req, data=body, timeout=2.0) as resp:
+        with urllib.request.urlopen(req, data=body, timeout=5.0) as resp:  # noqa: S310 (loopback only)
             payload = json.loads(resp.read().decode("utf-8"))
-            return payload if isinstance(payload, (dict, list)) else None
     except urllib.error.HTTPError as e:
-        # Daemon reachable but returned an error — do NOT treat as success
-        logger.debug("API %s %s -> HTTP %s", method, endpoint, e.code)
-        return None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return None
-
-
-def _get_daemon() -> AgentTraceDaemon:
-    """Create a daemon instance initialized with persistent storage."""
-    d = AgentTraceDaemon()
-    d._restore_from_storage()
-    return d
+        detail = ""
+        with contextlib.suppress(ValueError, OSError):
+            detail = json.loads(e.read().decode("utf-8")).get("detail", "")
+        if e.code == 401:
+            raise ApiError(
+                "Invalid or missing API token. Restart the daemon to regenerate it."
+            ) from e
+        raise ApiError(f"API returned HTTP {e.code}: {detail}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise ApiError(
+            f"Daemon not reachable at {_api_url()} ({e}). "
+            "Start it with `agenttrace start` or `agenttrace daemon`."
+        ) from e
+    if not isinstance(payload, (dict, list)):
+        raise ApiError("API returned an unexpected payload")
+    return payload
 
 
 @click.group()
@@ -93,52 +127,90 @@ def main() -> None:
     help="Agent type to monitor.",
 )
 def start(workspace: str, task: str, agent: str) -> None:
-    """Start an audit session for a workspace."""
+    """Start an audit session for a workspace (spawns the daemon if needed)."""
     workspace_path = str(Path(workspace).resolve())
+    data_dir = _data_dir()
+    port = int(os.environ.get("AGENTTRACE_PORT", str(DEFAULT_PORT)))
 
+    if not is_running(data_dir):
+        console.print("[yellow]Starting AgentTrace daemon...[/yellow]")
+        spawn_daemon(data_dir, port)
+        if not wait_until_running(data_dir, port):
+            console.print(
+                f"[red]Daemon failed to start. Check the log: {data_dir / 'daemon.log'}[/red]"
+            )
+            return
+        console.print("[green]✓ Daemon started[/green]")
+
+    try:
+        res = _call_api("/sessions", method="POST", data={
+            "workspace_path": workspace_path,
+            "task_description": task,
+            "agent_type": agent,
+        })
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+
+    if not isinstance(res, dict):
+        console.print("[red]Unexpected API response[/red]")
+        return
+
+    session_id = res["session_id"]
     console.print(Panel(
         f"[bold green]Starting AgentTrace Audit Session[/bold green]\n"
         f"Workspace: {workspace_path}\n"
         f"Task: {task or '(general development audit)'}\n"
-        f"Agent: {agent}",
+        f"Agent: {agent}\n\n"
+        f"[green]✓[/green] Session active: [bold cyan]{session_id}[/bold cyan]\n"
+        f"  Status: {res.get('status')}\n"
+        f"  Adapter: {res.get('adapter')}",
         title="🔍 AgentTrace",
         border_style="green",
     ))
 
-    async def _start() -> None:
-        daemon = _get_daemon()
-        await daemon.start()
-        session = await daemon.create_session(
-            workspace_path=workspace_path,
-            task_description=task,
-            agent_type=AgentType(agent),
-        )
+    gaps = res.get("observability_gaps") or []
+    if gaps:
+        console.print("[yellow]⚠ Observability gaps (unobservable agent internals):[/yellow]")
+        for gap in gaps:
+            console.print(f"  • {gap}")
 
-        console.print(f"\n[green]✓[/green] Session active: [bold cyan]{session.session_id}[/bold cyan]")
-        console.print(f"  Status: {session.status}")
-        adapter = daemon._adapters.get(session.session_id)
-        if adapter:
-            console.print(f"  Adapter: {adapter.adapter_name}")
-            if adapter.observability_gaps:
-                console.print("\n[yellow]⚠ Observability gaps (unobservable agent internals):[/yellow]")
-                for gap in adapter.observability_gaps:
-                    console.print(f"  • {gap}")
+    console.print(
+        f"\n[dim]Daemon running detached. Stop the session with "
+        f"`agenttrace stop {session_id}` (all: `agenttrace stop`).[/dim]"
+    )
 
-        console.print("\n[dim]Audit active. Press Ctrl+C to stop session and seal ledger...[/dim]")
 
-        try:
-            while True:
-                await asyncio.sleep(1)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            console.print("\n[yellow]Stopping audit session & sealing cryptographic hash chain...[/yellow]")
-            await daemon.stop_session(session.session_id)
-            await daemon.stop()
-            console.print("[green]✓ Session stopped and cryptographically sealed.[/green]")
+@main.group()
+def daemon() -> None:
+    """Manage the local daemon process."""
 
+
+@daemon.command("run")
+@click.option(
+    "--port", type=int, default=None,
+    help=f"API port (default: {DEFAULT_PORT}, env AGENTTRACE_PORT).",
+)
+@click.option("--data-dir", type=click.Path(file_okay=False), default=None, help="Data directory.")
+def daemon_run(port: int | None, data_dir: str | None) -> None:
+    """Run the daemon in the foreground (Ctrl+C to stop)."""
+    from agenttrace.daemon_entry import run_server
+
+    target_dir = Path(data_dir) if data_dir else _data_dir()
+    run_server(
+        target_dir, port or int(os.environ.get("AGENTTRACE_PORT", str(DEFAULT_PORT)))
+    )
+
+
+@daemon.command("stop")
+def daemon_stop() -> None:
+    """Stop the daemon and all active sessions."""
     try:
-        asyncio.run(_start())
-    except KeyboardInterrupt:
-        pass
+        _call_api("/shutdown", method="POST")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    console.print("[green]✓ Daemon stopped[/green]")
 
 
 @main.command()
@@ -169,14 +241,16 @@ def start(workspace: str, task: str, agent: str) -> None:
 )
 def approve(finding_id: str, scope: str, reason: str, session_id: str | None, expiry: int) -> None:
     """Approve a gated policy finding."""
-    # Try API first
-    daemon = _get_daemon()
-    sessions = daemon.list_sessions()
-    if not sessions:
+    try:
+        sessions = _call_api("/sessions")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(sessions, list) or not sessions:
         console.print("[red]No sessions found in local ledger[/red]")
         return
 
-    target_sid = UUID(session_id) if session_id else sessions[0].session_id
+    target_sid = session_id or str(sessions[0]["session_id"])
 
     # Interpret --scope as a path or command pattern so the enforcement gate
     # can honor the approval for the same path/command later
@@ -187,30 +261,19 @@ def approve(finding_id: str, scope: str, reason: str, session_id: str | None, ex
     elif scope:
         affected_commands.append(scope)
 
-    # Record approval
-    api_res = _call_api(f"/sessions/{target_sid}/approvals", method="POST", data={
-        "finding_id": finding_id,
-        "approved": True,
-        "reason": reason,
-        "scope": scope,
-        "expiry_minutes": expiry,
-        "affected_paths": affected_paths,
-        "affected_commands": affected_commands,
-    })
-
-    if not api_res:
-        # Fallback to direct ledger record
-        approvals = daemon.get_approval_manager(target_sid)
-        if approvals:
-            approvals.record_approval(
-                finding_id=finding_id,
-                approved=True,
-                reason=reason,
-                scope=scope,
-                expiry_minutes=expiry,
-                affected_paths=affected_paths,
-                affected_commands=affected_commands,
-            )
+    try:
+        _call_api(f"/sessions/{target_sid}/approvals", method="POST", data={
+            "finding_id": finding_id,
+            "approved": True,
+            "reason": reason,
+            "scope": scope,
+            "expiry_minutes": expiry,
+            "affected_paths": affected_paths,
+            "affected_commands": affected_commands,
+        })
+    except ApiError as e:
+        console.print(f"[red]Approval NOT recorded: {e}[/red]")
+        return
 
     console.print(Panel(
         f"[green]✓ Approval granted & signed in ledger[/green]\n"
@@ -252,29 +315,33 @@ def gate(action_type: str, target: str, session_id: str | None, details: str | N
             console.print("[red]--details must be valid JSON[/red]")
             return
 
-    daemon = _get_daemon()
-    sessions = daemon.list_sessions()
-    if not sessions:
+    try:
+        sessions = _call_api("/sessions")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(sessions, list) or not sessions:
         console.print("[red]No sessions found in local ledger[/red]")
         return
 
-    target_sid = UUID(session_id) if session_id else sessions[0].session_id
+    target_sid = session_id or str(sessions[0]["session_id"])
 
-    api_res = _call_api(f"/sessions/{target_sid}/evaluate", method="POST", data={
-        "action_type": action_type,
-        "target": target,
-        "details": details_dict,
-    })
+    try:
+        res = _call_api(f"/sessions/{target_sid}/evaluate", method="POST", data={
+            "action_type": action_type,
+            "target": target,
+            "details": details_dict,
+        })
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(res, dict):
+        console.print("[red]Unexpected API response[/red]")
+        return
 
-    if isinstance(api_res, dict):
-        action = api_res["action"]
-        reason = api_res["reason"]
-        req_id = api_res.get("required_approval_id", "")
-    else:
-        _, reason, req_id = daemon.evaluate_proposed_action(
-            target_sid, action_type, target, details_dict
-        )
-        action = "block" if reason.startswith("BLOCKED:") else ("pause" if req_id else "allow")
+    action = res["action"]
+    reason = res["reason"]
+    req_id = res.get("required_approval_id", "")
 
     if action == "block":
         title = "⛔ GATE: BLOCKED"
@@ -316,26 +383,23 @@ def shield() -> None:
 
 def _shield_verdict(sid: UUID, command: str) -> tuple[str, str, str]:
     """Evaluate a command against the gate. Returns (action, reason, approval_id)."""
-    api_res = _call_api(f"/sessions/{sid}/evaluate", method="POST", data={
+    res = _call_api(f"/sessions/{sid}/evaluate", method="POST", data={
         "action_type": "command",
         "target": command,
         "details": {},
     })
-    if isinstance(api_res, dict):
-        return (
-            api_res.get("action", "allow"),
-            api_res.get("reason", ""),
-            api_res.get("required_approval_id", ""),
-        )
-    daemon = _get_daemon()
-    _, reason, req_id = daemon.evaluate_proposed_action(sid, "command", command, {})
-    action = "block" if reason.startswith("BLOCKED:") else ("pause" if req_id else "allow")
-    return action, reason, req_id
+    if not isinstance(res, dict):
+        raise ApiError("Unexpected API response")
+    return (
+        str(res.get("action", "allow")),
+        str(res.get("reason", "")),
+        str(res.get("required_approval_id", "")),
+    )
 
 
 def _record_shield_approval(sid: UUID, command: str, reason: str, req_id: str) -> None:
     """Record a scoped approval for the exact command the gate paused on."""
-    api_res = _call_api(f"/sessions/{sid}/approvals", method="POST", data={
+    _call_api(f"/sessions/{sid}/approvals", method="POST", data={
         "finding_id": req_id or "gate",
         "approved": True,
         "reason": reason,
@@ -344,20 +408,6 @@ def _record_shield_approval(sid: UUID, command: str, reason: str, req_id: str) -
         "affected_paths": [],
         "affected_commands": [command],
     })
-    if api_res:
-        return
-    daemon = _get_daemon()
-    mgr = daemon.get_approval_manager(sid)
-    if mgr:
-        mgr.record_approval(
-            finding_id=req_id or "gate",
-            approved=True,
-            reason=reason,
-            scope="command",
-            expiry_minutes=60,
-            affected_paths=[],
-            affected_commands=[command],
-        )
 
 
 @shield.command("check", context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
@@ -367,14 +417,23 @@ def shield_check(session_id: str, command: tuple[str, ...]) -> None:
     """Evaluate a command against the gate and print the verdict WITHOUT running it."""
     sid = UUID(session_id)
     cmdline = " ".join(command)
-    action, reason, req_id = _shield_verdict(sid, cmdline)
+    try:
+        action, reason, req_id = _shield_verdict(sid, cmdline)
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(3) from e
     style = {"block": "red", "pause": "yellow", "allow": "green"}[action]
     lines = [f"Command: {cmdline}", f"Decision: {reason}"]
     if req_id:
         lines.append(f"Approval ID: {req_id}")
+    verdict_title = {
+        "block": "⛔ SHIELD: BLOCKED",
+        "pause": "🛑 SHIELD: APPROVAL REQUIRED",
+        "allow": "✅ SHIELD: ALLOWED",
+    }[action]
     console.print(Panel(
         "\n".join(lines),
-        title={"block": "⛔ SHIELD: BLOCKED", "pause": "🛑 SHIELD: APPROVAL REQUIRED", "allow": "✅ SHIELD: ALLOWED"}[action],
+        title=verdict_title,
         border_style=style,
     ))
     raise SystemExit(2 if action == "block" else 0)
@@ -390,7 +449,11 @@ def shield_run(session_id: str, command: tuple[str, ...], approve_all: bool) -> 
     sid = UUID(session_id)
     cmdline = " ".join(command)
 
-    action, reason, req_id = _shield_verdict(sid, cmdline)
+    try:
+        action, reason, req_id = _shield_verdict(sid, cmdline)
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(3) from e
 
     if action == "block":
         console.print(f"[bold red]⛔ BLOCKED — not executing:[/bold red] {cmdline}")
@@ -400,14 +463,16 @@ def shield_run(session_id: str, command: tuple[str, ...], approve_all: bool) -> 
     if action == "pause":
         console.print(f"[yellow]🛑 APPROVAL REQUIRED:[/yellow] {cmdline}")
         console.print(f"[yellow]  {reason}[/yellow]")
-        if not approve_all:
-            if not click.confirm("Approve and execute?", default=False):
-                console.print("[red]Denied — not executing.[/red]")
-                raise SystemExit(1)
-        _record_shield_approval(sid, cmdline, "granted via shield run", req_id)
+        if not approve_all and not click.confirm("Approve and execute?", default=False):
+            console.print("[red]Denied — not executing.[/red]")
+            raise SystemExit(1)
+        try:
+            _record_shield_approval(sid, cmdline, "granted via shield run", req_id)
+        except ApiError as e:
+            console.print(f"[red]Approval NOT recorded: {e}[/red]")
+            raise SystemExit(3) from e
         console.print("[green]✓ Approval recorded for this exact command.[/green]")
 
-    import subprocess
     proc = subprocess.call(list(command))
     raise SystemExit(proc)
 
@@ -427,12 +492,15 @@ def shield_install(session_id: str, workspace: str | None) -> None:
     if workspace:
         workspace_path = str(Path(workspace).resolve())
     else:
-        daemon = _get_daemon()
-        session = daemon.get_session(sid)
-        if not session:
+        try:
+            session = _call_api(f"/sessions/{sid}")
+        except ApiError as e:
+            console.print(f"[red]{e}[/red]")
+            return
+        if not isinstance(session, dict):
             console.print("[red]Session not found. Pass --workspace explicitly.[/red]")
             return
-        workspace_path = session.config.workspace_path
+        workspace_path = session["workspace_path"]
 
     bin_dir = Path(workspace_path) / ".agenttrace" / "shield" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -474,18 +542,12 @@ def shield_install(session_id: str, workspace: str | None) -> None:
 def incidents(session_id: str) -> None:
     """List correlated multi-stage incidents for a session."""
     sid = UUID(session_id)
-
-    api_res = _call_api(f"/sessions/{sid}/incidents")
-    if isinstance(api_res, list):
-        incs = api_res
-    else:
-        daemon = _get_daemon()
-        incs = [
-            e.model_dump(mode="json")
-            for e in daemon.get_incidents(sid)
-        ]
-
-    if not incs:
+    try:
+        incs = _call_api(f"/sessions/{sid}/incidents")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(incs, list) or not incs:
         console.print("[dim]No incidents correlated for this session.[/dim]")
         return
 
@@ -508,18 +570,21 @@ def incidents(session_id: str) -> None:
 def verify(session_id: str) -> None:
     """Verify cryptographic hash chain integrity for a session."""
     sid = UUID(session_id)
-    daemon = _get_daemon()
+    try:
+        res = _call_api(f"/sessions/{sid}/verify")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(res, dict):
+        console.print("[red]Unexpected API response[/red]")
+        return
 
-    is_valid, error = daemon._ledger.verify_chain(sid)
-    last_hash = daemon._ledger.get_last_hash(sid)
-    events = daemon._ledger.query_events(sid)
-
-    if is_valid:
+    if res["verified"]:
         console.print(Panel(
             f"[bold green]✓ CRYPTOGRAPHIC HASH CHAIN VERIFIED[/bold green]\n\n"
             f"Session ID:       {sid}\n"
-            f"Total Events:     {len(events)}\n"
-            f"Head Event Hash:  {last_hash}\n"
+            f"Total Events:     {res['event_count']}\n"
+            f"Head Event Hash:  {res['last_event_hash']}\n"
             f"Tamper Status:    UNBROKEN & UNMODIFIED",
             title="🛡 Forensic Integrity Verification",
             border_style="green",
@@ -528,7 +593,7 @@ def verify(session_id: str) -> None:
         console.print(Panel(
             f"[bold red]❌ TAMPER DETECTED IN EVENT CHAIN[/bold red]\n\n"
             f"Session ID:       {sid}\n"
-            f"Error Detail:     {error}",
+            f"Error Detail:     {res.get('error', '')}",
             title="🛡 Forensic Integrity Alert",
             border_style="red",
         ))
@@ -545,23 +610,14 @@ def verify(session_id: str) -> None:
 def report(session_id: str, output: str | None) -> None:
     """Generate a verified, cryptographically signed forensic audit report."""
     sid = UUID(session_id)
-    daemon = _get_daemon()
-
-    # Query API or generate locally
-    rep = _call_api(f"/sessions/{sid}/report")
-    if not rep:
-        is_valid, error = daemon._ledger.verify_chain(sid)
-        events = daemon._ledger.query_events(sid)
-        findings = daemon.get_findings(sid)
-        last_hash = daemon._ledger.get_last_hash(sid)
-        rep = {
-            "session_id": str(sid),
-            "integrity_status": "TAMPER_VERIFIED" if is_valid else "TAMPER_DETECTED",
-            "integrity_error": error,
-            "head_event_hash": last_hash,
-            "event_count": len(events),
-            "findings_count": len(findings),
-        }
+    try:
+        rep = _call_api(f"/sessions/{sid}/report")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(rep, dict):
+        console.print("[red]Unexpected API response[/red]")
+        return
 
     report_json = json.dumps(rep, indent=2)
     if output:
@@ -574,10 +630,12 @@ def report(session_id: str, output: str | None) -> None:
 @main.command()
 def status() -> None:
     """List sessions and audit ledger health."""
-    daemon = _get_daemon()
-    sessions = daemon.list_sessions()
-
-    if not sessions:
+    try:
+        sessions = _call_api("/sessions")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(sessions, list) or not sessions:
         console.print("[dim]No audit sessions in local ledger.[/dim]")
         return
 
@@ -589,13 +647,18 @@ def status() -> None:
     table.add_column("Integrity", style="bold")
 
     for s in sessions:
-        is_valid, _ = daemon._ledger.verify_chain(s.session_id)
-        integrity_label = "[green]VERIFIED[/green]" if is_valid else "[red]TAMPERED[/red]"
+        sid = s["session_id"]
+        try:
+            v = _call_api(f"/sessions/{sid}/verify")
+            verified = bool(v["verified"]) if isinstance(v, dict) else False
+        except ApiError:
+            verified = False
+        integrity_label = "[green]VERIFIED[/green]" if verified else "[red]TAMPERED[/red]"
         table.add_row(
-            str(s.session_id)[:8] + "...",
-            s.config.workspace_path,
-            s.status.value if hasattr(s.status, "value") else str(s.status),
-            str(s.event_count),
+            sid[:8] + "...",
+            s.get("workspace_path", ""),
+            s.get("status", "?"),
+            str(s.get("event_count", 0)),
             integrity_label,
         )
 
@@ -605,21 +668,26 @@ def status() -> None:
 @main.command(name="stop")
 @click.argument("session_id", required=False)
 def stop_cmd(session_id: str | None) -> None:
-    """Stop an active session."""
-    daemon = _get_daemon()
-
-    async def _stop() -> None:
+    """Stop an active session (all sessions when no ID is given)."""
+    try:
         if session_id:
             sid = UUID(session_id)
-            await daemon.stop_session(sid)
+            _call_api(f"/sessions/{sid}/stop", method="POST")
             console.print(f"[green]✓ Session {session_id[:8]}... stopped[/green]")
         else:
-            for s in daemon.list_sessions():
-                await daemon.stop_session(s.session_id)
-            console.print("[green]✓ All active sessions stopped[/green]")
-        await daemon.stop()
-
-    asyncio.run(_stop())
+            sessions = _call_api("/sessions")
+            if not isinstance(sessions, list):
+                console.print("[red]Unexpected API response[/red]")
+                return
+            active = [s for s in sessions if s.get("status") not in ("stopped", "completed")]
+            for s in active:
+                _call_api(f"/sessions/{s['session_id']}/stop", method="POST")
+            if not active:
+                console.print("[dim]No active sessions.[/dim]")
+            else:
+                console.print("[green]✓ All active sessions stopped[/green]")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
 
 
 if __name__ == "__main__":

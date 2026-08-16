@@ -77,3 +77,91 @@ class TestApprovalManager:
         assert restored == 1
         assert fresh.check_approval(finding_id="good-1") is True
         assert fresh.check_approval(finding_id="denied-1") is False
+
+    def test_path_scope_is_segment_exact(self, tmp_path: Path) -> None:
+        _, mgr, _ = _make_manager(tmp_path)
+        mgr.record_approval("finding-1", True, "ok", affected_paths=["/workspace/.env"])
+        # Same file and a descendant at a separator boundary match...
+        assert mgr.check_approval(path="/workspace/.env") is True
+        assert mgr.check_approval(path="/workspace/src") is False
+        # ...but lookalike names sharing the prefix must NOT match
+        assert mgr.check_approval(path="/workspace/.env.bak") is False
+        assert mgr.check_approval(path="/workspace/.env-2") is False
+        assert mgr.check_approval(path="/workspace/env") is False
+
+    def test_path_scope_covers_descendants_only(self, tmp_path: Path) -> None:
+        _, mgr, _ = _make_manager(tmp_path)
+        mgr.record_approval("finding-1", True, "ok", affected_paths=["/workspace/src"])
+        assert mgr.check_approval(path="/workspace/src/main.py") is True
+        assert mgr.check_approval(path="/workspace/src2/main.py") is False
+
+    def test_path_scope_windows_separators(self, tmp_path: Path) -> None:
+        _, mgr, _ = _make_manager(tmp_path)
+        mgr.record_approval("finding-1", True, "ok", affected_paths=["C:\\work\\src"])
+        assert mgr.check_approval(path="C:/work/src/main.py") is True
+        assert mgr.check_approval(path="C:/work/src2/main.py") is False
+
+    def test_command_scope_is_token_prefix(self, tmp_path: Path) -> None:
+        _, mgr, _ = _make_manager(tmp_path)
+        mgr.record_approval("finding-1", True, "ok", affected_commands=["git commit"])
+        assert mgr.check_approval(command="git commit -m 'fix'") is True
+        assert mgr.check_approval(command="git commit") is True
+        # The approved command is a true prefix of tokens — not of characters
+        assert mgr.check_approval(command="git commit-evil") is False
+        assert mgr.check_approval(command="git commit; rm -rf .") is False
+        assert mgr.check_approval(command="git push") is False
+
+    def test_typed_scope_strings(self, tmp_path: Path) -> None:
+        _, mgr, _ = _make_manager(tmp_path)
+        mgr.record_approval(
+            "finding-1", True, "ok", scope="path:/data/x, command:npm run build"
+        )
+        assert mgr.check_approval(path="/data/x/config.json") is True
+        assert mgr.check_approval(command="npm run build --prod") is True
+        assert mgr.check_approval(path="/data/y/config.json") is False
+        assert mgr.check_approval(command="npm install") is False
+
+    def test_request_then_verdict_is_one_record(self, tmp_path: Path) -> None:
+        """A request persisted, then resolved by record_approval, must not
+        leave duplicate records — the verdict updates the pending row."""
+        ledger, mgr, sid = _make_manager(tmp_path)
+
+        mgr.request_approval(
+            "finding-1",
+            "agent wants to touch .env",
+            affected_paths=["/workspace/.env"],
+        )
+        records = ledger.get_approvals(sid)
+        assert len(records) == 1
+        assert records[0]["status"] == "requested"
+        assert records[0]["approved"] == 0
+        # A request alone must never gate as approved
+        assert mgr.check_approval(path="/workspace/.env") is False
+
+        mgr.record_approval(
+            "finding-1", True, "fine", affected_paths=["/workspace/.env"]
+        )
+        records = ledger.get_approvals(sid)
+        assert len(records) == 1
+        assert records[0]["status"] == "granted"
+        assert records[0]["approved"] == 1
+        assert mgr.check_approval(path="/workspace/.env") is True
+
+    def test_request_denied_does_not_gate(self, tmp_path: Path) -> None:
+        ledger, mgr, sid = _make_manager(tmp_path)
+        mgr.request_approval("finding-1", "needs approval")
+        mgr.record_approval("finding-1", False, "no")
+        records = ledger.get_approvals(sid)
+        assert len(records) == 1
+        assert records[0]["status"] == "denied"
+        assert mgr.check_approval(finding_id="finding-1") is False
+
+    def test_request_restored_after_restart(self, tmp_path: Path) -> None:
+        """Pending requests survive restart and stay non-granting."""
+        ledger, mgr, _ = _make_manager(tmp_path)
+        mgr.request_approval("finding-1", "pending thing")
+
+        fresh = ApprovalManager(mgr.session_id, ledger)
+        restored = fresh.reload_from_storage()
+        assert restored == 0  # requests are not grants
+        assert fresh.check_approval(finding_id="finding-1") is False
