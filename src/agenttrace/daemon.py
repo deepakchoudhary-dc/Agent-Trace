@@ -50,6 +50,7 @@ from agenttrace.observers.network import NetworkObserver
 from agenttrace.observers.process_tree import ProcessTreeObserver
 from agenttrace.observers.terminal import TerminalObserver
 from agenttrace.security.approval import ApprovalManager
+from agenttrace.security.detectors import DetectionEngine, DetectorFinding
 from agenttrace.security.encryption import EncryptionManager
 from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.redaction import SecretRedactor
@@ -120,6 +121,7 @@ class AgentTraceDaemon:
         self._boundaries: dict[UUID, TaskBoundaryEngine] = {}
         self._network_observers: dict[UUID, NetworkObserver] = {}
         self._incidents: dict[UUID, IncidentCorrelationEngine] = {}
+        self._detectors: dict[UUID, DetectionEngine] = {}
         # Most-recent node index per (session, node_type, actor) for causal
         # correlation: links events to the *latest* cause, not the first match
         self._latest: dict[tuple[UUID, NodeType, str], UUID] = {}
@@ -200,6 +202,13 @@ class AgentTraceDaemon:
                         sid,
                         internet_allowed=config.internet_access_allowed,
                         allowed_destinations=config.allowed_destinations,
+                    )
+
+                    # Threat-detection rule engine
+                    self._detectors[sid] = DetectionEngine(
+                        sid,
+                        workspace_paths=contract.allowed_paths,
+                        internet_allowed=config.internet_access_allowed,
                     )
 
                     # Reconstruct ContextGraph from persisted nodes and edges
@@ -357,6 +366,13 @@ class AgentTraceDaemon:
             session.session_id,
             internet_allowed=config.internet_access_allowed,
             allowed_destinations=config.allowed_destinations,
+        )
+
+        # Threat-detection rule engine
+        self._detectors[session.session_id] = DetectionEngine(
+            session.session_id,
+            workspace_paths=contract.allowed_paths,
+            internet_allowed=config.internet_access_allowed,
         )
 
         # 4. Generate Baseline Graph & Persist Nodes
@@ -570,11 +586,34 @@ class AgentTraceDaemon:
             for incident in incident_engine.observe(event):
                 await self.ingest_event(incident)
 
+        # 5c. Threat-detection rule engine — host-observable attack patterns
+        detector_engine = self._detectors.get(event.session_id)
+        if detector_engine and not isinstance(event, PolicyFindingEvent):
+            for detection in detector_engine.evaluate(event):
+                await self.ingest_event(self._detector_finding(event, detection))
+
         # 6. Update Session In-Memory Status
         session = self._sessions.get(event.session_id)
         if session:
             session.event_count += 1
             session.last_event_hash = event.event_hash
+
+    @staticmethod
+    def _detector_finding(event: EventBase, finding: DetectorFinding) -> PolicyFindingEvent:
+        """Build a PolicyFindingEvent from a detector finding."""
+        return PolicyFindingEvent(
+            session_id=event.session_id,
+            actor_id="detector_engine",
+            source_adapter="detector_engine",
+            confidence=finding.confidence,
+            evidence_refs=finding.evidence_refs,
+            finding_type=finding.detector_id,
+            severity=finding.severity,
+            description=finding.description,
+            affected_path=finding.affected_path,
+            affected_command=finding.affected_command,
+            requires_approval=finding.requires_approval,
+        )
 
     @staticmethod
     def _boundary_finding(

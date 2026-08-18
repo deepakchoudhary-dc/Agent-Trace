@@ -450,3 +450,56 @@ async def test_restart_skips_stopped_sessions(tmp_path: Path) -> None:
         assert daemon2._adapters == {}
     finally:
         await daemon2.stop()
+
+
+@pytest.mark.asyncio
+async def test_detector_engine_emits_findings_through_ingest(tmp_path: Path) -> None:
+    """Threat detectors fire on ingest and persist PolicyFindingEvents."""
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    try:
+        session = await daemon.create_session(
+            workspace_path=str(tmp_path),
+            task_description="Detector wiring test",
+            agent_type=AgentType.GENERIC,
+        )
+        sid = session.session_id
+
+        await daemon.ingest_event(
+            CommandEvent(
+                session_id=sid,
+                actor_id="test",
+                source_adapter="terminal",
+                command="cat .env",
+            )
+        )
+        await daemon.ingest_event(
+            FileMutationEvent(
+                session_id=sid,
+                actor_id="filesystem",
+                source_adapter="filesystem_observer",
+                file_path="/etc/ld.so.preload",
+                mutation_type="create",
+            )
+        )
+        await daemon.ingest_event(
+            CommandEvent(
+                session_id=sid,
+                actor_id="test",
+                source_adapter="terminal",
+                command="npm test",
+            )
+        )
+
+        findings = daemon.get_findings(sid)
+        finding_types = {getattr(f, "finding_type", "") for f in findings}
+        assert "credential_read_heuristic" in finding_types
+        assert "sandbox_escape" in finding_types
+
+        # Findings carry evidence references to the triggering events.
+        cred = next(
+            f for f in findings if getattr(f, "finding_type", "") == "credential_read_heuristic"
+        )
+        assert cred.evidence_refs
+    finally:
+        await daemon.stop()
