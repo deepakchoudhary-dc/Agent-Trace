@@ -8,11 +8,13 @@ labeled edges. Every node and edge carries provenance metadata.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import networkx as nx  # type: ignore[import-untyped]
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 from agenttrace.models.graph import (
     EdgeType,

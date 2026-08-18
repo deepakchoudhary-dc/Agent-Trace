@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
+from typing import TYPE_CHECKING
 
 from agenttrace.models.events import ApprovalEvent, ConfidenceLevel
-from agenttrace.storage.ledger import EventLedger
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from agenttrace.storage.ledger import EventLedger
 
 logger = logging.getLogger(__name__)
 
@@ -177,14 +181,16 @@ class ApprovalManager:
             scoped_paths, scoped_commands = self._approval_scopes(approval)
 
             # Scope match on path
-            if path and scoped_paths:
-                if any(self._path_in_scope(p, path) for p in scoped_paths):
-                    return True
+            if path and scoped_paths and any(self._path_in_scope(p, path) for p in scoped_paths):
+                return True
 
             # Scope match on command
-            if command and scoped_commands:
-                if any(self._command_in_scope(c, command) for c in scoped_commands):
-                    return True
+            if (
+                command
+                and scoped_commands
+                and any(self._command_in_scope(c, command) for c in scoped_commands)
+            ):
+                return True
 
         return False
 

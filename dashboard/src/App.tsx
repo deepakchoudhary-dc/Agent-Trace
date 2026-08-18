@@ -17,6 +17,7 @@ import { DiffPanel } from './components/DiffPanel';
 import { ReviewLoopView } from './components/ReviewLoopView';
 import { ApprovalGateModal } from './components/ApprovalGateModal';
 import { ForensicReportModal } from './components/ForensicReportModal';
+import { ObservabilityGapsBanner } from './components/ObservabilityGapsBanner';
 import { AlertCircle, RefreshCw, X } from 'lucide-react';
 
 const LoadingShell: React.FC = () => (
@@ -264,6 +265,12 @@ export const App: React.FC = () => {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Observability gaps: what the adapter could not see — surfaced as a
+          feature, never hidden or fabricated around. */}
+      {currentSession && !showInitialSkeleton && (
+        <ObservabilityGapsBanner session={currentSession} />
       )}
 
       {/* Main Content Area by Tab */}

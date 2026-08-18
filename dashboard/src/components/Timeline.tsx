@@ -186,7 +186,9 @@ export const Timeline: React.FC<TimelineProps> = ({ events, onSelectEvent }) => 
                     aria-label={`Timeline event: ${evt.event_type}`}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' || e.key === ' ') {
-                        onSelectEvent && onSelectEvent(evt);
+                        if (onSelectEvent) {
+                          onSelectEvent(evt);
+                        }
                       }
                     }}
                     className="card card--clickable"

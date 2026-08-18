@@ -1,7 +1,6 @@
 """Tests for the replay engine's server-side verification command allowlist."""
 
 import sys
-import tempfile
 from pathlib import Path
 
 from agenttrace.graph.replay import ReplayEngine
@@ -111,7 +110,13 @@ class TestConstraintIsolation:
             assert ReplayEngine._is_safe_pattern(pat), f"{pat!r} should be safe"
 
     def test_escape_patterns_rejected(self) -> None:
-        for pat in ["../secret.txt", "a/../../secret.txt", "/etc/passwd", "C:/x/*.py", "..\\secret.txt"]:
+        for pat in [
+            "../secret.txt",
+            "a/../../secret.txt",
+            "/etc/passwd",
+            "C:/x/*.py",
+            "..\\secret.txt",
+        ]:
             assert not ReplayEngine._is_safe_pattern(pat), f"{pat!r} must be rejected"
 
     def test_apply_constraints_rejects_escaping_pattern(self, tmp_path: Path) -> None:

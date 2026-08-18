@@ -2,8 +2,8 @@
 
 from uuid import uuid4
 
-from agenttrace.models.graph import EdgeType, GraphEdge, GraphNode, NodeType
 from agenttrace.graph.context_graph import ContextGraph
+from agenttrace.models.graph import EdgeType, GraphEdge, GraphNode, NodeType
 
 
 class TestContextGraph:
@@ -162,7 +162,7 @@ class TestContextGraph:
         assert graph.node_count == 0
 
     def test_timeline_filtering(self) -> None:
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         graph = ContextGraph(uuid4())
         base_time = datetime(2024, 1, 1, tzinfo=timezone.utc)

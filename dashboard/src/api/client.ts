@@ -47,7 +47,10 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
     if (err instanceof ApiError) {
       throw err;
     }
-    throw new Error(`AgentTrace daemon unreachable at ${API_BASE}. Ensure daemon is running.`);
+    throw new Error(
+      `AgentTrace daemon unreachable at ${API_BASE}. Ensure daemon is running.`,
+      { cause: err }
+    );
   }
 }
 

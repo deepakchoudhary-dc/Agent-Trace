@@ -503,3 +503,179 @@ async def test_detector_engine_emits_findings_through_ingest(tmp_path: Path) -> 
         assert cred.evidence_refs
     finally:
         await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_blob_index_points_to_existing_file(tmp_path: Path) -> None:
+    """The ledger blob index path must match the on-disk sharded layout."""
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    try:
+        session = await daemon.create_session(
+            workspace_path=str(tmp_path),
+            task_description="Blob index test",
+            agent_type=AgentType.GENERIC,
+        )
+        raw = b"terminal capture with secrets\x00\x01"
+        await daemon.ingest_event(
+            CommandEvent(
+                session_id=session.session_id,
+                actor_id="test",
+                source_adapter="terminal",
+                command="echo hello",
+            ),
+            raw_payload=raw,
+        )
+
+        conn = daemon._ledger._conn
+        row = conn.execute("SELECT file_path FROM blobs").fetchone()
+        assert row is not None
+        indexed_path = Path(row[0])
+        assert indexed_path.exists()
+        assert indexed_path.parent.name == indexed_path.name[:2]
+        assert len(indexed_path.name) == 64
+        assert daemon._blob_store.retrieve_blob(indexed_path.name) == raw
+    finally:
+        await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_approved_egress_joins_workspace_baseline(tmp_path: Path) -> None:
+    """An approved egress destination is persisted per-workspace and no
+    longer flagged as new after a daemon restart."""
+    from agenttrace.models.events import ApprovalEvent
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    daemon1 = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon1.start()
+    try:
+        session = await daemon1.create_session(
+            workspace_path=str(workspace),
+            task_description="Egress baseline test",
+            agent_type=AgentType.GENERIC,
+        )
+        sid = session.session_id
+
+        net = NetworkEvent(
+            session_id=sid,
+            actor_id="agent",
+            source_adapter="network_observer",
+            destination_ip="203.0.113.99",
+            destination_port=443,
+            protocol="tcp",
+            direction="outbound",
+        )
+        await daemon1.ingest_event(net)
+
+        egress = next(
+            f for f in daemon1.get_findings(sid)
+            if getattr(f, "finding_type", "") == "network_egress"
+        )
+        assert egress.payload.get("destination") == "203.0.113.99:443"
+
+        # Approve the finding → destination joins the workspace baseline.
+        await daemon1.ingest_event(
+            ApprovalEvent(
+                session_id=sid,
+                actor_id="user",
+                source_adapter="cli",
+                finding_id=str(egress.event_id),
+                approved=True,
+                reason="trusted endpoint",
+                scope="network:203.0.113.99:443",
+            )
+        )
+        assert "203.0.113.99:443" in daemon1._ledger.get_destination_baseline(
+            str(workspace)
+        )
+    finally:
+        await daemon1.stop()
+
+    # Restart: the same destination is now baseline-known, not "new".
+    daemon2 = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon2.start()
+    try:
+        session2 = await daemon2.create_session(
+            workspace_path=str(workspace),
+            task_description="Egress baseline test (restart)",
+            agent_type=AgentType.GENERIC,
+        )
+        await daemon2.ingest_event(
+            NetworkEvent(
+                session_id=session2.session_id,
+                actor_id="agent",
+                source_adapter="network_observer",
+                destination_ip="203.0.113.99",
+                destination_port=443,
+                protocol="tcp",
+                direction="outbound",
+            )
+        )
+        findings = daemon2.get_findings(session2.session_id)
+        assert not any(
+            getattr(f, "finding_type", "") == "network_egress" for f in findings
+        )
+    finally:
+        await daemon2.stop()
+
+
+@pytest.mark.asyncio
+async def test_shared_artifact_edge_links_cross_actor_file_touches(
+    tmp_path: Path,
+) -> None:
+    """A different actor touching the same file yields a SHARED_ARTIFACT edge."""
+    from agenttrace.models.events import FileMutationEvent
+
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    try:
+        session = await daemon.create_session(
+            workspace_path=str(tmp_path),
+            task_description="Shared artifact edge test",
+            agent_type=AgentType.GENERIC,
+        )
+        sid = session.session_id
+
+        await daemon.project_event(
+            FileMutationEvent(
+                session_id=sid,
+                actor_id="agentA",
+                source_adapter="fs_observer",
+                file_path=str(tmp_path / "shared.py"),
+                mutation_type="modify",
+            )
+        )
+        await daemon.project_event(
+            FileMutationEvent(
+                session_id=sid,
+                actor_id="agentB",
+                source_adapter="fs_observer",
+                file_path=str(tmp_path / "shared.py"),
+                mutation_type="modify",
+            )
+        )
+
+        edges = daemon._ledger.get_graph_edges(sid, edge_type="SHARED_ARTIFACT")
+        assert len(edges) == 1
+        assert edges[0]["actor_id"] == "agentB"
+
+        # Same actor again: the reverse direction (B → A) is a legitimate
+        # distinct sharing relationship, and it is the only new one.
+        await daemon.project_event(
+            FileMutationEvent(
+                session_id=sid,
+                actor_id="agentB",
+                source_adapter="fs_observer",
+                file_path=str(tmp_path / "shared.py"),
+                mutation_type="modify",
+            )
+        )
+        edges = daemon._ledger.get_graph_edges(sid, edge_type="SHARED_ARTIFACT")
+        assert len(edges) == 2
+        # Each cross-actor touch links to the most recent other actor's node:
+        # both edges originate from agentA's node, targeting distinct touches.
+        assert len({e["source_node_id"] for e in edges}) == 1
+        assert len({e["target_node_id"] for e in edges}) == 2
+    finally:
+        await daemon.stop()

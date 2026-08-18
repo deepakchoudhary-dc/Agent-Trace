@@ -11,8 +11,10 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from agenttrace.security.encryption import EncryptionManager
+if TYPE_CHECKING:
+    from agenttrace.security.encryption import EncryptionManager
 
 
 class BlobStoreError(Exception):
@@ -52,6 +54,15 @@ class BlobStore:
         shard_dir = self._store_dir / prefix
         shard_dir.mkdir(exist_ok=True)
         return shard_dir / content_hash
+
+    def path_for(self, content_hash: str) -> Path:
+        """Public canonical path for a content hash.
+
+        Callers that index blob locations (e.g. the ledger blob index) must
+        use this method so the indexed path matches the on-disk layout
+        (``<store_dir>/<2-char shard>/<full hash>``).
+        """
+        return self._blob_path(content_hash)
 
     def _encrypt(self, data: bytes) -> bytes:
         """Encrypt blob bytes for at-rest storage (no-op without a manager)."""

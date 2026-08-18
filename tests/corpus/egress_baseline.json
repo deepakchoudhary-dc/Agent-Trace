@@ -1,0 +1,18 @@
+{
+  "name": "Baseline destination is not flagged",
+  "workspace_paths": ["/workspace/app"],
+  "baseline_destinations": ["203.0.113.9:443"],
+  "events": [
+    {
+      "event_type": "network",
+      "actor_id": "agent",
+      "source_adapter": "network_observer",
+      "destination_ip": "203.0.113.9",
+      "destination_port": 443,
+      "protocol": "tcp",
+      "direction": "outbound",
+      "http_method": "GET"
+    }
+  ],
+  "expected_findings": []
+}

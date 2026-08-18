@@ -1,0 +1,21 @@
+{
+  "name": "Git history rewriting",
+  "workspace_paths": ["/workspace/repo"],
+  "events": [
+    {
+      "event_type": "command",
+      "actor_id": "agent",
+      "source_adapter": "shell_observer",
+      "command": "git filter-branch --force --index-filter 'git rm --cached --ignore-unmatch .env'",
+      "working_dir": "/workspace/repo"
+    },
+    {
+      "event_type": "command",
+      "actor_id": "agent",
+      "source_adapter": "shell_observer",
+      "command": "git reflog expire --expire=now --all && git gc --prune=now",
+      "working_dir": "/workspace/repo"
+    }
+  ],
+  "expected_findings": ["git_history_rewriting"]
+}

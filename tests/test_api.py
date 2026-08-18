@@ -123,6 +123,95 @@ async def test_graph_nodes_never_contain_secrets(client, tmp_path):
     assert any(n["node_type"] == "command" for n in body.get("nodes", []))
 
 
+@pytest.mark.asyncio
+async def test_collusion_endpoint_surfaces_shared_artifacts(client, tmp_path):
+    """Cross-session shared artifacts are surfaced with an explicit gap."""
+    from agenttrace.models.events import FileMutationEvent
+
+    c, (test_daemon, tokens) = client
+    sid1 = _create_session(c, tokens, str(tmp_path))
+    sid2 = _create_session(c, tokens, str(tmp_path))
+
+    shared_path = str(tmp_path / "shared.py")
+    for sid, actor in ((sid1, "agentA"), (sid2, "agentB")):
+        session = test_daemon.get_session(UUID(sid))
+        assert session is not None
+        await test_daemon.ingest_event(
+            FileMutationEvent(
+                session_id=session.session_id,
+                actor_id=actor,
+                source_adapter="test",
+                file_path=shared_path,
+                mutation_type="modify",
+            )
+        )
+
+    res = c.get(f"/sessions/{sid1}/collusion", headers=_auth_headers(tokens))
+    assert res.status_code == 200
+    candidates = res.json()
+    shared = [x for x in candidates if x["signal"] == "shared_artifact"]
+    assert len(shared) == 1
+    assert shared[0]["detail"] == shared_path
+    assert shared[0]["confidence"] == "high"
+    assert set(shared[0]["session_ids"]) == {sid1, sid2}
+    assert shared[0]["reasoning_gap"]
+
+    # Other session sees the same candidate
+    res = c.get(f"/sessions/{sid2}/collusion", headers=_auth_headers(tokens))
+    assert res.status_code == 200
+    assert any(x["signal"] == "shared_artifact" for x in res.json())
+
+
+@pytest.mark.asyncio
+async def test_compliance_bundle_is_verifiable_and_anchored(client, tmp_path):
+    """The compliance manifest digests every artifact and self-verifies."""
+    from agenttrace.security.compliance import verify_compliance_bundle
+
+    c, (test_daemon, tokens) = client
+    sid = _create_session(c, tokens, str(tmp_path))
+
+    session = test_daemon.get_session(UUID(sid))
+    assert session is not None
+    await test_daemon.ingest_event(
+        CommandEvent(
+            session_id=session.session_id,
+            actor_id="agentA",
+            source_adapter="test",
+            command="ls",
+            working_dir=str(tmp_path),
+        )
+    )
+
+    res = c.get(f"/sessions/{sid}/compliance", headers=_auth_headers(tokens))
+    assert res.status_code == 200
+    bundle = res.json()
+
+    assert bundle["session_id"] == sid
+    assert bundle["chain"]["verified"] is True
+    assert bundle["chain"]["last_hash"]
+    assert set(bundle["artifacts"]) == {
+        "events", "findings", "incidents", "approvals", "graph", "baseline",
+    }
+    for artifact in bundle["artifacts"].values():
+        assert artifact["sha256"]
+    assert "EU AI Act Art. 12 (logging)" in bundle["standards"]
+    assert verify_compliance_bundle(bundle)
+
+    # Tampering is detectable: alter an artifact digest -> verification fails.
+    tampered = dict(bundle)
+    tampered["artifacts"] = {
+        **bundle["artifacts"],
+        "events": {"count": 0, "sha256": "0" * 64},
+    }
+    assert not verify_compliance_bundle(tampered)
+
+    # A second request is a fresh, consistent bundle (re-digest is stable
+    # for the same chain state).
+    res2 = c.get(f"/sessions/{sid}/compliance", headers=_auth_headers(tokens))
+    assert res2.status_code == 200
+    assert res2.json()["artifacts"]["events"] == bundle["artifacts"]["events"]
+
+
 # -- Review loop endpoints (P0-7) --
 
 GOOD_MODULE = '''\

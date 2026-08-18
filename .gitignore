@@ -93,6 +93,7 @@ blobs/
 !dashboard/package.json
 !dashboard/tsconfig*.json
 !tsconfig*.json
+!tests/corpus/*.json
 
 # OS and IDE configuration files
 .DS_Store

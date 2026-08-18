@@ -139,3 +139,14 @@ CREATE TABLE IF NOT EXISTS adapter_cursors (
     cursor_enc   BLOB NOT NULL,          -- AES-256-GCM encrypted JSON
     updated_at   TEXT NOT NULL
 );
+
+-- Per-workspace egress destination baseline: destinations that have already
+-- been observed and approved for a workspace. New destinations not in this
+-- baseline pause behind the network-egress gate instead of being re-flagged
+-- on every daemon restart.
+CREATE TABLE IF NOT EXISTS destination_baseline (
+    workspace_path TEXT NOT NULL,
+    destination    TEXT NOT NULL,
+    first_seen     TEXT NOT NULL,
+    PRIMARY KEY (workspace_path, destination)
+);

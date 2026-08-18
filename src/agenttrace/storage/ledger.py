@@ -1159,6 +1159,26 @@ class EventLedger:
         )
         self._conn.commit()
 
+    # -- Egress destination baseline --
+
+    def add_destination_baseline(self, workspace_path: str, destination: str) -> None:
+        """Record a destination as established for a workspace."""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO destination_baseline
+               (workspace_path, destination, first_seen)
+               VALUES (?, ?, ?)""",
+            (workspace_path, destination, datetime.now(timezone.utc).isoformat()),
+        )
+        self._conn.commit()
+
+    def get_destination_baseline(self, workspace_path: str) -> set[str]:
+        """All baseline destinations learned for a workspace."""
+        rows = self._conn.execute(
+            "SELECT destination FROM destination_baseline WHERE workspace_path = ?",
+            (workspace_path,),
+        ).fetchall()
+        return {row[0] for row in rows}
+
     # -- Key rotation --
 
     # Every encrypted column, grouped by table. Table and column names are

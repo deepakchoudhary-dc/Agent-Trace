@@ -126,6 +126,28 @@ class TestSecretRedactor:
             assert redactor.redact(text) == text, f"false positive on: {text}"
             assert not redactor.contains_secrets(text), f"false positive on: {text}"
 
+    def test_paths_never_trip_entropy_redaction(self) -> None:
+        """Long, mixed-case, digit-bearing file paths must survive the
+        write path — they are contextual, not standalone credentials.
+        Redacting them silently destroyed path correlation in the graph."""
+        redactor = SecretRedactor()
+        path = (
+            "C:/Users/visitor/AppData/Local/Temp/pytest-of-visitor/"
+            "pytest-132/test_shared_artifact_edge_link0/shared.py"
+        )
+        assert redactor.redact(path) == path
+        assert not redactor.contains_secrets(path)
+
+    def test_secret_inside_path_still_redacted(self) -> None:
+        """Named patterns still catch structured secrets embedded in paths."""
+        redactor = SecretRedactor()
+        # Concatenated so GitHub push protection does not flag test fixtures.
+        fake_stripe = "sk_" + "live_" + "a" * 40
+        path = f"C:/keys/{fake_stripe}/token.ini"
+        result = redactor.redact(path)
+        assert "sk_live" not in result
+        assert "[REDACTED]" in result
+
     def test_sensitive_key_non_string_values_redacted(self) -> None:
         """Sensitive keys must redact the value regardless of its type."""
         redactor = SecretRedactor()

@@ -117,7 +117,7 @@ class TestEventLedger:
 
         h1 = ledger.append_event(e1)
         h2 = ledger.append_event(e2)
-        h3 = ledger.append_event(e3)
+        ledger.append_event(e3)
 
         assert e2.prev_hash == h1
         assert e3.prev_hash == h2
@@ -181,12 +181,24 @@ class TestEventLedger:
         is_valid, error = ledger.verify_chain(session_id)
         assert not is_valid
 
-    def test_tamper_detection_on_sequence_discontinuity(self, ledger: EventLedger, session_id) -> None:
+    def test_tamper_detection_on_sequence_discontinuity(
+        self, ledger: EventLedger, session_id
+    ) -> None:
         """Adversarial test: sequence skip or deletion is detected."""
         ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
 
-        e1 = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="cmd 1")
-        e2 = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="cmd 2")
+        e1 = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="cmd 1",
+        )
+        e2 = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="cmd 2",
+        )
         ledger.append_event(e1)
         ledger.append_event(e2)
 
@@ -227,10 +239,17 @@ class TestEventLedger:
 
         # Read raw SQLite bytes directly without ledger abstraction
         conn = sqlite3.connect(str(ledger._db_path))
-        session_row = conn.execute("SELECT config_enc, task_desc_enc FROM sessions WHERE session_id = ?", (str(session_id),)).fetchone()
-        approval_row = conn.execute("SELECT reason_enc, scope_enc FROM approvals WHERE session_id = ?", (str(session_id),)).fetchone()
+        session_row = conn.execute(
+            "SELECT config_enc, task_desc_enc FROM sessions WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        approval_row = conn.execute(
+            "SELECT reason_enc, scope_enc FROM approvals WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
         event_row = conn.execute(
-            "SELECT canonical_json, canonical_json_enc, canonical_json_hash FROM events WHERE session_id = ?",
+            "SELECT canonical_json, canonical_json_enc, canonical_json_hash "
+            "FROM events WHERE session_id = ?",
             (str(session_id),),
         ).fetchone()
         conn.close()
@@ -247,7 +266,7 @@ class TestEventLedger:
         assert event_row[0] == ""  # legacy plaintext column is intentionally empty
         assert isinstance(event_row[1], bytes)
         assert len(event_row[2]) == 64
-        raw_bytes = open(ledger._db_path, "rb").read()
+        raw_bytes = Path(ledger._db_path).read_bytes()
         wal_path = Path(str(ledger._db_path) + "-wal")
         if wal_path.exists():
             raw_bytes += wal_path.read_bytes()
@@ -294,8 +313,18 @@ class TestEventLedger:
         stepwise swap that keeps monotonicity and prev links superficially
         valid — which the old chain checks would have passed completely."""
         ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
-        e1 = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="cmd 1")
-        e2 = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="cmd 2")
+        e1 = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="cmd 1",
+        )
+        e2 = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="cmd 2",
+        )
         h1 = ledger.append_event(e1)
         ledger.append_event(e2)
 
@@ -312,8 +341,14 @@ class TestEventLedger:
         # Level 2: a stepwise swap (temporary seq avoids the unique index)
         # with patched prev_hash columns still trips the binding hash.
         conn.execute("UPDATE events SET seq = 2 WHERE event_id = ?", (str(e2.event_id),))
-        conn.execute("UPDATE events SET seq = 1, prev_hash = ? WHERE event_id = ?", (h1, str(e1.event_id)))
-        conn.execute("UPDATE events SET seq = 0, prev_hash = '' WHERE event_id = ?", (str(e2.event_id),))
+        conn.execute(
+            "UPDATE events SET seq = 1, prev_hash = ? WHERE event_id = ?",
+            (h1, str(e1.event_id)),
+        )
+        conn.execute(
+            "UPDATE events SET seq = 0, prev_hash = '' WHERE event_id = ?",
+            (str(e2.event_id),),
+        )
         conn.commit()
         conn.close()
 
@@ -393,10 +428,32 @@ class TestEventLedger:
         assert len(ledger.query_events(session_id, limit=2)) == 2
         assert [e.seq for e in ledger.query_events(session_id, limit=None)] == [0, 1, 2, 3, 4]
 
+    def test_query_events_default_limit_truncates_but_none_does_not(
+        self, ledger: EventLedger, session_id
+    ) -> None:
+        """A session longer than the default 1000-event cap must not silently
+        truncate reports — the report path passes limit=None."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+        for i in range(1005):
+            ledger.append_event(CommandEvent(
+                session_id=session_id,
+                actor_id="agent",
+                source_adapter="terminal",
+                command=f"cmd {i}",
+            ))
+
+        assert len(ledger.query_events(session_id)) == 1000
+        assert len(ledger.query_events(session_id, limit=None)) == 1005
+
     def test_unique_seq_per_session_enforced(self, ledger: EventLedger, session_id) -> None:
         """(session_id, seq) is unique — duplicate chains are impossible."""
         ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
-        event = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="cmd")
+        event = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="cmd",
+        )
         ledger.append_event(event)
 
         conn = sqlite3.connect(str(ledger._db_path))
@@ -414,10 +471,17 @@ class TestEventLedger:
             )
         conn.close()
 
-    def test_append_transaction_rolls_back_on_failure(self, ledger: EventLedger, session_id) -> None:
+    def test_append_transaction_rolls_back_on_failure(
+        self, ledger: EventLedger, session_id
+    ) -> None:
         """A failing append must not leave a partial row or corrupt the chain."""
         ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
-        good = CommandEvent(session_id=session_id, actor_id="agent", source_adapter="terminal", command="ok")
+        good = CommandEvent(
+            session_id=session_id,
+            actor_id="agent",
+            source_adapter="terminal",
+            command="ok",
+        )
         ledger.append_event(good)
 
         # A second event with the same event_id collides on the PK
@@ -547,3 +611,18 @@ class TestEventLedger:
         ledger2 = EventLedger(db_path, encryption_mgr=mgr2)
         assert ledger2.get_session(sid)["task_desc"] == "rotate me"
         assert ledger2.get_event(evt.event_id).command == "cmd"  # type: ignore[union-attr]
+
+
+class TestDestinationBaseline:
+    def test_roundtrip_and_idempotency(self, ledger: EventLedger) -> None:
+        ledger.add_destination_baseline("/ws", "142.250.72.14:443")
+        ledger.add_destination_baseline("/ws", "142.250.72.14:443")
+        ledger.add_destination_baseline("/ws", "185.220.101.1:9050")
+        ledger.add_destination_baseline("/other", "10.0.0.1:80")
+
+        assert ledger.get_destination_baseline("/ws") == {
+            "142.250.72.14:443",
+            "185.220.101.1:9050",
+        }
+        assert ledger.get_destination_baseline("/other") == {"10.0.0.1:80"}
+        assert ledger.get_destination_baseline("/nowhere") == set()

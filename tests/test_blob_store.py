@@ -15,6 +15,17 @@ class TestBlobStore:
         blob_hash = store.store_blob(data)
         assert store.retrieve_blob(blob_hash) == data
 
+    def test_path_for_matches_on_disk_layout(self, tmp_path: Path) -> None:
+        """Indexed paths must resolve to the actual file (shard/full-hash)."""
+        store = BlobStore(tmp_path / "blobs", EncryptionManager(tmp_path / "keys"))
+        data = b"indexed blob content"
+        blob_hash = store.store_blob(data)
+        indexed_path = store.path_for(blob_hash)
+        assert indexed_path.exists()
+        assert indexed_path.parent.name == blob_hash[:2]
+        assert indexed_path.name == blob_hash
+        assert store.retrieve_blob(blob_hash) == data
+
     def test_dedup_by_plaintext_hash(self, tmp_path: Path) -> None:
         store = BlobStore(tmp_path / "blobs", EncryptionManager(tmp_path / "keys"))
         h1 = store.store_blob(b"same content")

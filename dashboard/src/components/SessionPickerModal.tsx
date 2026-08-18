@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { SessionInfo } from '../types';
 import { FolderGit2, Search, Check, X } from 'lucide-react';
 
@@ -16,6 +16,39 @@ export const SessionPickerModal: React.FC<SessionPickerModalProps> = ({
   onClose,
 }) => {
   const [search, setSearch] = useState('');
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        closeRef.current();
+        return;
+      }
+      if (e.key === 'Tab' && panelRef.current) {
+        // Focus trap: Tab cycles within the dialog, never escapes to the page.
+        const focusables = panelRef.current.querySelectorAll<HTMLElement>(
+          'button, input, [href], [tabindex]:not([tabindex="-1"])'
+        );
+        if (focusables.length === 0) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement;
+        if (e.shiftKey && (active === first || !panelRef.current.contains(active))) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && active === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    // Initial focus lands in the search field.
+    panelRef.current?.querySelector<HTMLInputElement>('input')?.focus();
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   const filtered = useMemo(
     () =>
@@ -38,6 +71,7 @@ export const SessionPickerModal: React.FC<SessionPickerModalProps> = ({
       aria-labelledby="session-picker-title"
     >
       <div
+        ref={panelRef}
         className="glass-panel"
         onClick={(e) => e.stopPropagation()}
         style={{

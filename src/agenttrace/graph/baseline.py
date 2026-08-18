@@ -11,11 +11,14 @@ import hashlib
 import logging
 import subprocess
 from pathlib import Path
-from uuid import UUID
+from typing import TYPE_CHECKING
 
+from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.models.events import ConfidenceLevel
 from agenttrace.models.graph import EdgeType, GraphEdge, GraphNode, NodeType
-from agenttrace.graph.context_graph import ContextGraph
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 

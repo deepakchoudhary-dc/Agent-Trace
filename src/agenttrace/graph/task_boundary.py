@@ -278,9 +278,8 @@ class TaskBoundaryEngine:
             ))
 
         # Check allowed tools
-        if self.contract.allowed_tools:
-            if base_cmd not in self.contract.allowed_tools:
-                results.append(ScopeDriftResult(
+        if self.contract.allowed_tools and base_cmd not in self.contract.allowed_tools:
+            results.append(ScopeDriftResult(
                     contract_id=self.contract.contract_id,
                     drift_type=DriftType.SEMANTIC_DRIFT,
                     severity="low",

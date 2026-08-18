@@ -16,7 +16,9 @@ from agenttrace.observers.network import NetworkObserver
 
 
 @pytest.mark.asyncio
-async def test_captures_time_wait_as_outbound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_captures_time_wait_as_outbound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     seen = []
@@ -49,7 +51,9 @@ async def test_captures_time_wait_as_outbound(tmp_path: Path, monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_captures_syn_sent_as_outbound_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_captures_syn_sent_as_outbound_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     seen = []
@@ -78,7 +82,9 @@ async def test_captures_syn_sent_as_outbound_attempt(tmp_path: Path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_untracked_pids_not_collected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_untracked_pids_not_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     seen = []
@@ -105,7 +111,9 @@ async def test_untracked_pids_not_collected(tmp_path: Path, monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
-async def test_no_scan_without_tracked_pids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_no_scan_without_tracked_pids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     seen = []

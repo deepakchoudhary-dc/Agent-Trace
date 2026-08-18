@@ -94,7 +94,12 @@ def spawn_daemon(data_dir: Path, port: int) -> None:
     try:
         creationflags = 0
         if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            # Windows-only process flags; mypy's POSIX typeshed does not define
+            # them, so resolve defensively (getattr) instead of direct access.
+            creationflags = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            )
         subprocess.Popen(  # noqa: S603 (explicit, trusted invocation of ourselves)
             [
                 sys.executable,

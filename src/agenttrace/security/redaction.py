@@ -22,21 +22,35 @@ _REDACTED = "[REDACTED]"
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # API keys and tokens
     ("aws_access_key", re.compile(r"(?:AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}")),
-    ("aws_secret_key", re.compile(r"(?:aws_secret_access_key|secret_key)\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?")),
+    ("aws_secret_key", re.compile(
+        r"(?:aws_secret_access_key|secret_key)\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?"
+    )),
     ("github_token", re.compile(r"gh[ps]_[A-Za-z0-9_]{36,255}")),
     ("github_fine_token", re.compile(r"github_pat_[A-Za-z0-9_]{22,255}")),
-    ("generic_api_key", re.compile(r"(?:api[_-]?key|apikey|api_secret)\s*[:=]\s*['\"]?([A-Za-z0-9\-_.]{20,100})['\"]?", re.IGNORECASE)),
+    ("generic_api_key", re.compile(
+        r"(?:api[_-]?key|apikey|api_secret)\s*[:=]\s*['\"]?([A-Za-z0-9\-_.]{20,100})['\"]?",
+        re.IGNORECASE,
+    )),
     ("bearer_token", re.compile(r"Bearer\s+[A-Za-z0-9\-_.~+/]+=*", re.IGNORECASE)),
 
     # Passwords and secrets
-    ("password_assignment", re.compile(r"(?:password|passwd|pwd|pass)\s*[:=]\s*['\"]?([^\s'\"]{4,100})['\"]?", re.IGNORECASE)),
-    ("secret_assignment", re.compile(r"(?:secret|token|credential)\s*[:=]\s*['\"]?([^\s'\"]{8,200})['\"]?", re.IGNORECASE)),
+    ("password_assignment", re.compile(
+        r"(?:password|passwd|pwd|pass)\s*[:=]\s*['\"]?([^\s'\"]{4,100})['\"]?",
+        re.IGNORECASE,
+    )),
+    ("secret_assignment", re.compile(
+        r"(?:secret|token|credential)\s*[:=]\s*['\"]?([^\s'\"]{8,200})['\"]?",
+        re.IGNORECASE,
+    )),
 
     # Private keys
     ("private_key", re.compile(r"-----BEGIN\s+(?:RSA|DSA|EC|OPENSSH|PGP)\s+PRIVATE\s+KEY-----")),
 
     # Connection strings
-    ("connection_string", re.compile(r"(?:mongodb|postgres|mysql|redis|amqp|mssql)://[^\s'\"]{10,500}", re.IGNORECASE)),
+    ("connection_string", re.compile(
+        r"(?:mongodb|postgres|mysql|redis|amqp|mssql)://[^\s'\"]{10,500}",
+        re.IGNORECASE,
+    )),
     ("jdbc_url", re.compile(r"jdbc:[a-z]+://[^\s'\"]{10,500}", re.IGNORECASE)),
 
     # Cloud provider secrets
@@ -46,7 +60,11 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("stripe_key", re.compile(r"(?:sk|pk)_(?:test|live)_[A-Za-z0-9]{20,100}")),
 
     # Generic high-entropy strings in sensitive contexts
-    ("env_secret", re.compile(r"(?:SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL)[_A-Z]*\s*=\s*['\"]?([A-Za-z0-9\-_.+/=]{16,200})['\"]?", re.IGNORECASE)),
+    ("env_secret", re.compile(
+        r"(?:SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL)[_A-Z]*\s*=\s*['\"]?"
+        r"([A-Za-z0-9\-_.+/=]{16,200})['\"]?",
+        re.IGNORECASE,
+    )),
 ]
 
 # Sensitive dictionary keys, matched component-exactly after normalization
@@ -245,9 +263,14 @@ class SecretRedactor:
         A token must be long (>=16), high-entropy (>4.5 bits/char), and contain
         at least one digit or symbol — or be mixed-case and very long (>=24).
         Plain prose, hex hashes, and short identifiers never trip it.
+        Paths never trip it: a token containing a path separator is contextual
+        (a file path, not a standalone credential). Structured secrets inside
+        paths are still caught by the named patterns above.
         """
         clean = token.strip("\"'()[]{}:;,")
         if len(clean) < 16:
+            return False
+        if "/" in clean or "\\" in clean:
             return False
         if self._shannon_entropy(clean) <= self._entropy_threshold:
             return False

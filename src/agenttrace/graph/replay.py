@@ -302,9 +302,7 @@ class ReplayEngine:
         normalized = pattern.replace("\\", "/")
         if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
             return False
-        if ".." in PurePosixPath(normalized).parts:
-            return False
-        return True
+        return ".." not in PurePosixPath(normalized).parts
 
     @staticmethod
     def _is_within_worktree(path: Path, worktree: Path) -> bool:

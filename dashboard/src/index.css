@@ -832,6 +832,19 @@ input[type='range']::-webkit-slider-thumb:hover {
   transition: filter var(--dur-fast) var(--ease-out);
 }
 
+/* Respect OS-level reduced-motion preference: no entry, pulse, spin, or
+   positional animations for vestibular-safe viewing. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 .g-cluster:hover rect.cluster-body {
   filter: drop-shadow(0 0 10px rgba(255, 255, 255, 0.5));
 }

@@ -11,19 +11,22 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.models.events import (
     CommandEvent,
+    ConfidenceLevel,
     EventBase,
     FileMutationEvent,
     GitEvent,
     NetworkEvent,
     PolicyFindingEvent,
-    ConfidenceLevel,
 )
-from agenttrace.models.task_contract import TaskContract
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from agenttrace.models.task_contract import TaskContract
 
 logger = logging.getLogger(__name__)
 
@@ -178,11 +181,12 @@ class PolicyEngine:
         rules: list[PolicyRule] | None = None,
         internet_allowed: bool | None = None,
         allowed_destinations: list[str] | None = None,
+        baseline_destinations: set[str] | None = None,
     ) -> None:
         self.session_id = session_id
         self.contract = contract
         self._rules = {r.rule_id: r for r in (rules or _DEFAULT_RULES)}
-        self._known_destinations: set[str] = set()
+        self._known_destinations: set[str] = set(baseline_destinations or ())
         # Declared network boundary (sealed-eval detection)
         self._internet_allowed = internet_allowed
         self._allowed_destinations = set(allowed_destinations or [])
@@ -203,7 +207,12 @@ class PolicyEngine:
         # Determine overall action (most restrictive wins)
         if result.triggered_rules:
             actions = [r.action for r in result.triggered_rules]
-            for action in [PolicyAction.BLOCK, PolicyAction.PAUSE, PolicyAction.WARN, PolicyAction.LOG]:
+            for action in (
+                PolicyAction.BLOCK,
+                PolicyAction.PAUSE,
+                PolicyAction.WARN,
+                PolicyAction.LOG,
+            ):
                 if action in actions:
                     result.action = action
                     break
@@ -299,7 +308,7 @@ class PolicyEngine:
             if rule and rule.enabled:
                 result.triggered_rules.append(rule)
                 result.findings.append(self._make_finding(
-                    rule, f"Credential exposure in command line arguments", "",
+                    rule, "Credential exposure in command line arguments", "",
                     command=event.command[:80],
                 ))
 
@@ -325,16 +334,19 @@ class PolicyEngine:
                 ))
 
         # Destination allowlist — connections outside the declared set
-        if self._allowed_destinations and is_public_ip(event.destination_ip):
-            if event.destination_ip not in self._allowed_destinations:
-                rule = self._rules.get("destination_allowlist")
-                if rule and rule.enabled:
-                    result.triggered_rules.append(rule)
-                    result.findings.append(self._make_finding(
-                        rule,
-                        f"Destination outside allowlist: {destination}",
-                        "",
-                    ))
+        if (
+            self._allowed_destinations
+            and is_public_ip(event.destination_ip)
+            and event.destination_ip not in self._allowed_destinations
+        ):
+            rule = self._rules.get("destination_allowlist")
+            if rule and rule.enabled:
+                result.triggered_rules.append(rule)
+                result.findings.append(self._make_finding(
+                    rule,
+                    f"Destination outside allowlist: {destination}",
+                    "",
+                ))
 
         # State-changing requests to public/external hosts — irreversible
         # side effects on real systems (the gym-booking incident pattern).
@@ -353,9 +365,13 @@ class PolicyEngine:
             rule = self._rules.get("network_egress")
             if rule and rule.enabled:
                 result.triggered_rules.append(rule)
-                result.findings.append(self._make_finding(
+                finding = self._make_finding(
                     rule, f"New network destination: {destination}", "",
-                ))
+                )
+                # Structured destination so the daemon can persist this
+                # destination into the workspace baseline after approval.
+                finding.payload["destination"] = destination
+                result.findings.append(finding)
             self._known_destinations.add(destination)
 
     def _check_git_policies(
@@ -395,6 +411,10 @@ class PolicyEngine:
     def add_known_destination(self, destination: str) -> None:
         """Register a known network destination to avoid false positives."""
         self._known_destinations.add(destination)
+
+    def add_known_destinations(self, destinations: set[str]) -> None:
+        """Register established destinations (e.g. a persisted baseline)."""
+        self._known_destinations.update(destinations)
 
     def get_rules(self) -> dict[str, PolicyRule]:
         """Get all policy rules."""

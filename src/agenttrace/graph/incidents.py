@@ -29,10 +29,8 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from agenttrace.models.events import (
     ApprovalEvent,
@@ -43,6 +41,10 @@ from agenttrace.models.events import (
     PolicyFindingEvent,
 )
 from agenttrace.security.netutil import is_public_ip
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from uuid import UUID
 
 logger = logging.getLogger(__name__)
 

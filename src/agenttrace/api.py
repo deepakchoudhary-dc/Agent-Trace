@@ -598,11 +598,50 @@ async def get_incidents(session_id: UUID) -> list[dict[str, Any]]:
     return [e.model_dump(mode="json") for e in incidents]
 
 
+@app.get("/sessions/{session_id}/collusion")
+async def get_collusion(session_id: UUID) -> list[dict[str, object]]:
+    """Cross-session coordination signals involving this session.
+
+    Observable half only: shared artifacts, reused egress destinations,
+    reused agent identities. Every candidate carries an explicit reasoning
+    gap — coordination itself is never claimed.
+    """
+    if not daemon.get_session(session_id) and not daemon._ledger.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    from agenttrace.graph.collusion import CollusionCorrelationEngine
+
+    engine = CollusionCorrelationEngine(daemon._ledger)
+    return [c.to_dict() for c in engine.for_session(session_id)]
+
+
+@app.get("/sessions/{session_id}/compliance")
+async def get_compliance_bundle(session_id: UUID) -> dict[str, Any]:
+    """Verifiable compliance evidence manifest (EU AI Act / ISO 42001 / SOC 2)."""
+    session_row = daemon._ledger.get_session(session_id)
+    if not session_row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    from agenttrace.security.compliance import build_compliance_bundle
+
+    try:
+        config = json.loads(session_row.get("config_json") or "{}")
+    except json.JSONDecodeError:
+        config = {}
+    workspace_path = config.get("workspace_path", "")
+    return build_compliance_bundle(
+        daemon._ledger,
+        session_id,
+        workspace_path,
+        get_findings=daemon.get_findings(session_id),
+        get_incidents=daemon.get_incidents(session_id),
+    )
+
+
 @app.get("/sessions/{session_id}/report")
 async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
     """Generate a verified, cryptographically sealed forensic audit report."""
     is_valid, error = daemon._ledger.verify_chain(session_id)
-    events = daemon._ledger.query_events(session_id)
+    # No truncation: the report must cover every sealed event.
+    events = daemon._ledger.query_events(session_id, limit=None)
     findings = daemon.get_findings(session_id)
     approvals = daemon._ledger.get_approvals(session_id)
     incidents = daemon.get_incidents(session_id)

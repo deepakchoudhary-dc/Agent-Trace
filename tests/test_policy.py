@@ -168,3 +168,35 @@ class TestPolicyEngine:
         )
         result = engine.evaluate(event)
         assert not any(r.rule_id == "external_state_change" for r in result.triggered_rules)
+
+    def test_baseline_destinations_do_not_trigger_egress(self) -> None:
+        """Destinations seeded from the workspace baseline are never re-flagged."""
+        session_id = uuid4()
+        engine = PolicyEngine(session_id, baseline_destinations={"8.8.8.8:443"})
+        event = NetworkEvent(
+            actor_id="test",
+            session_id=session_id,
+            source_adapter="test",
+            destination_ip="8.8.8.8",
+            destination_port=443,
+            protocol="tcp",
+        )
+        result = engine.evaluate(event)
+        assert not result.requires_approval
+        assert not any(r.rule_id == "network_egress" for r in result.triggered_rules)
+
+    def test_new_destination_finding_carries_structured_payload(self) -> None:
+        """The egress finding exposes the destination for baseline learning."""
+        engine = self._make_engine()
+        event = NetworkEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="test",
+            destination_ip="203.0.113.7",
+            destination_port=443,
+            protocol="tcp",
+        )
+        result = engine.evaluate(event)
+        egress = [f for f in result.findings if f.finding_type == "network_egress"]
+        assert egress
+        assert egress[0].payload.get("destination") == "203.0.113.7:443"

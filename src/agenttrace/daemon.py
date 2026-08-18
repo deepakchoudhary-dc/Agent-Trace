@@ -211,6 +211,13 @@ class AgentTraceDaemon:
                         internet_allowed=config.internet_access_allowed,
                     )
 
+                    # Egress baseline: destinations established for this
+                    # workspace are not re-flagged as new after restarts.
+                    baseline = self._ledger.get_destination_baseline(
+                        config.workspace_path
+                    )
+                    self._policies[sid].add_known_destinations(baseline)
+
                     # Reconstruct ContextGraph from persisted nodes and edges
                     graph = ContextGraph(sid)
                     nodes_data = self._ledger.get_graph_nodes(sid)
@@ -375,6 +382,11 @@ class AgentTraceDaemon:
             internet_allowed=config.internet_access_allowed,
         )
 
+        # Egress baseline: destinations established for this workspace are
+        # not re-flagged as new after restarts.
+        baseline = self._ledger.get_destination_baseline(config.workspace_path)
+        policy.add_known_destinations(baseline)
+
         # 4. Generate Baseline Graph & Persist Nodes
         baseline_gen = BaselineGenerator(session.session_id, config.workspace_path)
         graph = baseline_gen.generate()
@@ -516,7 +528,7 @@ class AgentTraceDaemon:
             self._ledger.store_blob_index(
                 blob_hash=blob_hash,
                 session_id=event.session_id,
-                file_path=str(self._data_dir / "blobs" / blob_hash[:2] / blob_hash[2:]),
+                file_path=str(self._blob_store.path_for(blob_hash)),
                 size_bytes=len(raw_payload),
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
@@ -592,11 +604,33 @@ class AgentTraceDaemon:
             for detection in detector_engine.evaluate(event):
                 await self.ingest_event(self._detector_finding(event, detection))
 
+        # 5d. Egress baseline learning — an approved egress destination becomes
+        #     an established destination for the workspace so restarts do not
+        #     re-flag it as "new".
+        if isinstance(event, ApprovalEvent) and event.approved:
+            await self._learn_approved_egress(event)
+
         # 6. Update Session In-Memory Status
         session = self._sessions.get(event.session_id)
         if session:
             session.event_count += 1
             session.last_event_hash = event.event_hash
+
+    async def _learn_approved_egress(self, event: ApprovalEvent) -> None:
+        """Persist an approved egress destination into the workspace baseline."""
+        session = self._sessions.get(event.session_id)
+        policy = self._policies.get(event.session_id)
+        if not session or not policy:
+            return
+        workspace_path = session.config.workspace_path
+        for evt in self._ledger.query_events(event.session_id, limit=None):
+            if str(evt.event_id) != event.finding_id:
+                continue
+            destination = evt.payload.get("destination")
+            if destination:
+                policy.add_known_destination(destination)
+                self._ledger.add_destination_baseline(workspace_path, destination)
+            return
 
     @staticmethod
     def _detector_finding(event: EventBase, finding: DetectorFinding) -> PolicyFindingEvent:
@@ -762,6 +796,24 @@ class AgentTraceDaemon:
                         confidence=ConfidenceLevel.HIGH,
                     ))
                     break
+
+            # Multi-actor artifact sharing: a different actor previously touched
+            # this same file. Observable fact, inference-labeled — coordination
+            # is never claimed (visible half only).
+            prev = self._latest_matching(
+                graph, NodeType.FILESYSTEM_MUTATION,
+                predicate=lambda n: n.data.get("file_path") == event.file_path
+                and n.actor_id != event.actor_id,
+            )
+            if prev:
+                new_edges.append(GraphEdge(
+                    source_node_id=prev.node_id,
+                    target_node_id=node.node_id,
+                    edge_type=EdgeType.SHARED_ARTIFACT,
+                    actor_id=event.actor_id,
+                    source_adapter=event.source_adapter,
+                    confidence=ConfidenceLevel.MEDIUM,
+                ))
 
         # 6. Network connections connect to the most recent spawning process
         elif isinstance(event, NetworkEvent):
@@ -1151,11 +1203,13 @@ class AgentTraceDaemon:
         return self._ledger.query_events(session_id)
 
     def get_findings(self, session_id: UUID) -> list[EventBase]:
-        return self._ledger.query_events(session_id, event_type=EventType.POLICY_FINDING)
+        return self._ledger.query_events(
+            session_id, event_type=EventType.POLICY_FINDING, limit=None
+        )
 
     def get_incidents(self, session_id: UUID) -> list[EventBase]:
         """Return all persisted incident records for a session."""
-        return self._ledger.query_events(session_id, event_type=EventType.INCIDENT)
+        return self._ledger.query_events(session_id, event_type=EventType.INCIDENT, limit=None)
 
     def get_contract(self, session_id: UUID) -> TaskContract | None:
         return self._contracts.get(session_id)

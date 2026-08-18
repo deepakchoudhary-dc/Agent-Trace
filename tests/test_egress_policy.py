@@ -15,8 +15,8 @@ from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.models.events import NetworkEvent
 from agenttrace.models.session import AgentType
-from agenttrace.security.policy import PolicyAction, PolicyEngine
 from agenttrace.models.task_contract import TaskContract
+from agenttrace.security.policy import PolicyAction, PolicyEngine
 
 _SESSION = uuid4()
 
@@ -90,7 +90,9 @@ class TestUnexpectedEgressIncident:
         assert any(i.incident_type == "unexpected_egress" for i in incidents)
         # In-allowlist destination → no incident
         engine2 = IncidentCorrelationEngine(uuid4(), allowed_destinations=["10.0.0.5"])
-        assert not any(i.incident_type == "unexpected_egress" for i in engine2.observe(_net(ip="10.0.0.5")))
+        assert not any(
+            i.incident_type == "unexpected_egress" for i in engine2.observe(_net(ip="10.0.0.5"))
+        )
 
 
 @pytest.mark.asyncio
