@@ -142,33 +142,41 @@ class ProcessTreeObserver(BaseObserver):
                 cmdline = info.get("cmdline") or []
                 create_time = info.get("create_time")
 
-                # Skip identities already judged irrelevant (no cwd lookup)
-                if create_time is not None and self._irrelevant.get(pid) == create_time:
-                    continue
+                # Descendants of already-tracked session processes are always
+                # relevant (VULN-04: prevents out-of-workspace CWD escape)
+                ppid = info.get("ppid")
+                is_descendant = bool(ppid is not None and ppid in self._tracked_pids)
 
-                # Cheap pre-filter before the expensive cwd syscall:
-                # name hints, shell/terminal interpreters, or the workspace
-                # path appearing in the command line.
-                cmdline_str = " ".join(cmdline).lower()
-                hints_cmdline = (
-                    workspace_l in cmdline_str or ws_raw_l in cmdline_str
-                )
-                hints_name = (
-                    any(sig in name for sig in _UNIVERSAL_AGENT_SIGNATURES)
-                    or any(prefix in name for prefix in _COMMAND_TOOL_PREFIXES)
-                    or _is_shell(name)
-                )
-                if not hints_cmdline and not hints_name:
-                    if create_time is not None:
-                        self._cache_irrelevant(pid, create_time)
-                    continue
+                if not is_descendant:
+                    # Skip identities already judged irrelevant (no cwd lookup)
+                    if create_time is not None and self._irrelevant.get(pid) == create_time:
+                        continue
 
-                cwd = self._safe_cwd(proc)
+                    # Cheap pre-filter before the expensive cwd syscall:
+                    # name hints, shell/terminal interpreters, or the workspace
+                    # path appearing in the command line.
+                    cmdline_str = " ".join(cmdline).lower()
+                    hints_cmdline = (
+                        workspace_l in cmdline_str or ws_raw_l in cmdline_str
+                    )
+                    hints_name = (
+                        any(sig in name for sig in _UNIVERSAL_AGENT_SIGNATURES)
+                        or any(prefix in name for prefix in _COMMAND_TOOL_PREFIXES)
+                        or _is_shell(name)
+                    )
+                    if not hints_cmdline and not hints_name:
+                        if create_time is not None:
+                            self._cache_irrelevant(pid, create_time)
+                        continue
 
-                if not self._is_relevant(name, cmdline, cwd):
-                    if create_time is not None:
-                        self._cache_irrelevant(pid, create_time)
-                    continue
+                    cwd = self._safe_cwd(proc)
+
+                    if not self._is_relevant(name, cmdline, cwd):
+                        if create_time is not None:
+                            self._cache_irrelevant(pid, create_time)
+                        continue
+                else:
+                    cwd = self._safe_cwd(proc)
 
                 current_pids.add(pid)
                 if pid in self._tracked_pids:

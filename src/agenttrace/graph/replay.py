@@ -78,6 +78,29 @@ class ReplayEngine:
     # Read-only linters/type checkers: safe to run in a workspace
     _STATIC_TOOLS = {"pytest", "ruff", "mypy"}
 
+    # Dangerous interpreter-hook, library-preload, and injection environment variables
+    _DANGEROUS_ENV_VARS = frozenset({
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONBREAKPOINT",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSAFEPATH",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "PERLLIB",
+        "PERL5LIB",
+        "RUBYOPT",
+        "CLASSPATH",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+    })
+
     def __init__(self, workspace_path: str) -> None:
         self.workspace_path = Path(workspace_path)
         self._active_simulations: dict[UUID, Path] = {}
@@ -382,7 +405,7 @@ class ReplayEngine:
                 "success": False,
             }
         scrubbed_env = dict(os.environ)
-        for var in ("PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT", "BASH_ENV", "ENV"):
+        for var in self._DANGEROUS_ENV_VARS:
             scrubbed_env.pop(var, None)
         try:
             result = subprocess.run(

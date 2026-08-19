@@ -820,6 +820,19 @@ class AgentTraceDaemon:
                 except Exception:
                     logger.warning("Could not revoke approval %s", approval.finding_id)
 
+        # Forcefully terminate active child processes associated with the session
+        terminated_pids = 0
+        for observer in self._observers.get(sid, []):
+            if isinstance(observer, ProcessTreeObserver):
+                for pid in list(observer._tracked_pids.keys()):
+                    try:
+                        import psutil  # type: ignore[import-untyped]
+                        p = psutil.Process(pid)
+                        p.kill()
+                        terminated_pids += 1
+                    except Exception:
+                        pass
+
         for observer in self._observers.get(sid, []):
             try:
                 await observer.stop()
@@ -835,7 +848,8 @@ class AgentTraceDaemon:
             severity="high",
             description=(
                 f"Critical {incident.incident_type} incident ({incident.title}) — "
-                f"session frozen, observation stopped, {revoked} approval(s) revoked."
+                f"session frozen, {terminated_pids} process(es) terminated, "
+                f"{revoked} approval(s) revoked."
             ),
             evidence_refs=[str(incident.event_id)],
         )

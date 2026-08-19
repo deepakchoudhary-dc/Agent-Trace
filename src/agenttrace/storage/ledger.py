@@ -11,9 +11,12 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from agenttrace.models.events import (
     EventBase,
@@ -29,6 +32,17 @@ if TYPE_CHECKING:
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 logger = logging.getLogger(__name__)
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _locked(fn: F) -> F:
+    """Synchronize ledger database access with an internal reentrant lock."""
+    @wraps(fn)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return cast("F", wrapper)
 
 
 class LedgerError(Exception):
@@ -48,6 +62,7 @@ class EventLedger:
         encryption_mgr: EncryptionManager | None = None,
         redactor: SecretRedactor | None = None,
     ) -> None:
+        self._lock = threading.RLock()
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._encryption = encryption_mgr or EncryptionManager()
@@ -55,13 +70,15 @@ class EventLedger:
 
         # Single-writer by design (only the daemon writes); threaded ASGI
         # servers (and TestClient) may touch it from different threads.
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._init_schema()
+        with self._lock:
+            self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._init_schema()
 
+    @_locked
     def _init_schema(self) -> None:
         """Apply the database schema and migrate existing databases in place."""
         schema_sql = _SCHEMA_PATH.read_text(encoding="utf-8")
@@ -69,6 +86,7 @@ class EventLedger:
         self._migrate_schema()
         self._conn.commit()
 
+    @_locked
     def _migrate_schema(self) -> None:
         """Add columns introduced after v0.2 to databases created before them."""
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(events)")}
@@ -112,6 +130,7 @@ class EventLedger:
             )
         self._backfill_index_bindings()
 
+    @_locked
     def _backfill_index_bindings(self) -> None:
         """Compute binding hashes for rows written before the column existed."""
         rows = self._conn.execute(
@@ -307,12 +326,14 @@ class EventLedger:
 
         return ""
 
+    @_locked
     def close(self) -> None:
         """Close the database connection."""
         self._conn.close()
 
     # -- Session management --
 
+    @_locked
     def create_session(
         self,
         session_id: UUID,
@@ -344,6 +365,7 @@ class EventLedger:
         )
         self._conn.commit()
 
+    @_locked
     def update_session_status(
         self, session_id: UUID, status: str, stopped_at: str | None = None
     ) -> None:
@@ -360,6 +382,7 @@ class EventLedger:
             )
         self._conn.commit()
 
+    @_locked
     def get_session(self, session_id: UUID) -> dict[str, Any] | None:
         """Retrieve a session by ID, decrypting sensitive fields."""
         row = self._conn.execute(
@@ -392,6 +415,7 @@ class EventLedger:
 
         return row_dict
 
+    @_locked
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all sessions with decrypted descriptions."""
         rows = self._conn.execute("SELECT * FROM sessions ORDER BY started_at DESC").fetchall()
@@ -411,6 +435,7 @@ class EventLedger:
 
     # -- Adapter resume cursors --
 
+    @_locked
     def save_adapter_cursor(
         self, session_id: UUID, adapter_name: str, cursor: dict[str, Any]
     ) -> None:
@@ -432,6 +457,7 @@ class EventLedger:
         )
         self._conn.commit()
 
+    @_locked
     def get_adapter_cursor(self, session_id: UUID) -> dict[str, Any] | None:
         """Load a session's persisted adapter cursor, or None if never saved."""
         row = self._conn.execute(
@@ -451,6 +477,7 @@ class EventLedger:
 
     # -- Event ledger --
 
+    @_locked
     def get_last_hash(self, session_id: UUID) -> str:
         """Get the hash of the last event in the session's chain."""
         row = self._conn.execute(
@@ -459,6 +486,7 @@ class EventLedger:
         ).fetchone()
         return row["event_hash"] if row else ""
 
+    @_locked
     def get_next_seq(self, session_id: UUID) -> int:
         """Get the next sequence number for the session."""
         row = self._conn.execute(
@@ -467,6 +495,7 @@ class EventLedger:
         ).fetchone()
         return int(row["next_seq"])
 
+    @_locked
     def append_event(self, event: EventBase) -> str:
         """Append an event to the ledger, extending the hash chain.
 
@@ -570,6 +599,7 @@ class EventLedger:
             raise
         return clean_event.event_hash
 
+    @_locked
     def get_event(self, event_id: UUID) -> EventBase | None:
         """Retrieve a single event by ID, deserializing to its concrete Event class.
 
@@ -599,6 +629,7 @@ class EventLedger:
 
         return event
 
+    @_locked
     def query_events(
         self,
         session_id: UUID,
@@ -672,6 +703,7 @@ class EventLedger:
 
     # -- Complete cryptographic chain verification --
 
+    @_locked
     def verify_chain(self, session_id: UUID) -> tuple[bool, str]:
         """Verify the complete hash chain integrity for a session.
 
@@ -744,6 +776,7 @@ class EventLedger:
 
     # -- Graph node/edge storage --
 
+    @_locked
     def store_graph_node(
         self,
         node_id: UUID,
@@ -785,6 +818,7 @@ class EventLedger:
         )
         self._conn.commit()
 
+    @_locked
     def store_graph_edge(
         self,
         edge_id: UUID,
@@ -824,6 +858,7 @@ class EventLedger:
         )
         self._conn.commit()
 
+    @_locked
     def get_graph_nodes(
         self,
         session_id: UUID,
@@ -855,6 +890,7 @@ class EventLedger:
             nodes.append(d)
         return nodes
 
+    @_locked
     def get_graph_edges(
         self,
         session_id: UUID,
@@ -894,6 +930,7 @@ class EventLedger:
 
     # -- Approval storage --
 
+    @_locked
     def store_approval(
         self,
         approval_id: UUID,
@@ -969,6 +1006,7 @@ class EventLedger:
             )
         self._conn.commit()
 
+    @_locked
     def get_approvals(self, session_id: UUID) -> list[dict[str, Any]]:
         """Retrieve approvals for a session with decrypted reasons."""
         rows = self._conn.execute(
@@ -1007,6 +1045,7 @@ class EventLedger:
 
     # -- Task contract storage --
 
+    @_locked
     def store_task_contract(
         self,
         contract_id: UUID,
@@ -1052,6 +1091,7 @@ class EventLedger:
         )
         self._conn.commit()
 
+    @_locked
     def get_task_contract(self, session_id: UUID) -> dict[str, Any] | None:
         """Retrieve the task contract for a session, decrypting fields."""
         row = self._conn.execute(
@@ -1091,6 +1131,7 @@ class EventLedger:
 
     # -- Review loop runs --
 
+    @_locked
     def store_review_run(
         self,
         loop_id: UUID,
@@ -1122,6 +1163,7 @@ class EventLedger:
         )
         self._conn.commit()
 
+    @_locked
     def get_review_runs(self, session_id: UUID) -> list[dict[str, Any]]:
         """Return all review runs for a session, newest first (decrypted)."""
         rows = self._conn.execute(
@@ -1148,6 +1190,7 @@ class EventLedger:
 
     # -- Blob indexing --
 
+    @_locked
     def store_blob_index(
         self,
         blob_hash: str,
@@ -1167,6 +1210,7 @@ class EventLedger:
 
     # -- Egress destination baseline --
 
+    @_locked
     def add_destination_baseline(self, workspace_path: str, destination: str) -> None:
         """Record a destination as established for a workspace."""
         self._conn.execute(
@@ -1177,6 +1221,7 @@ class EventLedger:
         )
         self._conn.commit()
 
+    @_locked
     def get_destination_baseline(self, workspace_path: str) -> set[str]:
         """All baseline destinations learned for a workspace."""
         rows = self._conn.execute(
@@ -1206,6 +1251,7 @@ class EventLedger:
         "review_runs": ("payload_enc",),
     }
 
+    @_locked
     def rotate_encryption(
         self,
         new_key: bytes,
@@ -1235,6 +1281,7 @@ class EventLedger:
             self._conn.rollback()
             raise
 
+    @_locked
     def _reencrypt_column(self, table: str, column: str, new_key: bytes) -> None:
         """Re-encrypt one column: decrypt with the current key, encrypt with the new one."""
         rows = self._conn.execute(

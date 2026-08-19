@@ -52,13 +52,17 @@ class FilesystemObserver(BaseObserver):
     ) -> None:
         super().__init__(session_id, workspace_path, callback)
         self._ignore_patterns = ignore_patterns or [
-            ".git/**",
+            ".git/objects/**",
+            ".git/index",
+            ".git/logs/**",
+            ".git/refs/**",
             "node_modules/**",
             "__pycache__/**",
             "*.pyc",
             ".venv/**",
             "venv/**",
         ]
+        self._stop_event = asyncio.Event()
         # Cache of file content hashes for before/after comparison
         self._hash_cache: dict[str, str] = {}
         # In-memory text cache for bounded diff generation
@@ -128,7 +132,7 @@ class FilesystemObserver(BaseObserver):
         try:
             async for changes in awatch(
                 self.workspace_path,
-                stop_event=asyncio.Event(),
+                stop_event=self._stop_event,
             ):
                 if not self._running:
                     break
@@ -202,3 +206,8 @@ class FilesystemObserver(BaseObserver):
         for path, content_hash in hashes.items():
             if path and content_hash and path not in self._hash_cache:
                 self._hash_cache[path] = content_hash
+
+    async def stop(self) -> None:
+        """Stop the filesystem watcher gracefully."""
+        self._stop_event.set()
+        await super().stop()

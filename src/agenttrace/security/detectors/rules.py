@@ -613,22 +613,25 @@ class DatabaseDestructionDetector:
     severity = "high"
 
     def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
-        cmd = _command(event)
-        if not cmd:
-            return []
-        if _DESTRUCTIVE_SQL_RE.search(cmd):
-            return [
-                DetectorFinding(
-                    detector_id=self.detector_id,
-                    name=self.name,
-                    severity=self.severity,
-                    confidence=ConfidenceLevel.HIGH,
-                    description=f"Destructive database operation: {cmd[:120]}",
-                    evidence_refs=[str(event.event_id)],
-                    affected_command=cmd[:200],
-                    requires_approval=False,
-                )
-            ]
+        for text in _collect_texts(event):
+            match = _DESTRUCTIVE_SQL_RE.search(text)
+            if match:
+                return [
+                    DetectorFinding(
+                        detector_id=self.detector_id,
+                        name=self.name,
+                        severity=self.severity,
+                        confidence=ConfidenceLevel.HIGH,
+                        description=f"Destructive database operation: {text[:120]}",
+                        evidence_refs=[str(event.event_id)],
+                        affected_command=(
+                            text[:200]
+                            if isinstance(event, (CommandEvent, ProcessEvent))
+                            else ""
+                        ),
+                        requires_approval=False,
+                    )
+                ]
         return []
 
 
@@ -637,7 +640,8 @@ class DatabaseDestructionDetector:
 # ---------------------------------------------------------------------------
 
 _SABOTAGE_RE = re.compile(
-    r"\bkill\s+-9\b|\bpkill\s+-9\b|\btaskkill\s+/(?:F|IM)\b|"
+    r"\bkill\s+(?:-\d+|-[A-Za-z]+)\b|\bpkill\b|\bkillall\b|\btaskkill\b|\bStop-Process\b|"
+    r"\bchmod\s+(?:000|a-w|-R\s+000)\b|\bicacls\s+.*\/deny\b|"
     r"\brm\s+-f\s+[^\s]*\.git[/\\]index\.lock\b|"
     r"\brm\s+-rf\s+[^\s]*(?:[/\\](?:node_modules|__pycache__|\.venv|target|dist)(?:[/\\]|$)|\.git\b)",
     re.IGNORECASE,
@@ -645,11 +649,11 @@ _SABOTAGE_RE = re.compile(
 
 
 class MultiAgentSabotageDetector:
-    """Flags process kills and deletion of shared state other agents rely on.
+    """Flags process kills, permission locks, and deletion of shared state.
 
     The turf-war failure mode: an agent destroying another agent's
-    environment (killing processes, wiping caches/virtualenvs, deleting git
-    locks) to sabotage a concurrent run.
+    environment (killing processes, locking permissions, wiping caches,
+    deleting git locks) to sabotage a concurrent run.
     """
 
     detector_id = "multi_agent_sabotage"
@@ -667,7 +671,7 @@ class MultiAgentSabotageDetector:
                     name=self.name,
                     severity=self.severity,
                     confidence=ConfidenceLevel.MEDIUM,
-                    description=f"Sabotage signal (kill/state deletion): {cmd[:120]}",
+                    description=f"Sabotage signal (kill/lock/state deletion): {cmd[:120]}",
                     evidence_refs=[str(event.event_id)],
                     affected_command=cmd[:200],
                     requires_approval=False,

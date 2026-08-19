@@ -143,10 +143,22 @@ class SecretRedactor:
 
         # 2. High-entropy credential tokens (entropy test on the write path)
         for token_match in re.finditer(r"\S+", text):
-            if self._is_high_entropy_credential(token_match.group(0)):
+            full_tok = token_match.group(0)
+            if self._is_high_entropy_credential(full_tok):
                 spans.append(
                     (token_match.start(), token_match.end(), "high_entropy_credential")
                 )
+            elif any(sep in full_tok for sep in ("/", "\\", "?", "&", "=")):
+                # Evaluate sub-segments (e.g. query parameters, API keys in URLs/paths)
+                for seg in re.finditer(r"[^/\\?&=:\s]+", full_tok):
+                    if self._is_high_entropy_credential(seg.group(0)):
+                        spans.append(
+                            (
+                                token_match.start() + seg.start(),
+                                token_match.start() + seg.end(),
+                                "high_entropy_credential",
+                            )
+                        )
 
         # Merge overlapping spans, keeping the wider one
         merged: list[tuple[int, int, str]] = []
@@ -278,14 +290,20 @@ class SecretRedactor:
         A token must be long (>=16), high-entropy (>4.5 bits/char), and contain
         at least one digit or symbol — or be mixed-case and very long (>=24).
         Plain prose, hex hashes, and short identifiers never trip it.
-        Paths never trip it: a token containing a path separator is contextual
-        (a file path, not a standalone credential). Structured secrets inside
-        paths are still caught by the named patterns above.
+        Standard paths with common file extensions or root path prefixes are
+        exempted from whole-string matching (their sub-segments are checked separately).
         """
         clean = token.strip("\"'()[]{}:;,")
         if len(clean) < 16:
             return False
-        if "/" in clean or "\\" in clean:
+        _exempt = (
+            "/", "\\", "./", ".\\", "../", "..\\", "~",
+            "http://", "https://", "ws://", "wss://",
+        )
+        if ("/" in clean or "\\" in clean) and (
+            clean.startswith(_exempt)
+            or re.search(r"\.[a-zA-Z0-9]{1,6}$", clean)
+        ):
             return False
         if self._shannon_entropy(clean) <= self._entropy_threshold:
             return False
