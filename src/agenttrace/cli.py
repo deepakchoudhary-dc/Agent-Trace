@@ -213,6 +213,35 @@ def daemon_stop() -> None:
     console.print("[green]✓ Daemon stopped[/green]")
 
 
+@daemon.command("rotate-token")
+def daemon_rotate_token() -> None:
+    """Regenerate the API token (invalidates all in-flight clients).
+
+    The daemon reads the token file on every verification, so a rotation
+    takes effect immediately; any running dashboard session must re-read
+    the token.
+    """
+    from agenttrace.security.token import ApiTokenManager
+
+    manager = ApiTokenManager(_data_dir())
+    if is_running(_data_dir()):
+        console.print(
+            "[yellow]Daemon is running — rotating the token will reject all "
+            "in-flight clients until they pick up the new token.[/yellow]"
+        )
+    old = manager.token()
+    new = manager.rotate()
+    if old == new:
+        console.print("[red]Token rotation failed (token unchanged).[/red]")
+        return
+    console.print(
+        f"[green]✓ API token rotated[/green]\n"
+        f"  New token: [bold cyan]{new}[/bold cyan]\n"
+        f"  File: {manager.token_path}\n"
+        f"  Expires: {manager.token_expiry() or 'unknown'}"
+    )
+
+
 @main.command()
 @click.argument("finding_id")
 @click.option(

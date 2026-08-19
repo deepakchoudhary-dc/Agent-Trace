@@ -500,6 +500,13 @@ class PrivilegeChangeDetector:
 
 _LINKER_EXEC_RE = re.compile(r"\bld-linux[^\s]*\.so\b|\bld\.so(\.\d+)?\b|\bld-musl[^\s]*\.so\b")
 _MEM_STATE_RE = re.compile(r"--state=mem:?/?|--state\s+mem:?/", re.IGNORECASE)
+# Trampolines that bypass sandbox exec wrappers or scrub the environment:
+# direct procfs pivots and env-clearing execution.
+_ESCAPE_TRAMPOLINES = re.compile(
+    r"/proc/self/(root|fd|mem)\b|"
+    r"(?:\benv\s+-i\b|\bunset\s+(?:PATH|LD_PRELOAD|LD_LIBRARY_PATH)\b)",
+    re.IGNORECASE,
+)
 _SYSTEM_PATHS = (
     "/etc/",
     "/usr/",
@@ -552,6 +559,8 @@ class SandboxEscapeDetector:
                 reasons.append("direct linker/loader execution")
             if _MEM_STATE_RE.search(cmd):
                 reasons.append("ephemeral in-memory state invocation")
+            if _ESCAPE_TRAMPOLINES.search(cmd):
+                reasons.append("sandbox-escape trampoline (procfs/env scrub)")
 
         if isinstance(event, CommandEvent) and ctx.workspace_paths:
             wd = event.working_dir
@@ -580,6 +589,505 @@ class SandboxEscapeDetector:
         ]
 
 
+# ---------------------------------------------------------------------------
+# 10. Destructive database operations — data-loss primitives.
+# ---------------------------------------------------------------------------
+
+_DESTRUCTIVE_SQL_RE = re.compile(
+    r"\bDROP\s+(?:TABLE|DATABASE|SCHEMA|INDEX|VIEW)\b|\bTRUNCATE\b|"
+    r"\bDELETE\s+FROM\b(?!\s+\w+\s+WHERE)|"
+    r"\bALTER\s+\w+\s+DROP\b|\brm\s+-[rf]+\s+[^\s]*\.(?:db|sqlite|sqlite3)\b",
+    re.IGNORECASE,
+)
+
+
+class DatabaseDestructionDetector:
+    """Flags destructive SQL and database-file deletion (data-loss events).
+
+    Covers the sabotage pattern of erasing evaluation/agent state stored in
+    databases (results, checkpoints, test fixtures).
+    """
+
+    detector_id = "database_destruction"
+    name = "Destructive Database Operations"
+    severity = "high"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        cmd = _command(event)
+        if not cmd:
+            return []
+        if _DESTRUCTIVE_SQL_RE.search(cmd):
+            return [
+                DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.HIGH,
+                    description=f"Destructive database operation: {cmd[:120]}",
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                    requires_approval=False,
+                )
+            ]
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 11. Multi-agent sabotage — hostile actions against other agents' state.
+# ---------------------------------------------------------------------------
+
+_SABOTAGE_RE = re.compile(
+    r"\bkill\s+-9\b|\bpkill\s+-9\b|\btaskkill\s+/(?:F|IM)\b|"
+    r"\brm\s+-f\s+[^\s]*\.git[/\\]index\.lock\b|"
+    r"\brm\s+-rf\s+[^\s]*(?:[/\\](?:node_modules|__pycache__|\.venv|target|dist)(?:[/\\]|$)|\.git\b)",
+    re.IGNORECASE,
+)
+
+
+class MultiAgentSabotageDetector:
+    """Flags process kills and deletion of shared state other agents rely on.
+
+    The turf-war failure mode: an agent destroying another agent's
+    environment (killing processes, wiping caches/virtualenvs, deleting git
+    locks) to sabotage a concurrent run.
+    """
+
+    detector_id = "multi_agent_sabotage"
+    name = "Multi-Agent Sabotage Signals"
+    severity = "high"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        cmd = _command(event)
+        if not cmd:
+            return []
+        if _SABOTAGE_RE.search(cmd):
+            return [
+                DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.MEDIUM,
+                    description=f"Sabotage signal (kill/state deletion): {cmd[:120]}",
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                    requires_approval=False,
+                )
+            ]
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 12. Persistence — outliving the session via cron/services/registry.
+# ---------------------------------------------------------------------------
+
+_PERSISTENCE_RE = re.compile(
+    r"\bcrontab\b|/etc/cron\.|/etc/systemd/|\bsystemctl\s+enable\b|"
+    r"\bupdate-rc\.d\b|\bchkconfig\b|\bschtasks\s+/create\b|"
+    r"HKCU\\[^ \"]*\\Run\b|HKEY_CURRENT_USER\\[^ \"]*\\Run\b|"
+    r"\.config/autostart|/etc/init\.d/|\breg\s+add\b.*\\Run\b|"
+    r"(?:\.bashrc|\.zshrc|\.profile)\b",
+    re.IGNORECASE,
+)
+
+
+class PersistenceDetector:
+    """Flags attempts to establish persistence outside the session lifetime.
+
+    Covers the "lay down infrastructure for later" pattern — cron entries,
+    systemd units, scheduled tasks, registry Run keys, and shell rc files
+    being modified for later re-execution.
+    """
+
+    detector_id = "persistence_malware"
+    name = "Persistence Establishment"
+    severity = "high"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        if isinstance(event, FileMutationEvent):
+            path = event.file_path.replace("\\", "/")
+            if any(k in path for k in ("/cron.", "systemd/", "/init.d/", "autostart")):
+                return [
+                    DetectorFinding(
+                        detector_id=self.detector_id,
+                        name=self.name,
+                        severity=self.severity,
+                        confidence=ConfidenceLevel.MEDIUM,
+                        description=f"Persistence-path mutation: {path}",
+                        evidence_refs=[str(event.event_id)],
+                        affected_path=event.file_path,
+                        requires_approval=False,
+                    )
+                ]
+        cmd = _command(event)
+        if cmd and _PERSISTENCE_RE.search(cmd):
+            return [
+                DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.MEDIUM,
+                    description=f"Persistence-establishment command: {cmd[:120]}",
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                    requires_approval=False,
+                )
+            ]
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 13. Test integrity — evaluation-rigging primitives.
+# ---------------------------------------------------------------------------
+
+_TEST_RIGGING_RE = re.compile(
+    r"--ignore(?:-glob)?(?:=[^\s]+)?(?=\s|['\"]|$)|--deselect\b|"
+    r"-k\s+['\"]?not\b|\b@(?:pytest\.mark\.)?skip\b|"
+    r"\bskipif\s+True\b|\bunittest\.skip\b|"
+    r"\bpython\s+-c\b.*\b(?:r|w)\s*\([^)]*test",
+    re.IGNORECASE,
+)
+
+_TEST_PATH_RE = re.compile(
+    r"(?:^|[/\\\s'\"])(?:tests?|specs?|e2e|__tests__)[/\\]"
+    r"|[._-](?:test|spec)(?:[/\\_\s'\"]|$)",
+    re.IGNORECASE,
+)
+
+
+class TestIntegrityDetector:
+    """Flags evaluation-rigging: test deselection, forced skips, test deletion.
+
+    The METR o3 rigging pattern (14/20 evals gamed): tests deleted or
+    deselected, failures forced green, evaluation scope silently narrowed.
+    """
+
+    detector_id = "test_integrity"
+    name = "Test / Evaluation Rigging"
+    severity = "medium"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        reasons: list[str] = []
+        if isinstance(event, FileMutationEvent) and _TEST_PATH_RE.search(event.file_path):
+            mutation = getattr(event, "mutation_type", "") or ""
+            if mutation.lower() in {"delete", "remove", "rename"}:
+                reasons.append(f"test file removed ({event.file_path})")
+        cmd = _command(event)
+        if cmd:
+            if _TEST_RIGGING_RE.search(cmd):
+                reasons.append(f"test selection rigging ({cmd[:120]})")
+            sed_cmd = cmd.strip().startswith("sed")
+            if isinstance(event, CommandEvent) and sed_cmd and _TEST_PATH_RE.search(cmd):
+                reasons.append("in-place mutation of test file via sed")
+        if not reasons:
+            return []
+        return [
+            DetectorFinding(
+                detector_id=self.detector_id,
+                name=self.name,
+                severity=self.severity,
+                confidence=ConfidenceLevel.MEDIUM,
+                description="Test/evaluation rigging: " + "; ".join(reasons),
+                evidence_refs=[str(event.event_id)],
+                affected_path=event.file_path if isinstance(event, FileMutationEvent) else "",
+                affected_command=cmd[:200] if cmd else "",
+                requires_approval=False,
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
+# 14. PowerShell cradles — encoded/obfuscated remote execution.
+# ---------------------------------------------------------------------------
+
+_PS_CRADLE_RE = re.compile(
+    r"-encod(?:ed)?\s*command\b|-enc\s+[A-Za-z0-9+/=]{20,}|"
+    r"\bIEX\s*\(|\bInvoke-Expression\b|\bDownloadString\b|"
+    r"-ExecutionPolicy\s+Bypass\b|(?:^|\s)-nop\b(?:.*)(?:^|\s)-w\s+hidden\b|"
+    r"powershell(?:\.exe)?\s+.*\bhidden\b.*\b-enc\b|"
+    r"\bwsl(?:\.exe)?\s+.*\bpowershell",
+    re.IGNORECASE,
+)
+
+
+class PowerShellCradleDetector:
+    """Flags encoded or download-and-execute PowerShell invocation.
+
+    Covers the classic Windows payload delivery chain — base64-encoded
+    command lines, ExecutionPolicy bypass, hidden windows — and the WSL
+    bridging variant that executes PowerShell from inside a Linux sandbox.
+    """
+
+    detector_id = "powershell_cradle"
+    name = "PowerShell Payload Cradles"
+    severity = "high"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        cmd = _command(event)
+        if not cmd:
+            return []
+        if _PS_CRADLE_RE.search(cmd):
+            return [
+                DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.HIGH,
+                    description=f"PowerShell payload cradle: {cmd[:120]}",
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                    requires_approval=False,
+                )
+            ]
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 15. Git author/committer spoofing — identity laundering.
+# ---------------------------------------------------------------------------
+
+_GIT_SPOOF_RE = re.compile(
+    r"\bgit\b[^\n;]*(?:^|\s)-c\s+user\.(?:name|email)\s*=\s*[^\s]+|"
+    r"\bGIT_(?:AUTHOR|COMMITTER)_(?:NAME|EMAIL|DATE)\s*=\s*[^\s]+|"
+    r"\bgit\s+commit\b[^\n;]*--author\s*=\s*[^\s]+",
+    re.IGNORECASE,
+)
+
+
+class GitAuthorSpoofDetector:
+    """Flags identity laundering: forged git authorship/committer identity.
+
+    Rewriting attribution hides which agent actually performed a commit —
+    the prerequisite for blaming another agent or evading per-agent
+    accountability.
+    """
+
+    detector_id = "git_author_spoof"
+    name = "Git Identity Spoofing"
+    severity = "medium"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        cmd = _command(event)
+        if not cmd:
+            return []
+        if _GIT_SPOOF_RE.search(cmd):
+            return [
+                DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.MEDIUM,
+                    description=f"Git identity override: {cmd[:120]}",
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                    requires_approval=False,
+                )
+            ]
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 16. Orphaned commits — parents outside the observed history.
+# ---------------------------------------------------------------------------
+
+_EMPTY_SHA_RE = re.compile(r"^0+$")
+
+
+class OrphanedCommitDetector:
+    """Flags commits whose parent chain is absent from the observed session.
+
+    A commit whose parent was never observed is either the first commit of a
+    freshly cloned/initialized repository or evidence of history rewriting /
+    out-of-band commits (a rebase, filter-branch, or a commit made by a
+    different agent outside this session's observation window). The finding
+    states exactly that — it never asserts intent.
+    """
+
+    detector_id = "orphaned_commit"
+    name = "Unobserved Parent Commit Chain"
+    severity = "medium"
+
+    def __init__(self) -> None:
+        self._seen_hashes: dict[str, set[str]] = {}
+        self._flagged: dict[str, set[tuple[str, str]]] = {}
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        if not isinstance(event, GitEvent):
+            return []
+        if event.git_action not in {"commit", "merge"} or not event.commit_hash:
+            return []
+        if _EMPTY_SHA_RE.match(event.commit_hash) or _EMPTY_SHA_RE.match(event.parent_hash):
+            return []
+
+        session_key = str(ctx.session_id)
+        seen = self._seen_hashes.setdefault(session_key, set())
+        seen.add(event.commit_hash)
+        if not event.parent_hash:
+            return []
+
+        flagged = self._flagged.setdefault(session_key, set())
+        if (event.commit_hash, event.parent_hash) in flagged:
+            return []
+        if event.parent_hash in seen:
+            return []
+        flagged.add((event.commit_hash, event.parent_hash))
+
+        return [
+            DetectorFinding(
+                detector_id=self.detector_id,
+                name=self.name,
+                severity=self.severity,
+                confidence=ConfidenceLevel.MEDIUM,
+                description=(
+                    f"Commit {event.commit_hash[:12]} on {event.branch or '?'} has a "
+                    f"parent ({event.parent_hash[:12]}) never observed in this session — "
+                    "consistent with history rewriting or an out-of-band commit"
+                ),
+                evidence_refs=[str(event.event_id)],
+                affected_command=event.message[:100],
+                requires_approval=False,
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
+# 17. DNS/ICMP tunneling signals — covert-channel primitives.
+# ---------------------------------------------------------------------------
+
+_TUNNEL_TOOLS_RE = re.compile(
+    r"\b(?:iodine|dnscat2?|dnscat|ptunnel|icmptunnel|icmpsh|dns2tcp)\b",
+    re.IGNORECASE,
+)
+# ICMP payloads large enough to carry tunneled data (classic ``ping -s``
+# data-channel usage; default ICMP payload is 32-56 bytes).
+_ICMP_DATA_PING_RE = re.compile(r"\bping\b[^\n;]*\s-s\s+\d{4,}")
+# DNS query labels long/entropy-dense enough to carry chunked payloads
+# (base64-ish blob as a subdomain label).
+_DNS_BLOB_LABEL_RE = re.compile(
+    r"\b(?:dig|nslookup|host)\s+([a-z0-9+/=_-]{50,})", re.IGNORECASE
+)
+
+_DNS_TUNNEL_WINDOW_SECONDS = 60.0
+_DNS_TUNNEL_VOLUME = 15
+_ICMP_TUNNEL_VOLUME = 15
+
+
+class NetworkTunnelSignalsDetector:
+    """Flags DNS/ICMP covert-channel primitives from host-observable signals.
+
+    Two signal classes, both honestly low-confidence:
+    - Command primitives: tunnel-tool invocations (iodine, dnscat2, ...),
+      oversized ICMP payloads (``ping -s``), and base64-blob DNS labels.
+    - Volume: a single destination receiving a dense burst of UDP/53 or
+      ICMP traffic within a short window is consistent with chunked
+      tunneled data, but never asserted as intent.
+    """
+
+    detector_id = "network_tunnel"
+    name = "DNS/ICMP Tunneling Signals"
+    severity = "medium"
+
+    def __init__(self) -> None:
+        self._recent: dict[str, dict[tuple[str, str], list[float]]] = {}
+        self._volume_flagged: dict[str, set[tuple[str, str]]] = {}
+
+    def _volume_finding(
+        self, event: EventBase, ctx: DetectionContext, kind: str, destination: str
+    ) -> DetectorFinding | None:
+        session_key = str(ctx.session_id)
+        key = (kind, destination)
+        flagged = self._volume_flagged.setdefault(session_key, set())
+        if key in flagged:
+            return None
+        flagged.add(key)
+        return DetectorFinding(
+            detector_id=self.detector_id,
+            name=self.name,
+            severity=self.severity,
+            confidence=ConfidenceLevel.LOW,
+            description=(
+                f"Dense {kind} traffic to a single destination "
+                f"({destination}) within {int(_DNS_TUNNEL_WINDOW_SECONDS)}s "
+                "— consistent with a chunked covert channel"
+            ),
+            evidence_refs=[str(event.event_id)],
+            requires_approval=False,
+        )
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        findings: list[DetectorFinding] = []
+
+        cmd = _command(event)
+        if cmd:
+            if _TUNNEL_TOOLS_RE.search(cmd):
+                findings.append(DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.MEDIUM,
+                    description=f"Covert-channel tunnel tool invoked: {cmd[:120]}",
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                    requires_approval=False,
+                ))
+            if _ICMP_DATA_PING_RE.search(cmd):
+                findings.append(DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.MEDIUM,
+                    description=f"Oversized ICMP payload ping (data channel): {cmd[:120]}",
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                    requires_approval=False,
+                ))
+            blob = _DNS_BLOB_LABEL_RE.search(cmd)
+            if blob and len(blob.group(1)) >= 50:
+                findings.append(DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.MEDIUM,
+                    description=(
+                        "DNS query carrying a payload-sized label "
+                        f"({len(blob.group(1))} chars)"
+                    ),
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                    requires_approval=False,
+                ))
+
+        if isinstance(event, NetworkEvent) and event.direction == "outbound":
+            now = event.timestamp.timestamp()
+            window = now - _DNS_TUNNEL_WINDOW_SECONDS
+            destination = f"{event.destination_ip}:{event.destination_port}"
+            session_key = str(ctx.session_id)
+            bucket = self._recent.setdefault(session_key, {})
+
+            proto = (event.protocol or "").lower()
+            if proto == "udp" and event.destination_port == 53:
+                key = ("dns", destination)
+                queue = bucket.setdefault(key, [])
+                queue.append(now)
+                if len(queue) >= _DNS_TUNNEL_VOLUME:
+                    finding = self._volume_finding(event, ctx, "DNS", destination)
+                    if finding is not None:
+                        findings.append(finding)
+            elif proto == "icmp":
+                key = ("icmp", destination)
+                queue = bucket.setdefault(key, [])
+                queue.append(now)
+                if len(queue) >= _ICMP_TUNNEL_VOLUME:
+                    finding = self._volume_finding(event, ctx, "ICMP", destination)
+                    if finding is not None:
+                        findings.append(finding)
+
+            # Prune entries outside the window so the volume signal decays.
+            for key, queue in bucket.items():
+                bucket[key] = [t for t in queue if t >= window]
+
+        return findings
+
+
 DEFAULT_DETECTORS: list[Any] = [
     PromptInjectionDetector(),
     ConfigTamperDetector(),
@@ -590,4 +1098,12 @@ DEFAULT_DETECTORS: list[Any] = [
     PathTrickDetector(),
     PrivilegeChangeDetector(),
     SandboxEscapeDetector(),
+    DatabaseDestructionDetector(),
+    MultiAgentSabotageDetector(),
+    PersistenceDetector(),
+    TestIntegrityDetector(),
+    PowerShellCradleDetector(),
+    GitAuthorSpoofDetector(),
+    OrphanedCommitDetector(),
+    NetworkTunnelSignalsDetector(),
 ]

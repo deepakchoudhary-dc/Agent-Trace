@@ -9,7 +9,7 @@ CORPUS = Path(__file__).parent / "corpus"
 
 def test_corpus_scenarios_all_pass() -> None:
     results = run_corpus(CORPUS)
-    assert len(results) >= 4
+    assert len(results) >= 16
     failures = [r for r in results if not r.passed]
     assert failures == [], [
         (f.name, f.missing, f.unexpected) for f in failures

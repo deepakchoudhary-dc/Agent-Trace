@@ -60,3 +60,31 @@ src/agenttrace/
 ```bash
 pytest tests/ -v
 ```
+
+## Known CI History & Fixes
+
+Earlier commits in the August 2026 gap-closure sequence produced red CI on
+Linux runners (`tests/test_gap_closure.py`). Root causes and the fix commit:
+
+- **`PermissionError: [Errno 13] ... data/api_token` and `.../.agenttrace/daemon.log`**
+  (tests `test_harden_data_dir_covers_artifacts`,
+  `test_run_server_watchdog_restarts_and_gives_up`,
+  `test_run_server_watchdog_raises_after_many_crashes`,
+  and the `test_shield.py` teardown errors):
+  `security/permissions.apply_restrictive_perms` applied `0600` to
+  **directories** as well as files. On POSIX a `0600` directory drops the
+  owner execute/search bit, so the owner can no longer traverse into it and
+  every child `stat`/`open` fails with EACCES. The local Windows runs passed
+  because icacls grants full access to directories. Fixed by making the
+  function directory-aware: files keep `0600`, directories get `0700`
+  (owner read/write/search) — see `security/permissions.py` and
+  `tests/test_gap_closure.py::test_apply_restrictive_perms_is_directory_aware`.
+
+- **`test_event_flood_flags_and_skips_projection` — `assert False`**
+  The test ingested 505 events and asserted an `event_flood` finding. The
+  anti-forensic window is 5 seconds of wall clock; on a fast local machine the
+  ingests finish inside the window and the counter accumulates, but on a slow
+  CI runner they take longer than 5s, so the window resets every event and the
+  counter never reaches the threshold. Fixed by patching
+  `daemon.time.monotonic` in the test to a deterministic clock that never
+  crosses the window boundary, independent of machine speed.

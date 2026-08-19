@@ -85,3 +85,13 @@ class CompositeAdapter(AdapterBase):
                 logger.debug("Error polling sub-adapter %s: %s", adapter.adapter_name, e)
 
         return all_events
+
+    def commit_cursor(self) -> None:
+        for adapter in self._sub_adapters:
+            with contextlib.suppress(Exception):
+                adapter.commit_cursor()
+
+    def rollback_cursor(self) -> None:
+        for adapter in self._sub_adapters:
+            with contextlib.suppress(Exception):
+                adapter.rollback_cursor()

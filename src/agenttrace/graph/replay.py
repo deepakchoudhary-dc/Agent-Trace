@@ -110,6 +110,18 @@ class ReplayEngine:
         if any("$(" in tok or "${ " in tok for tok in parts):
             return False, "Command substitution is not allowed"
 
+        # Reject interactive/debug hooks: `pytest --pdb` spawns a debugger
+        # on the child's stdin, `go test -exec` / `-execx` runs arbitrary
+        # binaries, and `-s` on pytest keeps stdout (harmless alone but a
+        # common first step of interactive rigging). Anything interactive
+        # must fail closed inside a replay.
+        if any(tok.startswith(("--pdb", "--pdbcls")) for tok in parts):
+            return False, "Interactive debugger flags (--pdb) are not allowed in replays"
+        if any(tok in ("-exec", "-execx") for tok in parts):
+            return False, "`-exec` is not allowed in replays (arbitrary binary execution)"
+        if any(tok in ("--capture=no", "-s", "--showlocals") for tok in parts):
+            return False, "Interactive test flags are not allowed in replays"
+
         base = Path(parts[0]).name.lower().removesuffix(".exe")
 
         # python -m pytest | python -m unittest | python -m py_compile
@@ -353,7 +365,13 @@ class ReplayEngine:
         return None, f"`{command}` is not on the verification allowlist"
 
     def _run_command(self, command: str, worktree: Path) -> dict[str, Any]:
-        """Run a verification command safely inside the isolated worktree."""
+        """Run a verification command safely inside the isolated worktree.
+
+        Hardened: stdin is detached (a ``pytest --pdb``-style interactive
+        debugger must never get a live terminal), and the environment is
+        scrubbed of interpreter-hook variables that could smuggle arbitrary
+        code into the child (PYTHONSTARTUP, PYTHONINSPECT, BASH_ENV).
+        """
         argv, error = self._resolve_command(command)
         if argv is None:
             return {
@@ -363,6 +381,9 @@ class ReplayEngine:
                 "stderr": error,
                 "success": False,
             }
+        scrubbed_env = dict(os.environ)
+        for var in ("PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT", "BASH_ENV", "ENV"):
+            scrubbed_env.pop(var, None)
         try:
             result = subprocess.run(
                 argv,
@@ -371,6 +392,8 @@ class ReplayEngine:
                 capture_output=True,
                 text=True,
                 timeout=120,
+                stdin=subprocess.DEVNULL,
+                env=scrubbed_env,
             )
             return {
                 "command": command,

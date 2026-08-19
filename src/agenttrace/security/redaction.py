@@ -178,6 +178,21 @@ class SecretRedactor:
 
         return result
 
+    def redact_bytes(self, data: bytes) -> bytes:
+        """Redact secrets from a byte payload before at-rest encryption.
+
+        Text payloads (UTF-8) are scrubbed in place. Binary payloads that do
+        not decode as text are returned unchanged: re-encoding arbitrary
+        binary through a text codec would corrupt the blob, and binary bytes
+        cannot be tokenized as text. Callers that capture binary secrets must
+        scrub at capture time.
+        """
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        return self.redact(text).encode("utf-8")
+
     def redact_any(self, value: Any) -> Any:
         """Recursively redact secrets across arbitrary nested Python data structures."""
         if isinstance(value, str):

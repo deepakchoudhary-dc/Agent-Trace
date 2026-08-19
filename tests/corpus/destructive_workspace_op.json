@@ -1,0 +1,14 @@
+{
+  "name": "Destructive workspace file deletion",
+  "workspace_paths": ["/workspace/app"],
+  "events": [
+    {
+      "event_type": "file_mutation",
+      "actor_id": "agent",
+      "source_adapter": "filesystem_observer",
+      "file_path": "/workspace/app/README.md",
+      "mutation_type": "delete"
+    }
+  ],
+  "expected_findings": ["destructive_file_op"]
+}

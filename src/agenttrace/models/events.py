@@ -290,5 +290,15 @@ def event_from_dict(data: dict[str, Any]) -> EventBase:
         event_type = EventType(event_type_str)
         model_cls = _EVENT_TYPE_MAP.get(event_type, EventBase)
         return model_cls.model_validate(data)
-    except Exception:
-        return EventBase.model_validate(data)
+    except Exception as exc:
+        # Silent degradation to the base model loses every typed field (finding
+        # severity, command text, destination IP). Tag the degraded event so
+        # downstream consumers can surface the gap instead of treating the
+        # lossy row as full-fidelity.
+        degraded = EventBase.model_validate(data)
+        degraded.payload.setdefault("_degraded", {})
+        degraded.payload["_degraded"].update({
+            "reason": f"{type(exc).__name__}: {exc}",
+            "source_event_type": event_type_str,
+        })
+        return degraded

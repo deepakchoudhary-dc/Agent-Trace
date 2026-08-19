@@ -88,7 +88,7 @@ def _health_ok(port: int, timeout: float) -> bool:
 
 def spawn_daemon(data_dir: Path, port: int) -> None:
     """Launch a detached daemon process for this data directory."""
-    data_dir.mkdir(parents=True, exist_ok=True)
+    harden_data_dir(data_dir)
     log_path = data_dir / "daemon.log"
     log_handle = log_path.open("a", encoding="utf-8")
     try:
@@ -139,17 +139,79 @@ def clear_runtime(data_dir: Path) -> None:
         logger.warning("Could not remove runtime file %s", runtime_path(data_dir))
 
 
+def harden_data_dir(data_dir: Path) -> None:
+    """Restrict the data directory and its artifacts to the current user.
+
+    The ledger is encrypted at rest, but the ACL still matters: another
+    local account must not be able to read, copy, or tamper with the token,
+    runtime file, or encrypted blobs. Best-effort — constrained hosts keep
+    working, and failures are logged.
+    """
+    from agenttrace.security.permissions import apply_restrictive_perms
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    apply_restrictive_perms(data_dir)
+    for child in data_dir.iterdir():
+        if (
+            (child.is_dir() and child.name in {"keys", "blobs"})
+            or child.is_file()
+        ):
+            apply_restrictive_perms(child)
+
+
+_WATCHDOG_MAX_CONSECUTIVE_FAILURES = 10
+_WATCHDOG_BACKOFF_BASE_SECONDS = 1.0
+_WATCHDOG_BACKOFF_MAX_SECONDS = 15.0
+
+
 def run_server(data_dir: Path, port: int) -> None:
-    """Run the API server in-process until interrupted."""
+    """Run the API server in-process until interrupted, supervised.
+
+    The watchdog restarts the server on crash with exponential backoff and
+    rewrites the runtime file before every attempt so clients keep finding
+    the same port. It gives up after consecutive failures and re-raises so
+    the failure is loud rather than invisible.
+    """
     os.environ["AGENTTRACE_DATA_DIR"] = str(data_dir)
+    harden_data_dir(data_dir)
     # Ensure the token exists before uvicorn binds so the API can verify clients.
     ApiTokenManager(data_dir).token()
 
     from agenttrace.api import app  # noqa: PLC0415 (import after env is set)
 
-    write_runtime(data_dir, port)
+    consecutive_failures = 0
+    attempt = 0
     try:
-        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info", access_log=False)
+        while True:
+            attempt += 1
+            write_runtime(data_dir, port)
+            try:
+                uvicorn.run(app, host="127.0.0.1", port=port, log_level="info", access_log=False)
+                # Clean shutdown (SIGTERM / Ctrl+C): leave without restarting.
+                break
+            except KeyboardInterrupt:
+                break
+            except Exception as exc:  # noqa: BLE001 — the watchdog owns recovery
+                consecutive_failures += 1
+                if consecutive_failures >= _WATCHDOG_MAX_CONSECUTIVE_FAILURES:
+                    logger.error(
+                        "Daemon server failed %d times consecutively; giving up: %s",
+                        consecutive_failures,
+                        exc,
+                    )
+                    raise
+                delay = min(
+                    _WATCHDOG_BACKOFF_BASE_SECONDS * (2 ** (consecutive_failures - 1)),
+                    _WATCHDOG_BACKOFF_MAX_SECONDS,
+                )
+                logger.warning(
+                    "Daemon server crashed (attempt %d, consecutive %d); restarting in %.1fs: %s",
+                    attempt,
+                    consecutive_failures,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
     finally:
         clear_runtime(data_dir)
 

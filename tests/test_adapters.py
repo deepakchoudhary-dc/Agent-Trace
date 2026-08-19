@@ -6,7 +6,7 @@ show is essential to understanding why an agent acted.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -236,6 +236,27 @@ class TestClaudeAdapter:
         assert invocations[0].timestamp == datetime.fromisoformat(vendor_ts)
 
     @pytest.mark.asyncio
+    async def test_naive_vendor_timestamp_clamped_to_utc(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        projects = tmp_path / "projects" / "-Users-me-app"
+        projects.mkdir(parents=True)
+        transcript = projects / "session-1.jsonl"
+        transcript.write_text(json.dumps({
+            "type": "user", "uuid": "u1", "cwd": str(workspace),
+            "sessionId": "s1", "version": "2.1.0",
+            "timestamp": "2026-08-16T10:30:00",
+            "message": {"role": "user", "content": "deploy now"},
+        }) + "\n", encoding="utf-8")
+
+        adapter = ClaudeAdapter(uuid4(), str(workspace), projects_dir=projects)
+        await adapter.start()
+        events = await adapter.poll()
+        invocations = [e for e in events if isinstance(e, InvocationEvent)]
+        assert len(invocations) == 1
+        assert invocations[0].timestamp.utcoffset() == timedelta(0)
+
+    @pytest.mark.asyncio
     async def test_rewind_reparses_truncated_tail_line(self, tmp_path: Path) -> None:
         """A tail line cut mid-write is rewound and parsed once it completes."""
         workspace = tmp_path / "ws"
@@ -450,6 +471,56 @@ class TestCodexAdapter:
         assert [c.command for c in commands] == ["git commit -m part"]
         assert await adapter.poll() == []
 
+    @pytest.mark.asyncio
+    async def test_rollback_rewinds_positions(self, tmp_path: Path) -> None:
+        """A failed ingest batch rewinds offsets so lines are re-reported."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        rollout = sessions / "rollout-1.jsonl"
+        rollout.write_text(
+            json.dumps({
+                "payload": {"type": "user_message", "message": "do it"},
+            }),
+            encoding="utf-8",
+        )
+
+        adapter = CodexAdapter(uuid4(), str(workspace), sessions_dir=sessions)
+        await adapter.start()
+        pre_poll = adapter.cursor_state()
+        assert len(await adapter.poll()) == 1
+
+        adapter.rollback_cursor()
+        assert adapter.cursor_state() == pre_poll
+        assert len(await adapter.poll()) == 1
+
+        adapter.commit_cursor()
+        assert await adapter.poll() == []
+
+    @pytest.mark.asyncio
+    async def test_naive_vendor_timestamp_clamped_to_utc(self, tmp_path: Path) -> None:
+        """Naive vendor timestamps are UTC, never the host's local offset."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        rollout = sessions / "rollout-1.jsonl"
+        rollout.write_text(
+            json.dumps({
+                "timestamp": "2026-08-16T10:30:00",
+                "payload": {"type": "user_message", "message": "deploy now"},
+            }),
+            encoding="utf-8",
+        )
+
+        adapter = CodexAdapter(uuid4(), str(workspace), sessions_dir=sessions)
+        await adapter.start()
+        events = await adapter.poll()
+        invocations = [e for e in events if isinstance(e, InvocationEvent)]
+        assert len(invocations) == 1
+        assert invocations[0].timestamp.utcoffset() == timedelta(0)
+
 
 class TestCopilotAdapter:
     """Copilot logs: only strict JSON records with a real prompt are emitted."""
@@ -619,6 +690,7 @@ class TestUniversalAgentAdapter:
         adapter = UniversalAgentAdapter(uuid4(), str(workspace), watch_dirs=[cline])
         await adapter.start()
         assert len(await adapter.poll()) == 1
+        adapter.commit_cursor()
 
         cursor = adapter.cursor_state()
         assert cursor["seen_entries"]
@@ -634,3 +706,43 @@ class TestUniversalAgentAdapter:
         events = await resumed.poll()
         assert len(events) == 1
         assert events[0].payload.get("path") == str(session_file)
+
+    @pytest.mark.asyncio
+    async def test_rollback_reports_changes_again(self, tmp_path: Path) -> None:
+        """A failed ingest batch (no commit) must not lose the change."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        cline = workspace / ".cline"
+        cline.mkdir()
+        session_file = cline / "session-1.json"
+        session_file.write_text('{"messages": []}', encoding="utf-8")
+
+        adapter = UniversalAgentAdapter(uuid4(), str(workspace), watch_dirs=[cline])
+        await adapter.start()
+        assert len(await adapter.poll()) == 1
+
+        # Daemon failed to ingest → rollback → next poll re-reports the change.
+        adapter.rollback_cursor()
+        assert len(await adapter.poll()) == 1
+        # Committing persists the fingerprint and stops re-reporting.
+        adapter.commit_cursor()
+        assert await adapter.poll() == []
+        assert adapter.cursor_state()["seen_entries"]
+
+    @pytest.mark.asyncio
+    async def test_pending_entries_not_persisted_in_cursor(self, tmp_path: Path) -> None:
+        """Uncommitted staged fingerprints must not leak into the cursor."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        cline = workspace / ".cline"
+        cline.mkdir()
+        session_file = cline / "session-1.json"
+        session_file.write_text('{"messages": []}', encoding="utf-8")
+
+        adapter = UniversalAgentAdapter(uuid4(), str(workspace), watch_dirs=[cline])
+        await adapter.start()
+        assert len(await adapter.poll()) == 1
+        assert adapter.cursor_state()["seen_entries"] == []
+
+        adapter.commit_cursor()
+        assert len(adapter.cursor_state()["seen_entries"]) == 1

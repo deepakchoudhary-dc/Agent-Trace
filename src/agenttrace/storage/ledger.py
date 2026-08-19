@@ -1099,8 +1099,14 @@ class EventLedger:
         iterations: int,
         payload_json: str,
     ) -> None:
-        """Persist a review loop result (encrypted, redacted payload)."""
-        payload = self._encryption.encrypt_str(payload_json)
+        """Persist a review loop result (encrypted, redacted at the boundary).
+
+        The payload is scrubbed by the write-boundary redactor BEFORE
+        encryption, so no caller can bypass sanitization by passing raw
+        review evidence (agent reasoning, tool output) directly.
+        """
+        redacted_payload = SecretRedactor().redact(payload_json)
+        payload = self._encryption.encrypt_str(redacted_payload)
         self._conn.execute(
             """INSERT OR REPLACE INTO review_runs
                (loop_id, session_id, passed, iterations, payload_enc, created_at)

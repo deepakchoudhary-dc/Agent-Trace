@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -19,6 +20,7 @@ from agenttrace.adapters.codex import CodexAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.baseline import BaselineGenerator
+from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.graph.task_boundary import TaskBoundaryEngine
@@ -26,13 +28,16 @@ from agenttrace.models.events import (
     ApprovalEvent,
     CommandEvent,
     ConfidenceLevel,
+    ContextBoundaryEvent,
     EventBase,
     EventType,
     FileMutationEvent,
     GitEvent,
+    IncidentEvent,
     InvocationEvent,
     NetworkEvent,
     PolicyFindingEvent,
+    ProcessEvent,
     ToolRequestEvent,
     ToolResultEvent,
 )
@@ -46,6 +51,7 @@ from agenttrace.models.session import (
 from agenttrace.models.task_contract import RiskLevel, ScopeDriftResult, TaskContract
 from agenttrace.observers.filesystem import FilesystemObserver
 from agenttrace.observers.git_monitor import GitMonitor
+from agenttrace.observers.kernel import KernelObserver
 from agenttrace.observers.network import NetworkObserver
 from agenttrace.observers.process_tree import ProcessTreeObserver
 from agenttrace.observers.terminal import TerminalObserver
@@ -65,6 +71,14 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_DATA_DIR = Path.home() / ".agenttrace"
+
+# Anti-forensic flood guard window/threshold (events per window)
+_FLOOD_WINDOW_SECONDS = 5.0
+_FLOOD_EVENT_THRESHOLD = 500
+
+# Clock-jump tolerance and finding cooldown (seconds)
+_CLOCK_JUMP_TOLERANCE_SECONDS = 300.0
+_CLOCK_FINDING_COOLDOWN_SECONDS = 300.0
 
 # Shell-capable tool names whose tool requests may legitimately explain a
 # CommandEvent (used for explicit command↔tool-request correlation).
@@ -125,6 +139,17 @@ class AgentTraceDaemon:
         # Most-recent node index per (session, node_type, actor) for causal
         # correlation: links events to the *latest* cause, not the first match
         self._latest: dict[tuple[UUID, NodeType, str], UUID] = {}
+
+        # Cross-session collusion correlation (R3) — pull-based engine over the
+        # ledger, scanned on a throttle so ingest stays O(1) per event.
+        self._collusion = CollusionCorrelationEngine(self._ledger)
+        self._collusion_cache: dict[tuple[str, str, tuple[str, ...]], CollusionCandidate] = {}
+        self._collusion_last_scan: dict[UUID, float] = {}
+
+        # Anti-forensic flood guard: (start_monotonic, count, flagged)
+        self._flood_state: dict[UUID, tuple[float, int, bool]] = {}
+        # Clock-jump finding cooldown per session
+        self._clock_findings: dict[UUID, float] = {}
 
         self._running = False
 
@@ -221,6 +246,7 @@ class AgentTraceDaemon:
                     # Reconstruct ContextGraph from persisted nodes and edges
                     graph = ContextGraph(sid)
                     nodes_data = self._ledger.get_graph_nodes(sid)
+                    skipped_nodes = 0
                     for n in nodes_data:
                         try:
                             node = GraphNode(
@@ -237,9 +263,11 @@ class AgentTraceDaemon:
                             )
                             graph.add_node(node)
                         except Exception:
+                            skipped_nodes += 1
                             continue
 
                     edges_data = self._ledger.get_graph_edges(sid)
+                    skipped_edges = 0
                     for e in edges_data:
                         try:
                             edge = GraphEdge(
@@ -255,9 +283,49 @@ class AgentTraceDaemon:
                             )
                             graph.add_edge(edge)
                         except Exception:
+                            skipped_edges += 1
                             continue
 
                     self._graphs[sid] = graph
+
+                    # R9/N14: a skipped row is a silent integrity loss — surface
+                    # it as a ledger-backed finding instead of swallowing it.
+                    if skipped_nodes or skipped_edges:
+                        integrity_event = PolicyFindingEvent(
+                            session_id=sid,
+                            actor_id="daemon",
+                            source_adapter="daemon_restore",
+                            confidence=ConfidenceLevel.HIGH,
+                            finding_type="restore_integrity",
+                            severity="low",
+                            description=(
+                                f"{skipped_nodes} graph node(s) and {skipped_edges} "
+                                "edge(s) could not be restored from the ledger "
+                                "(corrupt or unknown row format). Graph history "
+                                "is incomplete for this session."
+                            ),
+                        )
+                        try:
+                            self._ledger.append_event(integrity_event)
+                        except Exception:
+                            logger.warning(
+                                "Could not record restore-integrity finding",
+                                exc_info=True,
+                            )
+
+                    # R7: seed incident correlation with the persisted window so
+                    # a restart does not forget pre-restart evidence (a finding
+                    # seconds before shutdown must still pair with post-restart
+                    # egress).
+                    try:
+                        self._incidents[sid].seed_events(
+                            self._ledger.query_events(sid, limit=None)
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not seed incident correlation state",
+                            exc_info=True,
+                        )
 
                     # Zombie sessions: a restored ACTIVE session has live
                     # state but nothing observing it. Resume observers and
@@ -457,13 +525,16 @@ class AgentTraceDaemon:
         logger.info("Supervised adapter polling started for session: %s", session_id)
         while self._running and session_id in self._sessions:
             try:
+                pre_cursor = adapter.cursor_state()
                 events = await adapter.poll()
                 for event in events:
-                    if adapter.validate_event(event):
+                    if adapter.validate_event(event) and self._event_in_workspace(
+                        session_id, adapter, event
+                    ):
                         await self.ingest_event(event)
-                # Persist the cursor after each batch so a restart resumes at
-                # this point (crash windows duplicates at most the in-flight
-                # batch rather than the whole source).
+                # Confirm the batch only after everything ingested cleanly;
+                # on failure the adapter rewinds so nothing is silently lost.
+                adapter.commit_cursor()
                 self._ledger.save_adapter_cursor(
                     session_id, adapter.adapter_name, adapter.cursor_state()
                 )
@@ -471,8 +542,71 @@ class AgentTraceDaemon:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                adapter.rollback_cursor()
+                self._ledger.save_adapter_cursor(
+                    session_id, adapter.adapter_name, pre_cursor
+                )
                 logger.warning("Adapter polling error in session %s: %s", session_id, e)
                 await asyncio.sleep(3.0)
+
+    def _workspace_path(self, session_id: UUID) -> str:
+        session = self._sessions.get(session_id)
+        if session is not None:
+            return str(session.config.workspace_path)
+        return ""
+
+    @staticmethod
+    def _path_within(candidate: Path, workspace: Path) -> bool:
+        """Segment-exact containment: ``C:\\proj`` must NOT contain ``C:\\proj2``."""
+        try:
+            resolved = candidate.resolve()
+        except (OSError, ValueError):
+            return False
+        return resolved == workspace or resolved.is_relative_to(workspace)
+
+    def _event_in_workspace(
+        self, session_id: UUID, adapter: AdapterBase, event: EventBase
+    ) -> bool:
+        """Ensure adapter-reported paths anchor inside the workspace.
+
+        Vendors may emit absolute paths anywhere on the host; anything outside
+        the session workspace is surfaced as a low-confidence boundary anomaly
+        rather than silently accepted or silently dropped. Unknown sessions
+        have no verifiable boundary and are rejected.
+        """
+        workspace_raw = self._workspace_path(session_id)
+        if not workspace_raw:
+            logger.warning(
+                "Adapter %s event for unknown session %s rejected",
+                adapter.adapter_name,
+                session_id,
+            )
+            return False
+        workspace = Path(workspace_raw).resolve()
+        anchors: list[str] = []
+        if isinstance(event, FileMutationEvent) and event.file_path:
+            anchors.append(event.file_path)
+        if isinstance(event, (CommandEvent, ProcessEvent)) and event.working_dir:
+            anchors.append(event.working_dir)
+        if isinstance(event, ContextBoundaryEvent):
+            anchors.extend(f for f in event.files_visible if f)
+        if not anchors:
+            return True
+        try:
+            outside = [p for p in anchors if not self._path_within(Path(p), workspace)]
+        except (OSError, ValueError):
+            logger.debug(
+                "Adapter event path unparseable for session %s: %r", session_id, anchors
+            )
+            return False
+        if outside:
+            logger.warning(
+                "Adapter %s reported paths outside session workspace: %s",
+                adapter.adapter_name,
+                outside,
+            )
+            return False
+        return True
 
     async def stop_session(self, session_id: UUID) -> None:
         """Stop an active session."""
@@ -522,14 +656,21 @@ class AgentTraceDaemon:
 
     async def ingest_event(self, event: EventBase, raw_payload: bytes | None = None) -> str:
         """Process event: Redact → Encrypt → Hash-Chain → Store → Graph Projection → Policy."""
-        # 1. Store Large Blobs
+        # 0. Anti-forensic guards (bounded work before append; the ledger
+        #    always keeps full integrity even when projection is degraded).
+        flooded = self._check_event_flood(event)
+        self._check_clock_jump(event)
+
+        # 1. Store Large Blobs — every byte that reaches the blob store passes
+        #    through the write-boundary redactor first (invariant #6).
         if raw_payload:
-            blob_hash = self._blob_store.store_blob(raw_payload)
+            redacted_payload = self._redactor.redact_bytes(raw_payload)
+            blob_hash = self._blob_store.store_blob(redacted_payload)
             self._ledger.store_blob_index(
                 blob_hash=blob_hash,
                 session_id=event.session_id,
                 file_path=str(self._blob_store.path_for(blob_hash)),
-                size_bytes=len(raw_payload),
+                size_bytes=len(redacted_payload),
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
             event.evidence_refs.append(f"blob:{blob_hash}")
@@ -537,8 +678,17 @@ class AgentTraceDaemon:
         # 2. Append to cryptographic event ledger
         event_hash = self._ledger.append_event(event)
 
-        # 3-6. Graph projection, boundary/policy evaluation, session state
-        await self.project_event(event)
+        # 3-6. Graph projection, boundary/policy evaluation, session state.
+        #    Under an active flood the append still lands (integrity) but the
+        #    expensive projection is skipped so the flood cannot DoS the
+        #    pipeline; the ledger remains replayable.
+        if flooded:
+            session = self._sessions.get(event.session_id)
+            if session:
+                session.event_count += 1
+                session.last_event_hash = event_hash
+        else:
+            await self.project_event(event)
 
         return event_hash
 
@@ -598,6 +748,11 @@ class AgentTraceDaemon:
             for incident in incident_engine.observe(event):
                 await self.ingest_event(incident)
 
+        # R2: response ladder — any critical incident reaching the pipeline
+        # (created live, restored, or injected) freezes the session.
+        if isinstance(event, IncidentEvent) and event.severity == "critical":
+            await self._apply_incident_response(event)
+
         # 5c. Threat-detection rule engine — host-observable attack patterns
         detector_engine = self._detectors.get(event.session_id)
         if detector_engine and not isinstance(event, PolicyFindingEvent):
@@ -609,6 +764,10 @@ class AgentTraceDaemon:
         #     re-flag it as "new".
         if isinstance(event, ApprovalEvent) and event.approved:
             await self._learn_approved_egress(event)
+
+        # 5e. Cross-session collusion scan (throttled — the engine is
+        #     pull-based over the ledger, so per-event cost must stay O(1)).
+        await self._scan_collusion(event.session_id)
 
         # 6. Update Session In-Memory Status
         session = self._sessions.get(event.session_id)
@@ -631,6 +790,174 @@ class AgentTraceDaemon:
                 policy.add_known_destination(destination)
                 self._ledger.add_destination_baseline(workspace_path, destination)
             return
+
+    async def _apply_incident_response(self, incident: IncidentEvent) -> None:
+        """Response ladder (R2): critical incidents freeze the session.
+
+        Freezing stops further observation, revokes every pending approval
+        (no pre-incident consent survives the incident), and records an
+        audited containment finding. The ledger keeps its integrity —
+        nothing is deleted or rewritten.
+        """
+        sid = incident.session_id
+        session = self._sessions.get(sid)
+        if not session or session.status != SessionStatus.ACTIVE:
+            return
+
+        session.status = SessionStatus.PAUSED
+        try:
+            self._ledger.update_session_status(session_id=sid, status=session.status.value)
+        except Exception:
+            logger.warning("Could not persist frozen session status", exc_info=True)
+
+        revoked = 0
+        approvals = self._approvals.get(sid)
+        if approvals:
+            for approval in approvals.get_active_approvals():
+                try:
+                    if approvals.revoke_approval(approval.finding_id):
+                        revoked += 1
+                except Exception:
+                    logger.warning("Could not revoke approval %s", approval.finding_id)
+
+        for observer in self._observers.get(sid, []):
+            try:
+                await observer.stop()
+            except Exception:
+                logger.warning("Could not stop observer during containment", exc_info=True)
+
+        containment = PolicyFindingEvent(
+            session_id=sid,
+            actor_id="daemon",
+            source_adapter="incident_response",
+            confidence=ConfidenceLevel.HIGH,
+            finding_type="session_frozen",
+            severity="high",
+            description=(
+                f"Critical {incident.incident_type} incident ({incident.title}) — "
+                f"session frozen, observation stopped, {revoked} approval(s) revoked."
+            ),
+            evidence_refs=[str(incident.event_id)],
+        )
+        try:
+            self._ledger.append_event(containment)
+        except Exception:
+            logger.warning("Could not record containment finding", exc_info=True)
+
+    async def _scan_collusion(self, session_id: UUID) -> None:
+        """Cross-session collusion scan (R3), throttled to every 5s per session.
+
+        Newly detected candidates are surfaced as ledger-backed findings so
+        the signal is auditable, not just visible in a dashboard pull.
+        """
+        now = time.monotonic()
+        last = self._collusion_last_scan.get(session_id)
+        if last is not None and now - last < 5.0:
+            return
+        self._collusion_last_scan[session_id] = now
+        try:
+            for candidate in self._collusion.for_session(session_id):
+                key = (
+                    candidate.signal,
+                    candidate.detail,
+                    tuple(sorted(candidate.session_ids)),
+                )
+                if key in self._collusion_cache:
+                    continue
+                self._collusion_cache[key] = candidate
+                # Surface the signal in EVERY session it implicates, so the
+                # finding is visible from either side of the correlation.
+                for implicated in candidate.session_ids:
+                    finding = PolicyFindingEvent(
+                        session_id=UUID(implicated),
+                        actor_id="collusion_engine",
+                        source_adapter="collusion_engine",
+                        confidence=candidate.confidence,
+                        finding_type=f"collusion:{candidate.signal}",
+                        severity="medium",
+                        description=(
+                            f"{candidate.signal}: {candidate.detail} — "
+                            f"sessions {', '.join(candidate.session_ids)}. "
+                            f"{candidate.reasoning_gap}"
+                        ),
+                        evidence_refs=candidate.evidence_event_ids,
+                    )
+                    try:
+                        self._ledger.append_event(finding)
+                    except Exception:
+                        logger.warning(
+                            "Could not record collusion finding", exc_info=True
+                        )
+        except Exception:
+            logger.warning("Collusion scan failed", exc_info=True)
+
+    def _check_event_flood(self, event: EventBase) -> bool:
+        """Return True while a session is under an event flood (anti-forensic).
+
+        Flags once per episode with a ledger-backed finding; the ledger keeps
+        appending (integrity) but projection is skipped until the rate drops.
+        """
+        if isinstance(event, PolicyFindingEvent) and event.finding_type == "event_flood":
+            return False
+        now = time.monotonic()
+        start, count, flagged = self._flood_state.get(event.session_id, (now, 0, False))
+        if now - start > _FLOOD_WINDOW_SECONDS:
+            self._flood_state[event.session_id] = (now, 1, False)
+            return False
+        count += 1
+        if count >= _FLOOD_EVENT_THRESHOLD and not flagged:
+            self._flood_state[event.session_id] = (start, count, True)
+            finding = PolicyFindingEvent(
+                session_id=event.session_id,
+                actor_id="daemon",
+                source_adapter="daemon",
+                confidence=ConfidenceLevel.HIGH,
+                finding_type="event_flood",
+                severity="medium",
+                description=(
+                    f"More than {_FLOOD_EVENT_THRESHOLD} events in "
+                    f"{_FLOOD_WINDOW_SECONDS:.0f}s — a rate consistent with "
+                    "anti-forensic flooding. Projection is paused until the "
+                    "rate drops; the ledger continues appending."
+                ),
+                evidence_refs=[str(event.event_id)],
+            )
+            try:
+                self._ledger.append_event(finding)
+            except Exception:
+                logger.warning("Could not record flood finding", exc_info=True)
+            return True
+        self._flood_state[event.session_id] = (start, count, flagged)
+        return flagged
+
+    def _check_clock_jump(self, event: EventBase) -> None:
+        """Flag events whose timestamps deviate from wall clock (clock gaming)."""
+        delta = abs((datetime.now(timezone.utc) - event.timestamp).total_seconds())
+        if delta <= _CLOCK_JUMP_TOLERANCE_SECONDS:
+            return
+        last = self._clock_findings.get(event.session_id)
+        now = time.monotonic()
+        if last is not None and now - last < _CLOCK_FINDING_COOLDOWN_SECONDS:
+            return
+        self._clock_findings[event.session_id] = now
+        finding = PolicyFindingEvent(
+            session_id=event.session_id,
+            actor_id="daemon",
+            source_adapter="daemon",
+            confidence=ConfidenceLevel.MEDIUM,
+            finding_type="clock_anomaly",
+            severity="low",
+            description=(
+                f"Event timestamp {event.timestamp.isoformat()} deviates from "
+                f"wall clock by {delta:.0f}s — clock manipulation or skewed "
+                "capture timestamps."
+            ),
+            evidence_refs=[str(event.event_id)],
+        )
+        try:
+            self._ledger.append_event(finding)
+        except Exception:
+            logger.warning("Could not record clock-anomaly finding", exc_info=True)
 
     @staticmethod
     def _detector_finding(event: EventBase, finding: DetectorFinding) -> PolicyFindingEvent:
@@ -1156,6 +1483,10 @@ class AgentTraceDaemon:
                 track_global_history=session.config.track_global_shell_history,
             ),
             net_observer,
+            # Kernel-tier: ETW process audit where available; Job-Object and
+            # MXC containment are declared as honest gaps on hosts without
+            # those capabilities.
+            KernelObserver(session.session_id, workspace, callback),
         ]
 
         # Reconcile hash sources: seed the observer's hash cache from the

@@ -367,7 +367,7 @@ async def test_restart_resumes_active_session_observation(tmp_path: Path) -> Non
         agent_type=AgentType.GENERIC,
     )
     sid = session.session_id
-    assert len(daemon1._observers[sid]) == 5
+    assert len(daemon1._observers[sid]) == 6
     assert sid in daemon1._adapter_tasks
 
     # Simulate a crash: no stop_session, no cursor persistence — the session
@@ -384,7 +384,7 @@ async def test_restart_resumes_active_session_observation(tmp_path: Path) -> Non
         assert restored.status == SessionStatus.ACTIVE
 
         # Observation is resumed: observers, adapter, and poll task are live.
-        assert len(daemon2._observers[sid]) == 5
+        assert len(daemon2._observers[sid]) == 6
         assert daemon2._adapters[sid] is not None
         assert sid in daemon2._adapter_tasks
         assert not daemon2._adapter_tasks[sid].done()
@@ -679,3 +679,119 @@ async def test_shared_artifact_edge_links_cross_actor_file_touches(
         assert len({e["target_node_id"] for e in edges}) == 2
     finally:
         await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_adapter_workspace_boundary_enforced(tmp_path: Path) -> None:
+    """Adapter events anchoring outside the workspace are not ingested."""
+    from agenttrace.models.events import ContextBoundaryEvent, ProcessEvent
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sibling = tmp_path / "ws2"
+    sibling.mkdir()
+
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    try:
+        session = await daemon.create_session(
+            workspace_path=str(workspace),
+            task_description="Adapter boundary test",
+            agent_type=AgentType.GENERIC,
+        )
+        sid = session.session_id
+        adapter = daemon._select_adapter(session)
+
+        # Anchors inside the workspace pass...
+        assert daemon._event_in_workspace(
+            sid, adapter, FileMutationEvent(
+                session_id=sid,
+                actor_id="agent",
+                source_adapter="codex",
+                file_path=str(workspace / "src" / "app.py"),
+                mutation_type="modify",
+            )
+        )
+        assert daemon._event_in_workspace(
+            sid, adapter, ProcessEvent(
+                session_id=sid,
+                actor_id="agent",
+                source_adapter="codex",
+                pid=1,
+                command="python main.py",
+                working_dir=str(workspace),
+            )
+        )
+
+        # ...and events with no path anchors are never rejected.
+        assert daemon._event_in_workspace(
+            sid, adapter, InvocationEvent(
+                session_id=sid,
+                actor_id="agent",
+                source_adapter="codex",
+                user_intent="do something",
+            )
+        )
+
+        # Absolute paths outside the workspace are rejected, including
+        # segment-prefix siblings (C:\ws must not contain C:\ws2).
+        assert not daemon._event_in_workspace(
+            sid, adapter, FileMutationEvent(
+                session_id=sid,
+                actor_id="agent",
+                source_adapter="codex",
+                file_path=str(outside / "secret.db"),
+                mutation_type="modify",
+            )
+        )
+        assert not daemon._event_in_workspace(
+            sid, adapter, FileMutationEvent(
+                session_id=sid,
+                actor_id="agent",
+                source_adapter="codex",
+                file_path=str(sibling / "app.py"),
+                mutation_type="modify",
+            )
+        )
+        assert not daemon._event_in_workspace(
+            sid, adapter, ProcessEvent(
+                session_id=sid,
+                actor_id="agent",
+                source_adapter="codex",
+                pid=2,
+                command="curl evil.example",
+                working_dir=str(outside),
+            )
+        )
+        assert not daemon._event_in_workspace(
+            sid, adapter, ContextBoundaryEvent(
+                session_id=sid,
+                actor_id="agent",
+                source_adapter="codex",
+                files_visible=[str(outside / "keys.pem")],
+            )
+        )
+
+        # Unknown sessions never silently pass either.
+        assert not daemon._event_in_workspace(
+            uuid4(), adapter, FileMutationEvent(
+                session_id=uuid4(),
+                actor_id="agent",
+                source_adapter="codex",
+                file_path=str(workspace / "app.py"),
+                mutation_type="modify",
+            )
+        )
+    finally:
+        await daemon.stop()
+
+
+def test_path_within_is_segment_exact(tmp_path: Path) -> None:
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    assert AgentTraceDaemon._path_within(ws / "sub" / "file.py", ws)
+    assert AgentTraceDaemon._path_within(ws, ws)
+    assert not AgentTraceDaemon._path_within(tmp_path / "proj2", ws)
+    assert not AgentTraceDaemon._path_within(tmp_path / "proj_extra", ws)

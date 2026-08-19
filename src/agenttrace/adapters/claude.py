@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -51,14 +51,19 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_iso(value: Any) -> datetime | None:
-    """Parse a vendor ISO-8601 timestamp into an aware datetime."""
+    """Parse a vendor ISO-8601 timestamp into an aware datetime.
+
+    Naive vendor timestamps are clamped to UTC — the vendor's local clock
+    offset is unobservable, and assuming the host's current local offset
+    would silently skew replay ordering.
+    """
     if not isinstance(value, str):
         return None
     try:
         ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return ts if ts.tzinfo is not None else ts.replace(tzinfo=datetime.now().tzinfo)
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
 
 
 class ClaudeAdapter(AdapterBase):

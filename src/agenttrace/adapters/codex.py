@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -43,14 +43,19 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_iso(value: Any) -> datetime | None:
-    """Parse a vendor ISO-8601 timestamp into an aware datetime."""
+    """Parse a vendor ISO-8601 timestamp into an aware datetime.
+
+    Naive vendor timestamps are clamped to UTC — the vendor's local clock
+    offset is unobservable, and assuming the host's current local offset
+    would silently skew replay ordering.
+    """
     if not isinstance(value, str):
         return None
     try:
         ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return ts if ts.tzinfo is not None else ts.replace(tzinfo=datetime.now().tzinfo)
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
 
 
 # Tool names whose input is a shell command string
@@ -92,6 +97,8 @@ class CodexAdapter(AdapterBase):
         self._sessions_dir = sessions_dir or Path.home() / ".codex" / "sessions"
         self._positions: dict[str, int] = {}
         self._invoked: set[str] = set()
+        self._staged_positions: dict[str, int] | None = None
+        self._staged_invoked: set[str] | None = None
 
     @staticmethod
     def _is_shell_tool(name: str) -> bool:
@@ -112,6 +119,21 @@ class CodexAdapter(AdapterBase):
                 str(k): int(v) for k, v in positions.items()
             }
         self._invoked = set(state.get("invoked", []))
+
+    def commit_cursor(self) -> None:
+        """The ingest batch succeeded: staged cursor state becomes durable."""
+        self._staged_positions = None
+        self._staged_invoked = None
+
+    def rollback_cursor(self) -> None:
+        """A poll batch failed to ingest: rewind to the pre-batch snapshot so
+        every line is re-reported instead of permanently lost."""
+        if self._staged_positions is not None:
+            self._positions = self._staged_positions
+            self._staged_positions = None
+        if self._staged_invoked is not None:
+            self._invoked = self._staged_invoked
+            self._staged_invoked = None
 
     async def start(self) -> None:
         self._running = True
@@ -142,6 +164,9 @@ class CodexAdapter(AdapterBase):
         events: list[EventBase] = []
         if not self._running:
             return events
+
+        self._staged_positions = dict(self._positions)
+        self._staged_invoked = set(self._invoked)
 
         for rollout in self._rollouts():
             path_key = str(rollout)

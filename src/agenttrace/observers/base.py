@@ -44,6 +44,12 @@ class BaseObserver(ABC):
         self._callback = callback
         self._running = False
         self._task: asyncio.Task[None] | None = None
+        # Observability gaps: reasons this sensor cannot see parts of the
+        # environment (privilege denials, unsupported platform features).
+        # Surfaced in session responses so "we don't know" is explicit.
+        self.observability_gaps: list[str] = []
+        self._dropped_events = 0
+        self._last_callback_error: Exception | None = None
 
     @property
     def name(self) -> str:
@@ -54,6 +60,16 @@ class BaseObserver(ABC):
     def running(self) -> bool:
         """Whether the observer is currently active."""
         return self._running
+
+    @property
+    def dropped_events(self) -> int:
+        """Number of events lost because the callback rejected them."""
+        return self._dropped_events
+
+    def _record_gap(self, message: str) -> None:
+        """Record an observability gap (deduplicated) for surfacing."""
+        if message not in self.observability_gaps:
+            self.observability_gaps.append(message)
 
     async def start(self) -> None:
         """Start the observer. Safe to call multiple times."""
@@ -77,12 +93,23 @@ class BaseObserver(ABC):
         logger.info("%s stopped for session %s", self.name, self.session_id)
 
     async def emit(self, event: EventBase, payload: bytes | None = None) -> None:
-        """Emit an event through the registered callback."""
+        """Emit an event through the registered callback.
+
+        Callback failures are counted and recorded as a gap instead of being
+        swallowed silently: a dropping callback creates a blind spot that must
+        be visible in the session's observability report.
+        """
         try:
             result = self._callback(event, payload)
             if asyncio.iscoroutine(result):
                 await result
-        except Exception:
+        except Exception as exc:
+            self._dropped_events += 1
+            self._last_callback_error = exc
+            self._record_gap(
+                f"{self.name}: {self._dropped_events} event(s) dropped by callback "
+                f"({type(exc).__name__}: {exc})"
+            )
             logger.exception("Error in event callback for %s", self.name)
 
     @abstractmethod

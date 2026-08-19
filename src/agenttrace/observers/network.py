@@ -108,8 +108,14 @@ class NetworkObserver(BaseObserver):
 
         try:
             connections = psutil.net_connections(kind="inet")
-        except (psutil.AccessDenied, OSError):
-            logger.debug("Cannot access network connections (requires elevation)")
+        except (psutil.AccessDenied, OSError) as exc:
+            # Blind spot: without connection visibility the egress baseline
+            # cannot learn and unexpected_egress cannot fire. Record the gap
+            # so the session report states "network observation unavailable"
+            # instead of silently reporting zero egress.
+            self._record_gap(
+                f"Cannot access network connections ({type(exc).__name__}: {exc})"
+            )
             return
 
         for conn in connections:

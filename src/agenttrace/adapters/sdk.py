@@ -133,6 +133,25 @@ class AdapterBase(ABC):
         """Restore position state persisted by :meth:`cursor_state`."""
         return None
 
+    def commit_cursor(self) -> None:
+        """Confirm the last poll batch was fully ingested.
+
+        Adapters that stage cursor advancement during :meth:`poll` move it
+        into durable state here, so a failed ingest batch is re-reported
+        instead of silently lost.
+        """
+        return None
+
+    def rollback_cursor(self) -> None:
+        """Undo staged cursor advancement after a failed ingest batch.
+
+        The default is a no-op for adapters whose cursor is only persisted
+        after a successful batch (the daemon simply does not save it).
+        Adapters that advance in-memory state during poll must stage it and
+        roll back here.
+        """
+        return None
+
     def validate_event(self, event: EventBase) -> bool:
         """Validate that an event meets the SDK contract."""
         if not event.event_id:

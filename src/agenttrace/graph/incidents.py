@@ -345,6 +345,21 @@ class IncidentCorrelationEngine:
             approvals,
         )]
 
+    def seed_events(self, events: Sequence[EventBase]) -> None:
+        """Seed correlation state from persisted history (daemon restart).
+
+        Without this, a restart forgets the correlation window: a credential
+        finding recorded seconds before the restart could never combine with
+        the egress that follows it. Only events still inside the longest
+        window are seeded; incidents are never re-correlated.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=_GENERAL_WINDOW_SECONDS)
+        for event in events:
+            if isinstance(event, IncidentEvent):
+                continue
+            if event.timestamp >= cutoff:
+                self._recent.append(event)
+
     def reset(self) -> None:
         """Clear correlation state (e.g., on session restart)."""
         self._recent.clear()

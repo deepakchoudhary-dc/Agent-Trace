@@ -188,12 +188,22 @@ class ReviewRunRequest(BaseModel):
 @app.post("/sessions", response_model=CreateSessionResponse)
 async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
     """Create a new audit session."""
+    # N6: the wildcard default ("*") or an empty list defeats every
+    # "outside the workspace" check — SandboxEscapeDetector cannot reason
+    # about scope, and a literal "*" never matches a real path, producing a
+    # false-positive storm. Derive an explicit allowlist from the workspace
+    # path instead; explicit caller-provided paths are respected verbatim.
+    workspace_resolved = os.path.abspath(req.workspace_path)
+    if not req.allowed_paths or "*" in req.allowed_paths:
+        allowed_paths = [workspace_resolved]
+    else:
+        allowed_paths = req.allowed_paths
     try:
         session = await daemon.create_session(
             workspace_path=req.workspace_path,
             task_description=req.task_description,
             agent_type=AgentType(req.agent_type),
-            allowed_paths=req.allowed_paths,
+            allowed_paths=allowed_paths,
             prohibited_paths=req.prohibited_paths,
             expected_tests=req.expected_tests,
             allowed_tools=req.allowed_tools,
@@ -205,14 +215,16 @@ async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     adapter = daemon._adapters.get(session.session_id)
-    gaps = adapter.observability_gaps if adapter else []
+    gaps = list(adapter.observability_gaps) if adapter else []
+    for observer in daemon._observers.get(session.session_id, []):
+        gaps.extend(getattr(observer, "observability_gaps", []))
 
     return CreateSessionResponse(
         session_id=str(session.session_id),
         status=session.status.value if hasattr(session.status, "value") else str(session.status),
         workspace_path=session.config.workspace_path,
         adapter=adapter.adapter_name if adapter else "generic",
-        observability_gaps=gaps,
+        observability_gaps=sorted(set(gaps)),
     )
 
 
@@ -230,9 +242,26 @@ async def list_sessions() -> list[dict[str, Any]]:
             "last_event_hash": s.last_event_hash,
             "started_at": s.started_at.isoformat(),
             "stopped_at": s.stopped_at.isoformat() if s.stopped_at else None,
+            "observability_gaps": sorted(
+                set(
+                    list(getattr(s, "observability_gaps", []) or [])
+                    + _collect_session_gaps(s)
+                )
+            ),
         }
         for s in sessions
     ]
+
+
+def _collect_session_gaps(session: object) -> list[str]:
+    """Aggregate adapter + observer observability gaps for a session."""
+    gaps: list[str] = []
+    adapter = daemon._adapters.get(session.session_id)  # type: ignore[attr-defined]
+    if adapter:
+        gaps.extend(adapter.observability_gaps)
+    for observer in daemon._observers.get(session.session_id, []):  # type: ignore[attr-defined]
+        gaps.extend(getattr(observer, "observability_gaps", []))
+    return gaps
 
 
 @app.get("/sessions/{session_id}")
@@ -658,11 +687,16 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
             response_text = evt.payload.get("response_text") or ""
             excerpt = reasoning or response_text
             if excerpt:
+                # Excerpts leave the sealed store to be rendered in the
+                # dashboard/report — run them through the write-boundary
+                # redactor so no credential captured in agent reasoning is
+                # re-exposed outside the audit view.
+                redacted_excerpt = daemon._redactor.redact(str(excerpt))
                 reasoning_trail.append({
                     "event_id": str(evt.event_id),
                     "timestamp": evt.timestamp.isoformat(),
                     "kind": evt.payload.get("reasoning_kind", "thinking"),
-                    "excerpt": str(excerpt)[:500],
+                    "excerpt": redacted_excerpt[:500],
                 })
 
     manifest = {

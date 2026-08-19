@@ -74,6 +74,7 @@ class UniversalAgentAdapter(AdapterBase):
             watch_dirs if watch_dirs is not None else self._discover_agent_dirs()
         )
         self._seen_entries: set[str] = set()
+        self._pending_entries: set[str] = set()
 
     def _discover_agent_dirs(self) -> list[Path]:
         """Discover agent state dirs for tools WITHOUT a dedicated adapter.
@@ -104,6 +105,21 @@ class UniversalAgentAdapter(AdapterBase):
 
     def restore_cursor(self, state: dict[str, Any]) -> None:
         self._seen_entries = set(state.get("seen_entries", []))
+
+    def commit_cursor(self) -> None:
+        """Promote staged change fingerprints into the durable seen set.
+
+        Called by the daemon only after the whole poll batch ingested
+        successfully; a failed batch rolls back and re-reports the changes.
+        """
+        self._seen_entries.update(self._pending_entries)
+        self._pending_entries.clear()
+        if len(self._seen_entries) > _MAX_SEEN_ENTRIES:
+            self._seen_entries.clear()
+
+    def rollback_cursor(self) -> None:
+        """Discard staged fingerprints so the failed batch is re-reported."""
+        self._pending_entries.clear()
 
     async def start(self) -> None:
         self._running = True
@@ -146,11 +162,9 @@ class UniversalAgentAdapter(AdapterBase):
                         key = f"{log_file}:sha256:{digest}"
                     else:
                         key = f"{log_file}:{mtime}:{size}"
-                    if key in self._seen_entries:
+                    if key in self._seen_entries or key in self._pending_entries:
                         continue
-                    self._seen_entries.add(key)
-                    if len(self._seen_entries) > _MAX_SEEN_ENTRIES:
-                        self._seen_entries.clear()
+                    self._pending_entries.add(key)
 
                     events.append(ContextBoundaryEvent(
                         session_id=self.session_id,

@@ -1,0 +1,17 @@
+{
+  "name": "Orphaned commit with unobserved parent",
+  "workspace_paths": ["/workspace/app"],
+  "events": [
+    {
+      "event_type": "git",
+      "actor_id": "agent",
+      "source_adapter": "git_monitor",
+      "git_action": "commit",
+      "commit_hash": "9f8c7d6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e",
+      "parent_hash": "0000aaaabbbbccccddddeeeeffff000011112222",
+      "branch": "main",
+      "message": "imported history from backup"
+    }
+  ],
+  "expected_findings": ["orphaned_commit"]
+}

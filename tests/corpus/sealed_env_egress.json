@@ -1,0 +1,18 @@
+{
+  "name": "Sealed-environment egress",
+  "workspace_paths": ["/workspace/app"],
+  "internet_allowed": false,
+  "events": [
+    {
+      "event_type": "network",
+      "actor_id": "agent",
+      "source_adapter": "network_observer",
+      "destination_ip": "8.8.8.8",
+      "destination_port": 443,
+      "protocol": "tcp",
+      "direction": "outbound",
+      "http_method": "GET"
+    }
+  ],
+  "expected_findings": ["seal_violation", "network_egress"]
+}

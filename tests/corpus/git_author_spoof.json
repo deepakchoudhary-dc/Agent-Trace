@@ -1,0 +1,21 @@
+{
+  "name": "Git author identity spoofing",
+  "workspace_paths": ["/workspace/app"],
+  "events": [
+    {
+      "event_type": "command",
+      "actor_id": "agent",
+      "source_adapter": "shell_observer",
+      "command": "git -c user.name=admin -c user.email=admin@corp.example commit -m \"hotfix\"",
+      "working_dir": "/workspace/app"
+    },
+    {
+      "event_type": "command",
+      "actor_id": "agent",
+      "source_adapter": "shell_observer",
+      "command": "GIT_AUTHOR_NAME=admin GIT_AUTHOR_EMAIL=admin@corp.example git commit -m \"chore\"",
+      "working_dir": "/workspace/app"
+    }
+  ],
+  "expected_findings": ["git_author_spoof"]
+}
