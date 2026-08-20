@@ -249,40 +249,58 @@ class KernelObserver(BaseObserver):
         except ValueError:
             timestamp = datetime.now(timezone.utc)
 
-        pid_text = fields.get("pid", "")
-        if not pid_text.isdigit():
+        def _parse_int(val: str) -> int | None:
+            v = val.strip()
+            if not v:
+                return None
+            try:
+                if v.startswith(("0x", "0X")):
+                    return int(v, 16)
+                return int(v)
+            except ValueError:
+                return None
+
+        pid = _parse_int(fields.get("pid", ""))
+        if pid is None:
             return None
-        try:
-            pid = int(pid_text)
-        except ValueError:
-            pid = 0
+
+        ppid = _parse_int(fields.get("ppid", "")) or 0
+        cmdline = fields.get("command_line", "")
+        image = fields.get("image", "")
+
+        # Check if process is correlated to the workspace
+        norm_workspace = self.workspace_path.lower().replace("\\", "/")
+        is_workspace_correlated = (
+            norm_workspace in cmdline.lower().replace("\\", "/")
+            or norm_workspace in image.lower().replace("\\", "/")
+        )
+
+        confidence = ConfidenceLevel.HIGH if is_workspace_correlated else ConfidenceLevel.LOW
+        actor_id = f"etw:{pid}" if is_workspace_correlated else f"unattributed_etw:{pid}"
 
         if event_id == _EVENT_PROCESS_CREATED:
             return ProcessEvent(
                 session_id=self.session_id,
-                actor_id=f"etw:{pid}",
+                actor_id=actor_id,
                 source_adapter="kernel_etw",
-                confidence=ConfidenceLevel.HIGH,
+                confidence=confidence,
                 pid=pid,
-                ppid=int(fields["ppid"]) if fields.get("ppid", "").isdigit() else 0,
-                command_line=fields.get("command_line", ""),
+                ppid=ppid,
+                command_line=cmdline,
                 started_at=timestamp,
-                payload={"image": fields.get("image", "")},
+                payload={"image": image, "workspace_correlated": is_workspace_correlated},
             )
         if event_id == _EVENT_PROCESS_EXITED:
+            exit_code = _parse_int(fields.get("exit_code", ""))
             return ProcessEvent(
                 session_id=self.session_id,
-                actor_id=f"etw:{pid}",
+                actor_id=actor_id,
                 source_adapter="kernel_etw",
-                confidence=ConfidenceLevel.HIGH,
+                confidence=confidence,
                 pid=pid,
-                command_line=fields.get("command_line", ""),
+                command_line=cmdline,
                 ended_at=timestamp,
-                exit_code=(
-                    int(fields["exit_code"])
-                    if fields.get("exit_code", "").lstrip("-").isdigit()
-                    else None
-                ),
-                payload={"image": fields.get("image", "")},
+                exit_code=exit_code,
+                payload={"image": image, "workspace_correlated": is_workspace_correlated},
             )
         return None

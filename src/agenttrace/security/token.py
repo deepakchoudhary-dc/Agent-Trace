@@ -66,9 +66,12 @@ class ApiTokenManager:
 
     def is_expired(self) -> bool:
         """Whether the stored token has passed its expiry (fail closed)."""
+        if not self._path.exists():
+            return False
         expiry = self.token_expiry()
         if expiry is None:
-            return False
+            # Missing or corrupt companion expiry file fails closed (P1.3)
+            return True
         return datetime.datetime.now(datetime.timezone.utc) >= expiry
 
     def _create(self) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from uuid import uuid4
 
@@ -25,27 +24,37 @@ def test_job_object_initialization() -> None:
 
 
 def test_job_object_pid_assignment_and_query() -> None:
-    """Current process can be assigned to the Job Object."""
+    """A target child process can be assigned to the Job Object."""
+    import subprocess
+
     sid = uuid4()
     job = WindowsJobObject(sid, kill_on_close=False)
-    current_pid = os.getpid()
 
-    # Assign current process
-    assigned = job.assign_pid(current_pid)
-    pids = job.get_pids()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        target_pid = proc.pid
+        assigned = job.assign_pid(target_pid)
+        pids = job.get_pids()
 
-    if sys.platform == "win32" and job.is_active:
-        assert assigned is True
-        assert current_pid in pids
-    else:
-        assert current_pid in pids
-    job.close()
+        if sys.platform == "win32" and job.is_active:
+            assert assigned is True
+            assert target_pid in pids
+        else:
+            assert target_pid in pids
+    finally:
+        job.close()
+        proc.kill()
+        proc.wait()
 
 
 def test_job_object_fallback_on_mock() -> None:
     """Job Object behaves safely when inactive."""
     sid = uuid4()
-    job = WindowsJobObject(sid)
+    job = WindowsJobObject(sid, kill_on_close=False)
     job._is_windows = False
     job._handle = None
 

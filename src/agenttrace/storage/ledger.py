@@ -1007,6 +1007,16 @@ class EventLedger:
         self._conn.commit()
 
     @_locked
+    def revoke_approval(self, session_id: UUID, finding_id: str) -> None:
+        """Mark an approval record as revoked in the database."""
+        self._conn.execute(
+            """UPDATE approvals SET status = 'revoked', approved = 0
+               WHERE session_id = ? AND finding_id = ?""",
+            (str(session_id), finding_id),
+        )
+        self._conn.commit()
+
+    @_locked
     def get_approvals(self, session_id: UUID) -> list[dict[str, Any]]:
         """Retrieve approvals for a session with decrypted reasons."""
         rows = self._conn.execute(

@@ -319,9 +319,15 @@ class ApprovalManager:
         return list(self._active_approvals.values())
 
     def revoke_approval(self, finding_id: str) -> bool:
-        """Revoke an existing approval."""
+        """Revoke an existing approval and persist revocation to ledger."""
+        revoked = False
         if finding_id in self._active_approvals:
             del self._active_approvals[finding_id]
+            revoked = True
+
+        if hasattr(self._ledger, "revoke_approval"):
+            self._ledger.revoke_approval(self.session_id, finding_id)
+
+        if revoked:
             logger.info("Approval revoked: %s", finding_id)
-            return True
-        return False
+        return revoked

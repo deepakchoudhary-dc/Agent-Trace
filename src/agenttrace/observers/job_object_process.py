@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_QUERY_INFORMATION = 0x0400
@@ -111,12 +110,11 @@ class WindowsJobObject:
 
             self._handle = handle
 
-            # Configure extended limits
+            # Configure extended limits (strict containment: breakaway disabled)
             info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
             flags = 0
             if self._kill_on_close:
                 flags |= _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            flags |= _JOB_OBJECT_LIMIT_BREAKAWAY_OK
 
             info.BasicLimitInformation.LimitFlags = flags
 

@@ -17,9 +17,42 @@ import {
   VerificationResult,
 } from '../types';
 
-const API_BASE = 'http://127.0.0.1:8765';
+const DEFAULT_API_BASE = 'http://127.0.0.1:8765';
 
-class ApiError extends Error {
+export function getApiBase(): string {
+  if (typeof window !== 'undefined') {
+    const custom = (window as unknown as { __AGENTTRACE_API_URL__?: string }).__AGENTTRACE_API_URL__;
+    if (custom) return custom;
+    const stored = localStorage.getItem('agenttrace_api_url');
+    if (stored) return stored;
+  }
+  return DEFAULT_API_BASE;
+}
+
+export function setApiBase(url: string): void {
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('agenttrace_api_url', url);
+  }
+}
+
+export function getApiToken(): string | null {
+  if (typeof window !== 'undefined') {
+    const custom = (window as unknown as { __AGENTTRACE_TOKEN__?: string }).__AGENTTRACE_TOKEN__;
+    if (custom) return custom;
+    const stored = sessionStorage.getItem('agenttrace_token') || localStorage.getItem('agenttrace_token');
+    if (stored) return stored;
+  }
+  return null;
+}
+
+export function setApiToken(token: string): void {
+  if (typeof window !== 'undefined') {
+    sessionStorage.setItem('agenttrace_token', token);
+    localStorage.setItem('agenttrace_token', token);
+  }
+}
+
+export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
     this.name = 'ApiError';
@@ -27,14 +60,20 @@ class ApiError extends Error {
 }
 
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
-  const url = `${API_BASE}${endpoint}`;
+  const apiBase = getApiBase();
+  const token = getApiToken();
+  const url = `${apiBase}${endpoint}`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(token ? { 'X-AgentTrace-Token': token } : {}),
+    ...(options?.headers as Record<string, string>),
+  };
+
   try {
     const res = await fetch(url, {
       ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options?.headers,
-      },
+      headers,
     });
 
     if (!res.ok) {
@@ -48,7 +87,7 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
       throw err;
     }
     throw new Error(
-      `AgentTrace daemon unreachable at ${API_BASE}. Ensure daemon is running.`,
+      `AgentTrace daemon unreachable at ${apiBase}. Ensure daemon is running.`,
       { cause: err }
     );
   }

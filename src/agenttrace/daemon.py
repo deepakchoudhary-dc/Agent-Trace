@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from uuid import UUID, uuid4
 
 from agenttrace.adapters.claude import ClaudeAdapter
 from agenttrace.adapters.codex import CodexAdapter
+from agenttrace.adapters.composite import CompositeAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.baseline import BaselineGenerator
@@ -158,12 +160,16 @@ class AgentTraceDaemon:
 
     async def start(self) -> None:
         """Start the daemon and restore historical sessions from storage."""
+        if self._running:
+            return
         self._running = True
         await self._restore_from_storage()
         logger.info("AgentTrace daemon started, data_dir=%s", self._data_dir)
 
     async def stop(self) -> None:
         """Stop the daemon, cancel tasks, and clean up active sessions."""
+        if not self._running:
+            return
         self._running = False
 
         # Cancel adapter polling tasks
@@ -841,15 +847,23 @@ class AgentTraceDaemon:
                 except Exception:
                     logger.warning("Could not revoke approval %s", approval.finding_id)
 
-        # Terminate active child processes associated with session via Job Object and psutil
+        # Terminate active child processes associated with session via Job Object and psutil (P1.19)
         terminated_pids = 0
+        current_pid = os.getpid()
+        parent_pid = os.getppid()
+
         job = self._job_objects.get(sid)
         if job and job.is_active:
             job.terminate()
 
         for observer in self._observers.get(sid, []):
             if isinstance(observer, ProcessTreeObserver):
-                for pid in list(observer._tracked_pids.keys()):
+                for pid, pinfo in list(observer._tracked_pids.items()):
+                    if pid in (current_pid, parent_pid):
+                        continue
+                    # P1.19: Only terminate proven contained descendants automatically
+                    if isinstance(pinfo, dict) and not pinfo.get("contained_descendant", False):
+                        continue
                     try:
                         import psutil  # type: ignore[import-untyped]
                         p = psutil.Process(pid)
@@ -863,6 +877,15 @@ class AgentTraceDaemon:
                 await observer.stop()
             except Exception:
                 logger.warning("Could not stop observer during containment", exc_info=True)
+
+        # Cancel adapter polling tasks and stop adapter
+        poll_task = self._adapter_tasks.pop(sid, None)
+        if poll_task:
+            poll_task.cancel()
+        adapter = self._adapters.pop(sid, None)
+        if adapter:
+            with contextlib.suppress(Exception):
+                await adapter.stop()
 
         containment = PolicyFindingEvent(
             session_id=sid,
@@ -1592,7 +1615,9 @@ class AgentTraceDaemon:
             return CopilotAdapter(session.session_id, workspace)
         elif agent_type == AgentType.CLAUDE:
             return ClaudeAdapter(session.session_id, workspace)
-        return UniversalAgentAdapter(session.session_id, workspace)
+        elif agent_type == AgentType.GENERIC:
+            return UniversalAgentAdapter(session.session_id, workspace)
+        return CompositeAdapter(session.session_id, workspace)
 
     # -- Queries --
 

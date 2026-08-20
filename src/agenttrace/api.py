@@ -37,14 +37,7 @@ from agenttrace.security.token import ApiTokenManager
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="AgentTrace API",
-    description="Local daemon API for the AgentTrace causal auditor",
-    version="0.2.0",
-)
-
 daemon = AgentTraceDaemon(os.environ.get("AGENTTRACE_DATA_DIR"))
-
 token_manager = ApiTokenManager(daemon._data_dir)
 
 
@@ -56,6 +49,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await daemon.stop()
+
+
+app = FastAPI(
+    title="AgentTrace API",
+    description="Local daemon API for the AgentTrace causal auditor",
+    version="0.3.0",
+    lifespan=lifespan,
+)
 
 # Bind CORS to local loopback UI development servers only
 app.add_middleware(

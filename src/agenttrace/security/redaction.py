@@ -96,6 +96,11 @@ _SENSITIVE_KEY_NAMES = frozenset({
     "sessiontoken",
 })
 
+_ZERO_WIDTH_CHARS = frozenset({
+    "\u200b", "\u200c", "\u200d", "\ufeff", "\u00ad",
+    "\u200e", "\u200f", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+})
+
 
 @dataclass
 class RedactionRecord:
@@ -140,6 +145,24 @@ class SecretRedactor:
         for pattern_name, pattern in _SECRET_PATTERNS:
             for match in pattern.finditer(text):
                 spans.append((match.start(), match.end(), pattern_name))
+
+        # 1b. Defeat zero-width Unicode obfuscation (P1.14)
+        clean_chars: list[str] = []
+        orig_indices: list[int] = []
+        for i, ch in enumerate(text):
+            if ch not in _ZERO_WIDTH_CHARS:
+                clean_chars.append(ch)
+                orig_indices.append(i)
+        clean_text = "".join(clean_chars)
+
+        if len(clean_text) != len(text):
+            for pattern_name, pattern in _SECRET_PATTERNS:
+                for match in pattern.finditer(clean_text):
+                    c_start, c_end = match.start(), match.end()
+                    if c_start < len(orig_indices) and c_end <= len(orig_indices):
+                        spans.append(
+                            (orig_indices[c_start], orig_indices[c_end - 1] + 1, pattern_name)
+                        )
 
         # 2. High-entropy credential tokens (entropy test on the write path)
         for token_match in re.finditer(r"\S+", text):
@@ -201,9 +224,13 @@ class SecretRedactor:
         """
         try:
             text = data.decode("utf-8")
+            return self.redact(text).encode("utf-8")
         except UnicodeDecodeError:
-            return data
-        return self.redact(text).encode("utf-8")
+            # Fail closed (P0.11): replace non-decodable binary payload with safe digest metadata
+            import hashlib
+            digest = hashlib.sha256(data).hexdigest()
+            meta = f"[REDACTED BINARY EVIDENCE: SHA256={digest}, size={len(data)}B]"
+            return meta.encode("utf-8")
 
     def redact_any(self, value: Any) -> Any:
         """Recursively redact secrets across arbitrary nested Python data structures."""

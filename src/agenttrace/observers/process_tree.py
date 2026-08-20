@@ -225,17 +225,26 @@ class ProcessTreeObserver(BaseObserver):
                 started_at = datetime.now(timezone.utc)
                 if isinstance(create_time, (int, float)) and create_time > 0:
                     started_at = datetime.fromtimestamp(create_time, tz=timezone.utc)
+
+                proc_confidence = (
+                    ConfidenceLevel.HIGH if is_descendant else ConfidenceLevel.MEDIUM
+                )
+
                 event = ProcessEvent(
                     session_id=self.session_id,
                     actor_id=actor_id,
                     source_adapter="process_tree_observer",
-                    confidence=ConfidenceLevel.HIGH,
+                    confidence=proc_confidence,
                     pid=pid,
                     ppid=info.get("ppid") or 0,
                     command_line=str(proc_info["cmdline"]),
                     working_dir=cwd,
                     started_at=started_at,
-                    payload={"process_name": name, "actor": actor_id},
+                    payload={
+                        "process_name": name,
+                        "actor": actor_id,
+                        "contained_descendant": is_descendant,
+                    },
                 )
                 await self.emit(event)
 
@@ -255,7 +264,7 @@ class ProcessTreeObserver(BaseObserver):
                         session_id=self.session_id,
                         actor_id=actor_id,
                         source_adapter="process_tree_observer",
-                        confidence=ConfidenceLevel.HIGH,
+                        confidence=proc_confidence,
                         command=command,
                         working_dir=cwd,
                         payload={"pid": pid, "tool": name, "raw_cmdline": clean_cmd[:300]},

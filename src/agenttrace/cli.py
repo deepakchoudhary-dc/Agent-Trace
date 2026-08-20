@@ -543,17 +543,17 @@ def shield_install(session_id: str, workspace: str | None) -> None:
     for tool in tools:
         bash_wrapper = bin_dir / tool
         bash_wrapper.write_text(
-            f"#!/usr/bin/env bash\nexec agenttrace shield run {sid} -- \"$@\"\n",
+            f"#!/usr/bin/env bash\nexec agenttrace shield run {sid} -- {tool} \"$@\"\n",
             encoding="utf-8",
         )
         cmd_wrapper = bin_dir / f"{tool}.cmd"
         cmd_wrapper.write_text(
-            f"@echo off\r\nagenttrace shield run {sid} -- %*\r\n",
+            f"@echo off\r\nagenttrace shield run {sid} -- {tool} %*\r\n",
             encoding="utf-8",
         )
         ps1_wrapper = bin_dir / f"{tool}.ps1"
         ps1_wrapper.write_text(
-            f"agenttrace shield run {sid} -- $args\n",
+            f"agenttrace shield run {sid} -- {tool} $args\n",
             encoding="utf-8",
         )
         written.extend([str(bash_wrapper), str(cmd_wrapper), str(ps1_wrapper)])

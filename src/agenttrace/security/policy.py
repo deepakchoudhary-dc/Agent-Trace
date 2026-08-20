@@ -8,6 +8,7 @@ changes, network egress, and high-impact Git operations.
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
@@ -185,7 +186,7 @@ class PolicyEngine:
     ) -> None:
         self.session_id = session_id
         self.contract = contract
-        self._rules = {r.rule_id: r for r in (rules or _DEFAULT_RULES)}
+        self._rules = {r.rule_id: copy.deepcopy(r) for r in (rules or _DEFAULT_RULES)}
         self._known_destinations: set[str] = set(baseline_destinations or ())
         # Declared network boundary (sealed-eval detection)
         self._internet_allowed = internet_allowed
