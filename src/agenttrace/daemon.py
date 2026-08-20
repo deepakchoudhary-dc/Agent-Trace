@@ -8,6 +8,7 @@ persistence/restoration across restarts, and mediated pre-execution gates.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from datetime import datetime, timezone
@@ -51,6 +52,7 @@ from agenttrace.models.session import (
 from agenttrace.models.task_contract import RiskLevel, ScopeDriftResult, TaskContract
 from agenttrace.observers.filesystem import FilesystemObserver
 from agenttrace.observers.git_monitor import GitMonitor
+from agenttrace.observers.job_object_process import WindowsJobObject
 from agenttrace.observers.kernel import KernelObserver
 from agenttrace.observers.network import NetworkObserver
 from agenttrace.observers.process_tree import ProcessTreeObserver
@@ -136,6 +138,7 @@ class AgentTraceDaemon:
         self._network_observers: dict[UUID, NetworkObserver] = {}
         self._incidents: dict[UUID, IncidentCorrelationEngine] = {}
         self._detectors: dict[UUID, DetectionEngine] = {}
+        self._job_objects: dict[UUID, WindowsJobObject] = {}
         # Most-recent node index per (session, node_type, actor) for causal
         # correlation: links events to the *latest* cause, not the first match
         self._latest: dict[tuple[UUID, NodeType, str], UUID] = {}
@@ -498,7 +501,10 @@ class AgentTraceDaemon:
             data=task_node.data,
         )
 
-        # 6. Start Observers
+        # 6. Windows Job Object Containment & Observers
+        if session.session_id not in self._job_objects:
+            self._job_objects[session.session_id] = WindowsJobObject(session.session_id)
+
         observers = await self._start_observers(session)
         self._observers[session.session_id] = observers
 
@@ -637,6 +643,10 @@ class AgentTraceDaemon:
                 )
             await adapter.stop()
 
+        job = self._job_objects.pop(session_id, None)
+        if job:
+            job.close()
+
         session.status = SessionStatus.STOPPED
         session.stopped_at = datetime.now(timezone.utc)
         self._ledger.update_session_status(
@@ -645,6 +655,17 @@ class AgentTraceDaemon:
             stopped_at=session.stopped_at.isoformat(),
         )
         logger.info("Session %s stopped", session_id)
+
+    def register_session_pid(self, session_id: UUID, pid: int) -> bool:
+        """Register an agent launcher PID to be trapped in the Job Object and tracked."""
+        job = self._job_objects.get(session_id)
+        assigned = False
+        if job:
+            assigned = job.assign_pid(pid)
+        for obs in self._observers.get(session_id, []):
+            if isinstance(obs, ProcessTreeObserver):
+                obs.boost_polling(2.0)
+        return assigned
 
     def get_session(self, session_id: UUID) -> AuditSession | None:
         return self._sessions.get(session_id)
@@ -820,8 +841,12 @@ class AgentTraceDaemon:
                 except Exception:
                     logger.warning("Could not revoke approval %s", approval.finding_id)
 
-        # Forcefully terminate active child processes associated with the session
+        # Terminate active child processes associated with session via Job Object and psutil
         terminated_pids = 0
+        job = self._job_objects.get(sid)
+        if job and job.is_active:
+            job.terminate()
+
         for observer in self._observers.get(sid, []):
             if isinstance(observer, ProcessTreeObserver):
                 for pid in list(observer._tracked_pids.keys()):
@@ -1371,9 +1396,35 @@ class AgentTraceDaemon:
             synthetic.payload["gate_proposal"] = True
             await self.ingest_event(synthetic)
 
-        # 3. BLOCK outright (privilege escalation, etc.) — approval cannot override
+        # 2c. Threat detection engine dry-run over the synthetic event
+        detector_engine = self._detectors.get(session_id)
+        if detector_engine and synthetic is not None:
+            synthetic.session_id = session_id
+            detector_findings = detector_engine.evaluate(synthetic)
+            for f in detector_findings:
+                if f.severity in {"critical", "high"}:
+                    policy_blocked = True
+                    policy_hits.append((f.detector_id, f.description))
+                else:
+                    policy_hits.append((f.detector_id, f.description))
+
+        # 3. BLOCK outright (privilege escalation, database destruction, malware, etc.)
         if policy_blocked:
             desc = policy_hits[0][1] if policy_hits else "action is not permitted by policy"
+            rule_id = policy_hits[0][0] if policy_hits else "shield_blocked_threat"
+            # Record the pre-execution blocked attack to the cryptographic ledger
+            blocked_event = PolicyFindingEvent(
+                session_id=session_id,
+                actor_id="shield_gate",
+                source_adapter="gate",
+                confidence=ConfidenceLevel.HIGH,
+                finding_type="shield_blocked_threat",
+                severity="critical",
+                description=f"Shield blocked execution: {desc}",
+                policy_rule=rule_id,
+            )
+            with contextlib.suppress(Exception):
+                self._ledger.append_event(blocked_event)
             return False, f"BLOCKED: {desc}", ""
 
         # 4. Boundary hits — pause unless covered by an active approval
@@ -1395,6 +1446,9 @@ class AgentTraceDaemon:
             return False, f"APPROVAL REQUIRED: {desc}", rule_id
 
         return True, "Allowed by policy", ""
+
+    # Alias for API/Gate consistency
+    evaluate_action = evaluate_proposed_action
 
     @staticmethod
     def _split_host_port(target: str) -> tuple[str, int]:
@@ -1482,6 +1536,7 @@ class AgentTraceDaemon:
             workspace,
             callback,
             on_pids_updated=lambda pids: net_observer.update_tracked_pids(pids),
+            job_object=self._job_objects.get(session.session_id),
         )
 
         observers: list[BaseObserver] = [

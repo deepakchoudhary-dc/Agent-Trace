@@ -101,9 +101,19 @@ class ReplayEngine:
         "_JAVA_OPTIONS",
     })
 
-    def __init__(self, workspace_path: str) -> None:
+    def __init__(self, workspace_path: str, container_isolation: bool = False) -> None:
         self.workspace_path = Path(workspace_path)
         self._active_simulations: dict[UUID, Path] = {}
+        self.container_isolation = container_isolation
+        self._container_engine = self._find_container_engine()
+
+    @staticmethod
+    def _find_container_engine() -> str | None:
+        """Find an available container runner (docker or podman)."""
+        for engine in ("docker", "podman"):
+            if shutil.which(engine):
+                return engine
+        return None
 
     @staticmethod
     def verify_command_allowed(command: str) -> tuple[bool, str]:
@@ -404,6 +414,47 @@ class ReplayEngine:
                 "stderr": error,
                 "success": False,
             }
+        # Containerized isolation execution
+        if self.container_isolation and self._container_engine:
+            container_argv = [
+                self._container_engine,
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-v",
+                f"{worktree.resolve()}:/workspace",
+                "-w",
+                "/workspace",
+                "--memory",
+                "1g",
+                "--cpus",
+                "2",
+                "python:3.11-slim",
+                *argv,
+            ]
+            try:
+                c_result = subprocess.run(
+                    container_argv,
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    stdin=subprocess.DEVNULL,
+                )
+                return {
+                    "command": command,
+                    "exit_code": c_result.returncode,
+                    "stdout": c_result.stdout[:5000],
+                    "stderr": c_result.stderr[:5000],
+                    "success": c_result.returncode == 0,
+                    "isolated_container": True,
+                }
+            except Exception as e:
+                logger.debug(
+                    "Container replay failed, falling back to scrubbed host runner: %s", e
+                )
+
         scrubbed_env = dict(os.environ)
         for var in self._DANGEROUS_ENV_VARS:
             scrubbed_env.pop(var, None)

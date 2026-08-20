@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from uuid import UUID
 
+    from agenttrace.observers.job_object_process import WindowsJobObject
+
 logger = logging.getLogger(__name__)
 
 # Core agent keyword signatures
@@ -97,22 +99,33 @@ class ProcessTreeObserver(BaseObserver):
         callback: EventCallback,
         poll_interval: float = _POLL_INTERVAL,
         on_pids_updated: Callable[[set[int]], None] | None = None,
+        job_object: WindowsJobObject | None = None,
     ) -> None:
         super().__init__(session_id, workspace_path, callback)
         self._poll_interval = poll_interval
         self._on_pids_updated = on_pids_updated
+        self._job_object = job_object
         self._tracked_pids: dict[int, dict[str, str | int | float | None]] = {}
         self._irrelevant: dict[int, float] = {}
         self._workspace_resolved = Path(workspace_path).resolve()
+        self._boost_until: float = 0.0
+
+    def boost_polling(self, duration: float = 2.0) -> None:
+        """Temporarily boost polling frequency during high-velocity command execution."""
+        import time
+        self._boost_until = max(self._boost_until, time.monotonic() + duration)
 
     async def _run(self) -> None:
-        """Poll process tree at regular intervals."""
+        """Poll process tree at regular or adaptive intervals."""
+        import time
         logger.info("Universal ProcessTreeObserver watching workspace: %s", self.workspace_path)
 
         try:
             while self._running:
                 await self._scan_processes()
-                await asyncio.sleep(self._poll_interval)
+                is_boosted = time.monotonic() < self._boost_until
+                current_interval = 0.25 if is_boosted else self._poll_interval
+                await asyncio.sleep(current_interval)
         except asyncio.CancelledError:
             logger.debug("ProcessTreeObserver cancelled")
         except Exception:
@@ -130,6 +143,7 @@ class ProcessTreeObserver(BaseObserver):
         current_pids: set[int] = set()
         workspace_l = str(self._workspace_resolved).lower()
         ws_raw_l = self.workspace_path.lower()
+        job_pids: set[int] = set(self._job_object.get_pids()) if self._job_object else set()
 
         for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]):
             try:
@@ -142,10 +156,13 @@ class ProcessTreeObserver(BaseObserver):
                 cmdline = info.get("cmdline") or []
                 create_time = info.get("create_time")
 
-                # Descendants of already-tracked session processes are always
-                # relevant (VULN-04: prevents out-of-workspace CWD escape)
+                # Descendants of already-tracked session processes or Job Object members
+                # are always relevant (VULN-04: prevents out-of-workspace CWD escape)
                 ppid = info.get("ppid")
-                is_descendant = bool(ppid is not None and ppid in self._tracked_pids)
+                is_descendant = bool(
+                    (ppid is not None and ppid in self._tracked_pids)
+                    or (pid in job_pids)
+                )
 
                 if not is_descendant:
                     # Skip identities already judged irrelevant (no cwd lookup)
@@ -179,6 +196,9 @@ class ProcessTreeObserver(BaseObserver):
                     cwd = self._safe_cwd(proc)
 
                 current_pids.add(pid)
+                if self._job_object and pid not in job_pids:
+                    self._job_object.assign_pid(pid)
+
                 if pid in self._tracked_pids:
                     # Canonical process identity = (pid, start time). A pid
                     # reused by a NEW process (the old one exited between

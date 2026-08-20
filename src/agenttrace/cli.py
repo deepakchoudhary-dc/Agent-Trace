@@ -551,7 +551,12 @@ def shield_install(session_id: str, workspace: str | None) -> None:
             f"@echo off\r\nagenttrace shield run {sid} -- %*\r\n",
             encoding="utf-8",
         )
-        written.extend([str(bash_wrapper), str(cmd_wrapper)])
+        ps1_wrapper = bin_dir / f"{tool}.ps1"
+        ps1_wrapper.write_text(
+            f"agenttrace shield run {sid} -- $args\n",
+            encoding="utf-8",
+        )
+        written.extend([str(bash_wrapper), str(cmd_wrapper), str(ps1_wrapper)])
 
     console.print(Panel(
         f"[green]✓ {len(written)} shield wrappers installed[/green]\n\n"
