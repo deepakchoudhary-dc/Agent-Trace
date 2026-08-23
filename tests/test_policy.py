@@ -73,6 +73,34 @@ class TestPolicyEngine:
         result = engine.evaluate(event)
         assert result.requires_approval
 
+    def test_scope_substring_bypass_closed(self) -> None:
+        """`allowed_paths=["src"]` must NOT authorize `/opt/darksrc/evil`."""
+        from agenttrace.security.policy import path_within_scope
+
+        assert not path_within_scope("src", "/opt/darksrc/evil")
+        assert not path_within_scope("src", "src-backup/x.py")
+        assert not path_within_scope("src/auth", "/repo/srcx/evil.py")
+
+    def test_scope_segment_exact_containment(self) -> None:
+        """Literal patterns cover the pattern itself and descendants only."""
+        from agenttrace.security.policy import path_within_scope
+
+        # The path itself
+        assert path_within_scope("src/auth", "src/auth")
+        # Direct and nested descendants
+        assert path_within_scope("src", "src/main.py")
+        assert path_within_scope("src", "src/auth/login.py")
+        # Relative pattern embedded at a segment boundary in an absolute path
+        assert path_within_scope("src/auth", "/repo/src/auth/login.py")
+        assert path_within_scope("/workspace/src", "\\workspace\\src\\a.py")
+
+    def test_scope_glob_patterns_still_anchored(self) -> None:
+        """Glob patterns keep fully-anchored fnmatch semantics."""
+        from agenttrace.security.policy import path_within_scope
+
+        assert path_within_scope("/workspace/src/*", "/workspace/src/a.py")
+        assert not path_within_scope("/workspace/src/*", "/workspace/config/x.yaml")
+
     def test_block_privilege_escalation(self) -> None:
         engine = self._make_engine()
         event = CommandEvent(

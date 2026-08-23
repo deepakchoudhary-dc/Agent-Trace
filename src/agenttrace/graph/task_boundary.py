@@ -17,6 +17,7 @@ from agenttrace.models.task_contract import (
     ScopeDriftResult,
     TaskContract,
 )
+from agenttrace.security.policy import path_within_scope
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ class TaskBoundaryEngine:
         # Check if within allowed paths (if specified)
         if self.contract.allowed_paths:
             is_allowed = any(
-                fnmatch(file_path, pattern) or pattern in file_path
+                path_within_scope(pattern, file_path)
                 for pattern in self.contract.allowed_paths
             )
             if not is_allowed:

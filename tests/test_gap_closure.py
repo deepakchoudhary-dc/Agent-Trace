@@ -9,12 +9,14 @@ anti-forensic guards, and replay hardening.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 import agenttrace.api as api
 from agenttrace.daemon import AgentTraceDaemon
@@ -151,13 +153,16 @@ def daemon_env(tmp_path, monkeypatch):
     return test_daemon, test_tokens
 
 
-def test_list_sessions_includes_observability_gaps(daemon_env):
+def test_list_sessions_includes_observability_gaps(daemon_env, tmp_path):
     test_daemon, test_tokens = daemon_env
     with TestClient(api.app) as c:
         c.post(
             "/sessions",
             json={
-                "workspace_path": str(Path.cwd()),
+                # Isolated workspace: pointing a live session at Path.cwd()
+                # makes create_session baseline/watch the entire repo
+                # (.venv included), hanging local runs for minutes.
+                "workspace_path": str(tmp_path),
                 "task_description": "t",
                 "agent_type": "generic",
             },
@@ -172,10 +177,10 @@ def test_list_sessions_includes_observability_gaps(daemon_env):
 
 # -- N9: reasoning trail excerpts are redacted -------------------------------
 
-def test_reasoning_trail_excerpts_redacted(daemon_env):
+def test_reasoning_trail_excerpts_redacted(daemon_env, tmp_path):
     test_daemon, test_tokens = daemon_env
     with TestClient(api.app) as c:
-        sid = _create_session(c, test_tokens, str(Path.cwd()))
+        sid = _create_session(c, test_tokens, str(tmp_path))
         ctx = ContextBoundaryEvent(
             actor_id="agent",
             session_id=UUID(sid),

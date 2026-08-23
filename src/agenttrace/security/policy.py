@@ -31,6 +31,45 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_GLOB_MAGIC = set("*?[")
+
+
+def normalize_scope_path(p: str) -> str:
+    """Normalize separators for cross-platform matching without touching disk."""
+    return p.replace("\\", "/").rstrip("/")
+
+
+def path_within_scope(pattern: str, path: str) -> bool:
+    """Segment-exact scope containment for task-contract allowed paths.
+
+    Literal patterns anchor at separator boundaries: ``src`` covers
+    ``src/auth/x.py`` and ``/repo/src/auth/x.py`` (pattern found at a
+    segment-aligned position), never ``/opt/darksrc/evil`` or
+    ``src-backup/x`` — plain substring containment authorized writes
+    outside every allowed path that merely contained it as a substring.
+
+    Glob patterns keep their previous semantics: fully-anchored
+    ``fnmatch`` against the normalized path.
+    """
+    norm_pattern = normalize_scope_path(pattern)
+    norm_path = normalize_scope_path(path)
+    if not norm_pattern or not norm_path:
+        return False
+
+    if any(ch in _GLOB_MAGIC for ch in norm_pattern):
+        from fnmatch import fnmatch  # noqa: PLC0415 (platform-cased matching)
+
+        return fnmatch(norm_path, norm_pattern)
+
+    pat_segs = [s for s in norm_pattern.split("/") if s]
+    if not pat_segs:
+        return False
+    path_segs = [s for s in norm_path.split("/") if s]
+    n = len(pat_segs)
+    return any(
+        path_segs[i : i + n] == pat_segs for i in range(len(path_segs) - n + 1)
+    )
+
 
 class PolicyAction(str, Enum):
     """What to do when a policy triggers."""
@@ -249,10 +288,8 @@ class PolicyEngine:
 
         # Write outside scope
         if self.contract and self.contract.allowed_paths:
-            from fnmatch import fnmatch
-
             is_allowed = any(
-                fnmatch(event.file_path, p) or p in event.file_path
+                path_within_scope(p, event.file_path)
                 for p in self.contract.allowed_paths
             )
             if not is_allowed:

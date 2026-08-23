@@ -41,6 +41,15 @@ class TestTaskBoundary:
         assert result is not None
         assert result.drift_type == DriftType.FILE_OUTSIDE_SCOPE
 
+    def test_allowed_scope_substring_bypass_closed(self) -> None:
+        """A literal allowed path must not cover substring look-alikes."""
+        engine = self._make_engine(allowed=["src"])
+        assert engine.check_file_mutation("/opt/darksrc/evil.py", "write") is not None
+        assert engine.check_file_mutation("src-backup/x.py", "write") is not None
+        # Genuine descendants and the directory itself stay in scope.
+        assert engine.check_file_mutation("src/main.py", "write") is None
+        assert engine.check_file_mutation("/repo/src/auth.py", "write") is None
+
     def test_destructive_command(self) -> None:
         engine = self._make_engine()
         results = engine.check_command("rm -rf /important")
