@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from agenttrace.api import app, lifespan
+from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.observers.job_object_process import WindowsJobObject
 from agenttrace.observers.kernel import KernelObserver
 from agenttrace.security.approval import ApprovalManager
@@ -96,6 +98,51 @@ def test_job_object_strict_containment_no_breakaway() -> None:
     # The job object must be initialized without raising errors
     assert job.session_id == sid
     job.close()
+
+
+class _FakeJob:
+    """Stands in for WindowsJobObject with scripted kernel membership."""
+
+    def __init__(self, pids: set[int], active: bool = True) -> None:
+        self._pids = pids
+        self._active = active
+        self.terminated = False
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    def get_pids(self) -> list[int]:
+        return list(self._pids)
+
+    def terminate(self, exit_code: int = 1) -> bool:
+        self.terminated = True
+        return True
+
+
+def test_incident_kill_requires_kernel_verified_membership(tmp_path: Path) -> None:
+    """Heuristic descendants are never killed; only Job Object members."""
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    sid = uuid4()
+
+    # A heuristic "contained_descendant" tracked by the observer must NOT
+    # influence the kill decision: the fake job reports empty membership.
+    daemon._job_objects[sid] = _FakeJob(pids=set())
+    assert daemon._terminate_contained(sid) == 0
+    assert not daemon._job_objects[sid].terminated
+
+    daemon._job_objects[sid] = _FakeJob(pids={1001, 1002})
+    assert daemon._terminate_contained(sid) == 2
+    assert daemon._job_objects[sid].terminated
+
+
+def test_incident_kill_refuses_daemon_own_tree(tmp_path: Path) -> None:
+    """If the daemon's own PIDs appear inside a job, refuse to arm."""
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    sid = uuid4()
+    daemon._job_objects[sid] = _FakeJob(pids={os.getpid(), os.getppid(), 4242})
+    assert daemon._terminate_contained(sid) == 0
+    assert not daemon._job_objects[sid].terminated
 
 
 def test_kernel_observer_parses_hex_pid_and_scopes_confidence(tmp_path: Path) -> None:

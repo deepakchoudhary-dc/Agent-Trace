@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Server-side ceiling on approval lifetime: a client may request any
+# expiry_minutes, but grants never outlive this window.
+MAX_EXPIRY_MINUTES = 24 * 60
+
 
 class ApprovalManager:
     """Manages approval lifecycle for policy-gated actions.
@@ -94,7 +98,11 @@ class ApprovalManager:
         as a queryable approval record — resolving any pending request
         for the same finding in place.
         """
-        expiry = datetime.now(timezone.utc) + timedelta(minutes=expiry_minutes)
+        # Cap only the upper bound: negative/past expiries stay in the past
+        # (an already-expired grant is never active).
+        expiry = datetime.now(timezone.utc) + timedelta(
+            minutes=min(expiry_minutes, MAX_EXPIRY_MINUTES)
+        )
 
         event = ApprovalEvent(
             session_id=self.session_id,
@@ -264,6 +272,11 @@ class ApprovalManager:
         Called on daemon restart so previously granted approvals keep working
         without requiring the user to re-approve the same action.
 
+        Every grant must anchor to a hash that exists in the session's
+        tamper-evident event chain; rows whose ``event_hash`` is missing or
+        absent from the ledger were inserted/mutated out-of-band and are
+        refused (they never reach the active cache).
+
         Returns the number of active approvals restored.
         """
         records = self._ledger.get_approvals(self.session_id)
@@ -272,6 +285,17 @@ class ApprovalManager:
 
         for rec in records:
             if rec.get("status") != "granted":
+                continue
+
+            if not self._ledger.event_hash_exists(
+                self.session_id, rec.get("event_hash", "")
+            ):
+                logger.warning(
+                    "Refusing approval %s for session %s: anchor hash not in "
+                    "event chain (tampered or forged record)",
+                    rec.get("finding_id"),
+                    self.session_id,
+                )
                 continue
 
             try:

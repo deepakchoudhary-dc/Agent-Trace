@@ -35,20 +35,17 @@ class AgentType(str, Enum):
     GENERIC = "generic"
 
 
-class NetworkCapturePolicy(str, Enum):
-    """Network capture depth per workspace."""
-
-    METADATA_ONLY = "metadata_only"  # Destination IP/port/protocol
-    HEADERS = "headers"  # + HTTP method/status/headers
-    FULL = "full"  # + redacted bodies (opt-in)
-
-
 class SessionConfig(BaseModel):
-    """Per-workspace configuration for an audit session."""
+    """Per-workspace configuration for an audit session.
+
+    Deliberately contains NO toggles for redaction, encryption, or network
+    capture depth: those are always-on integrity/privacy guarantees, not
+    options. A config knob that is never read by the daemon is a false
+    promise, so none exist here.
+    """
 
     workspace_path: str
     agent_type: AgentType = AgentType.AUTO
-    network_capture: NetworkCapturePolicy = NetworkCapturePolicy.METADATA_ONLY
     watch_patterns: list[str] = Field(default_factory=lambda: ["**/*"])
     ignore_patterns: list[str] = Field(
         default_factory=lambda: [
@@ -60,9 +57,6 @@ class SessionConfig(BaseModel):
             "venv/**",
         ]
     )
-    redaction_enabled: bool = True
-    encryption_enabled: bool = True
-    max_blob_size_mb: int = 50
     # Privacy: global shell-history files (~/.bash_history, PSReadLine history)
     # are NEVER read unless the user explicitly opts in per session
     track_global_shell_history: bool = False

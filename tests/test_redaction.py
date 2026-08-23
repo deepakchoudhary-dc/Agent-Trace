@@ -68,6 +68,38 @@ class TestSecretRedactor:
         assert redactor.contains_secrets(f"api_key = '{test_key}'")
         assert not redactor.contains_secrets("Hello world")
 
+    def test_hex_secret_in_url_param_is_redacted(self) -> None:
+        """Long lowercase hex (4.0 bits/char) behind credential params is caught."""
+        redactor = SecretRedactor()
+        hex_secret = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0"  # 40 lowercase hex
+        url = f"https://evil.example/callback?token={hex_secret}"
+        result = redactor.redact(url)
+        assert hex_secret not in result
+        assert "[REDACTED]" in result
+        assert redactor.contains_secrets(url)
+
+    def test_bare_git_sha_is_never_redacted(self) -> None:
+        """A 40-hex commit SHA in normal text must survive untouched."""
+        redactor = SecretRedactor()
+        sha = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0"
+        text = f"Reverted commit {sha} on main"
+        assert redactor.redact(text) == text
+        assert not redactor.contains_secrets(text)
+
+    def test_contains_secrets_agrees_with_redact(self) -> None:
+        """Zero-width-obfuscated secrets: contains_secrets must match redact()."""
+        redactor = SecretRedactor()
+        secret = "sk_" + "live_" + "x" * 24
+        obfuscated = "to\u200bken=" + secret  # zero-width space inside 'token'
+        # If redact() rewrites it, contains_secrets() must have said True.
+        rewritten = redactor.redact(obfuscated)
+        if rewritten != obfuscated:
+            fresh = SecretRedactor()
+            assert fresh.contains_secrets(obfuscated)
+        else:
+            fresh = SecretRedactor()
+            assert not fresh.contains_secrets(obfuscated)
+
     def test_recursive_nested_structures(self) -> None:
         """Verify deeply nested dictionaries inside lists and tuples are sanitized."""
         redactor = SecretRedactor()

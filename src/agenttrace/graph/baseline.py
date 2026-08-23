@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -120,50 +121,56 @@ class BaselineGenerator:
         return graph
 
     def _add_repo_tree(self, graph: ContextGraph, parent_id: UUID) -> None:
-        """Add source file nodes for the repository tree."""
+        """Add source file nodes for the repository tree.
+
+        Ignored directories are PRUNED during traversal, not filtered
+        afterwards: an rglob over a workspace containing ``.venv`` or
+        ``node_modules`` enumerates tens of thousands of files before any
+        filter runs, which made session creation hang on real repos.
+        """
         ignore_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox"}
 
-        for file_path in self.workspace_path.rglob("*"):
-            # Skip ignored directories
-            if any(part in ignore_dirs for part in file_path.parts):
-                continue
-            if not file_path.is_file():
-                continue
+        for root, dirnames, filenames in os.walk(self.workspace_path):
+            # Prune in place so os.walk never descends into ignored dirs.
+            dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
 
-            # Compute content hash
-            try:
-                content_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
-            except (OSError, PermissionError):
-                content_hash = ""
+            for filename in filenames:
+                file_path = Path(root) / filename
 
-            rel_path = str(file_path.relative_to(self.workspace_path))
-            file_node = GraphNode(
-                node_type=NodeType.SOURCE_FILE,
-                label=rel_path,
-                actor_id="baseline",
-                source_adapter="baseline_generator",
-                confidence=ConfidenceLevel.HIGH,
-                content_hash=content_hash,
-                session_id=self.session_id,
-                data={
-                    "path": str(file_path),
-                    "relative_path": rel_path,
-                    "extension": file_path.suffix,
-                    "size_bytes": file_path.stat().st_size,
-                },
-            )
-            graph.add_node(file_node)
+                # Compute content hash
+                try:
+                    content_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                except (OSError, PermissionError):
+                    content_hash = ""
 
-            # Connect to workspace
-            edge = GraphEdge(
-                source_node_id=parent_id,
-                target_node_id=file_node.node_id,
-                edge_type=EdgeType.READS,
-                actor_id="baseline",
-                source_adapter="baseline_generator",
-                confidence=ConfidenceLevel.HIGH,
-            )
-            graph.add_edge(edge)
+                rel_path = str(file_path.relative_to(self.workspace_path))
+                file_node = GraphNode(
+                    node_type=NodeType.SOURCE_FILE,
+                    label=rel_path,
+                    actor_id="baseline",
+                    source_adapter="baseline_generator",
+                    confidence=ConfidenceLevel.HIGH,
+                    content_hash=content_hash,
+                    session_id=self.session_id,
+                    data={
+                        "path": str(file_path),
+                        "relative_path": rel_path,
+                        "extension": file_path.suffix,
+                        "size_bytes": file_path.stat().st_size,
+                    },
+                )
+                graph.add_node(file_node)
+
+                # Connect to workspace
+                edge = GraphEdge(
+                    source_node_id=parent_id,
+                    target_node_id=file_node.node_id,
+                    edge_type=EdgeType.READS,
+                    actor_id="baseline",
+                    source_adapter="baseline_generator",
+                    confidence=ConfidenceLevel.HIGH,
+                )
+                graph.add_edge(edge)
 
     def _add_git_status(self, graph: ContextGraph, parent_id: UUID) -> None:
         """Add Git status information to the graph."""

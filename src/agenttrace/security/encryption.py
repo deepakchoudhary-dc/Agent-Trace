@@ -8,7 +8,6 @@ and strict OS permissions on non-Windows platforms.
 from __future__ import annotations
 
 import base64
-import contextlib
 import ctypes
 import json
 import logging
@@ -244,9 +243,24 @@ class EncryptionManager:
 
     @staticmethod
     def _restrict_permissions(key_path: Path) -> None:
-        """Enforce restrictive file permissions on the key file."""
-        with contextlib.suppress(OSError):
+        """Enforce restrictive file permissions on the key file.
+
+        POSIX only. A silent failure here would leave the master key at
+        umask defaults (typically 0644) with zero telemetry, so failures
+        are logged loudly. Windows relies on the DACL hardening applied
+        by security/permissions.py.
+        """
+        if os.name != "posix":
+            return
+        try:
             os.chmod(str(key_path), 0o600)
+        except OSError as exc:
+            logger.error(
+                "Could not restrict master-key permissions on %s: %s — "
+                "the key file may be readable by other local accounts",
+                key_path,
+                exc,
+            )
 
     def encrypt(self, plaintext: bytes, associated_data: bytes | None = None) -> bytes:
         """Encrypt data using AES-256-GCM.

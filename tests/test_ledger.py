@@ -626,3 +626,50 @@ class TestDestinationBaseline:
         }
         assert ledger.get_destination_baseline("/other") == {"10.0.0.1:80"}
         assert ledger.get_destination_baseline("/nowhere") == set()
+
+
+
+class TestIntegritySurfacing:
+    """Corrupt/tampered evidence must surface, never vanish into defaults."""
+
+    def test_corrupt_session_config_is_counted_and_flagged(self, tmp_path: Path) -> None:
+        ledger = EventLedger(tmp_path / "integrity.db")
+        sid = uuid4()
+        ledger.create_session(
+            session_id=sid,
+            config_json='{"goal": "x"}',
+            task_desc="t",
+            started_at="2026-08-20T12:00:00Z",
+        )
+
+        # Corrupt the stored ciphertext out-of-band (simulated tampering):
+        # valid column, invalid ciphertext -> decrypt fails on read.
+        ledger._conn.execute(
+            "UPDATE sessions SET config_enc = '!!not-ciphertext!!' WHERE session_id = ?",
+            (str(sid),),
+        )
+        before = ledger.integrity_failure_count
+
+        row = ledger.get_session(sid)
+        assert row is not None
+        assert row["config_json"] == "{}"  # degraded placeholder, readable
+        assert ledger.integrity_failure_count == before + 1
+
+        rows = ledger.list_sessions()
+        target = next(r for r in rows if r["session_id"] == str(sid))
+        assert target.get("integrity_degraded") is True
+
+    def test_clean_reads_do_not_increment_integrity_counter(
+        self, tmp_path: Path
+    ) -> None:
+        ledger = EventLedger(tmp_path / "clean.db")
+        sid = uuid4()
+        ledger.create_session(
+            session_id=sid,
+            config_json="{}",
+            task_desc="t",
+            started_at="2026-08-20T12:00:00Z",
+        )
+        assert ledger.get_session(sid) is not None
+        ledger.list_sessions()
+        assert ledger.integrity_failure_count == 0

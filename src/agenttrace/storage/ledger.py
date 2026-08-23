@@ -67,6 +67,11 @@ class EventLedger:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._encryption = encryption_mgr or EncryptionManager()
         self._redactor = redactor or SecretRedactor()
+        # Count of decrypt/integrity failures on read paths. A failure means
+        # stored evidence was corrupted or tampered with; it is logged loudly
+        # AND surfaced via integrity_failure_count / row flags — never
+        # silently swallowed into an empty-looking clean result.
+        self.integrity_failure_count: int = 0
 
         # Single-writer by design (only the daemon writes); threaded ASGI
         # servers (and TestClient) may touch it from different threads.
@@ -77,6 +82,16 @@ class EventLedger:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._init_schema()
+
+    def _record_integrity_failure(self, context: str) -> None:
+        """Log and count a decrypt/integrity failure on stored evidence."""
+        self.integrity_failure_count += 1
+        logger.error(
+            "INTEGRITY: could not decrypt/parse stored data (%s) — the "
+            "record may be corrupted or tampered with; returning a "
+            "degraded placeholder",
+            context,
+        )
 
     @_locked
     def _init_schema(self) -> None:
@@ -396,21 +411,25 @@ class EventLedger:
         try:
             row_dict["config_json"] = self._encryption.decrypt_str(row_dict["config_enc"])
         except Exception:
+            self._record_integrity_failure(f"session {session_id} config")
             row_dict["config_json"] = "{}"
 
         try:
             row_dict["task_desc"] = self._encryption.decrypt_str(row_dict["task_desc_enc"])
         except Exception:
+            self._record_integrity_failure(f"session {session_id} task_desc")
             row_dict["task_desc"] = ""
 
         try:
             row_dict["metadata"] = self._encryption.decrypt_json(row_dict["metadata_enc"])
         except Exception:
+            self._record_integrity_failure(f"session {session_id} metadata")
             row_dict["metadata"] = {}
 
         try:
             row_dict["agents"] = json.loads(row_dict.get("agents_json", "[]"))
         except Exception:
+            self._record_integrity_failure(f"session {session_id} agents")
             row_dict["agents"] = []
 
         return row_dict
@@ -422,14 +441,22 @@ class EventLedger:
         result: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
+            degraded: list[str] = []
             try:
                 d["task_desc"] = self._encryption.decrypt_str(d["task_desc_enc"])
             except Exception:
+                degraded.append("task_desc")
                 d["task_desc"] = ""
             try:
                 d["config"] = json.loads(self._encryption.decrypt_str(d["config_enc"]))
             except Exception:
+                degraded.append("config")
                 d["config"] = {}
+            if degraded:
+                self._record_integrity_failure(
+                    f"session listing row {d.get('session_id')}: {', '.join(degraded)}"
+                )
+                d["integrity_degraded"] = True
             result.append(d)
         return result
 
@@ -469,6 +496,9 @@ class EventLedger:
         try:
             cursor = self._encryption.decrypt_json(row["cursor_enc"])
         except Exception:
+            self._record_integrity_failure(
+                f"adapter cursor {row['adapter_name']} for session {session_id}"
+            )
             cursor = {}
         return {
             "adapter_name": row["adapter_name"],
@@ -882,10 +912,12 @@ class EventLedger:
             try:
                 d["label"] = self._encryption.decrypt_str(d["label_enc"])
             except Exception:
+                self._record_integrity_failure(f"graph node {d.get('node_id')} label")
                 d["label"] = ""
             try:
                 d["data"] = self._encryption.decrypt_json(d["data_enc"])
             except Exception:
+                self._record_integrity_failure(f"graph node {d.get('node_id')} data")
                 d["data"] = {}
             nodes.append(d)
         return nodes
@@ -924,6 +956,7 @@ class EventLedger:
             try:
                 d["data"] = self._encryption.decrypt_json(d["data_enc"])
             except Exception:
+                self._record_integrity_failure(f"graph edge {d.get('edge_id')} data")
                 d["data"] = {}
             edges.append(d)
         return edges
@@ -1016,6 +1049,22 @@ class EventLedger:
         )
         self._conn.commit()
 
+    def event_hash_exists(self, session_id: UUID, event_hash: str) -> bool:
+        """True when event_hash is present in this session's hash-chained events.
+
+        Used to authenticate approval rows on reload: a grant whose anchor
+        hash does not exist in the tamper-evident event chain was inserted
+        or mutated out-of-band and must never be honored.
+        """
+        if not event_hash:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM events WHERE session_id = ? AND event_hash = ? LIMIT 1",
+                (str(session_id), event_hash),
+            ).fetchone()
+        return row is not None
+
     @_locked
     def get_approvals(self, session_id: UUID) -> list[dict[str, Any]]:
         """Retrieve approvals for a session with decrypted reasons."""
@@ -1030,10 +1079,14 @@ class EventLedger:
             try:
                 d["reason"] = self._encryption.decrypt_str(d["reason_enc"])
             except Exception:
+                self._record_integrity_failure(
+                    f"approval {d.get('finding_id')} reason"
+                )
                 d["reason"] = ""
             try:
                 d["scope"] = self._encryption.decrypt_str(d["scope_enc"])
             except Exception:
+                self._record_integrity_failure(f"approval {d.get('finding_id')} scope")
                 d["scope"] = ""
             try:
                 affected = self._encryption.decrypt_json(d["affected_enc"])
@@ -1047,6 +1100,9 @@ class EventLedger:
                     d["affected_paths"] = affected or []
                     d["affected_commands"] = []
             except Exception:
+                self._record_integrity_failure(
+                    f"approval {d.get('finding_id')} scopes"
+                )
                 d["affected"] = {"paths": [], "commands": []}
                 d["affected_paths"] = []
                 d["affected_commands"] = []
@@ -1112,29 +1168,25 @@ class EventLedger:
             return None
 
         d = dict(row)
-        try:
-            d["goal"] = self._encryption.decrypt_str(d["goal_enc"])
-        except Exception:
-            d["goal"] = ""
-        try:
-            d["allowed_paths"] = self._encryption.decrypt_json(d["allowed_enc"])
-        except Exception:
-            d["allowed_paths"] = []
-        try:
-            d["prohibited_paths"] = self._encryption.decrypt_json(d["prohibited_enc"])
-        except Exception:
-            d["prohibited_paths"] = []
-        try:
-            d["expected_tests"] = self._encryption.decrypt_json(d["tests_enc"])
-        except Exception:
-            d["expected_tests"] = []
-        try:
-            d["allowed_tools"] = self._encryption.decrypt_json(d["tools_enc"])
-        except Exception:
-            d["allowed_tools"] = []
+        for field, key, default in (
+            ("goal", "goal_enc", ""),
+            ("allowed_paths", "allowed_enc", []),
+            ("prohibited_paths", "prohibited_enc", []),
+            ("expected_tests", "tests_enc", []),
+            ("allowed_tools", "tools_enc", []),
+        ):
+            try:
+                if field == "goal":
+                    d[field] = self._encryption.decrypt_str(d[key])
+                else:
+                    d[field] = self._encryption.decrypt_json(d[key])
+            except Exception:
+                self._record_integrity_failure(f"task contract {field}")
+                d[field] = default
         try:
             d["notes"] = self._encryption.decrypt_str(d["notes_enc"]) if d.get("notes_enc") else ""
         except Exception:
+            self._record_integrity_failure("task contract notes")
             d["notes"] = ""
 
         return d

@@ -65,6 +65,15 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"([A-Za-z0-9\-_.+/=]{16,200})['\"]?",
         re.IGNORECASE,
     )),
+
+    # Credential-bearing URL query parameters with long hex values.
+    # Random lowercase hex maxes out at ~4.0 bits/char, below the entropy
+    # floor; bare 40-hex strings are usually git SHAs (never redacted), but
+    # hex sitting behind token=/key=/sig= in a query string is a secret.
+    ("url_credential_param", re.compile(
+        r"[?&](?:token|key|secret|password|access[_-]?token|api[_-]?key"
+        r"|sig(?:nature)?|credential)=([0-9a-fA-F]{16,200})"
+    )),
 ]
 
 # Sensitive dictionary keys, matched component-exactly after normalization
@@ -129,16 +138,13 @@ class SecretRedactor:
         """Read-only access to the redaction audit log."""
         return list(self._redaction_log)
 
-    def redact(self, text: str) -> str:
-        """Redact all detected secrets from text.
+    def _collect_spans(self, text: str) -> list[tuple[int, int, str]]:
+        """Detect secret spans in ``text``; shared by redact() and contains_secrets().
 
-        Every match is collected against the ORIGINAL text and applied
-        end-to-start, so the audit log always references original positions
-        and no match is skewed by earlier replacements.
+        Every match is collected against the ORIGINAL text (zero-width
+        obfuscation mapped back to original indices), then overlapping
+        spans are merged keeping the wider one.
         """
-        if not text or not isinstance(text, str):
-            return text
-
         spans: list[tuple[int, int, str]] = []
 
         # 1. Known secret formats
@@ -191,6 +197,18 @@ class SecretRedactor:
                     merged[-1] = (merged[-1][0], end, merged[-1][2])
                 continue
             merged.append((start, end, name))
+        return merged
+
+    def redact(self, text: str) -> str:
+        """Redact all detected secrets from text.
+
+        Matches are applied end-to-start, so the audit log always references
+        original positions and no match is skewed by earlier replacements.
+        """
+        if not text or not isinstance(text, str):
+            return text
+
+        merged = self._collect_spans(text)
 
         result = text
         for start, end, pattern_name in reversed(merged):
@@ -269,19 +287,15 @@ class SecretRedactor:
         return self.redact_any(data)  # type: ignore[no-any-return]
 
     def contains_secrets(self, text: str) -> bool:
-        """Check if text contains any detectable secrets."""
-        if not isinstance(text, str):
+        """Check if text contains any detectable secrets.
+
+        Uses the exact same span collection as ``redact()`` — a text that
+        would be rewritten always reports True, with zero drift between
+        detection and redaction.
+        """
+        if not isinstance(text, str) or not text:
             return False
-
-        for _, pattern in _SECRET_PATTERNS:
-            if pattern.search(text):
-                return True
-
-        for token_match in re.finditer(r"\S+", text):
-            if self._is_high_entropy_credential(token_match.group(0)):
-                return True
-
-        return False
+        return bool(self._collect_spans(text))
 
     @staticmethod
     def _normalize_key(key: str) -> str:

@@ -107,14 +107,27 @@ class TestShieldVerdicts:
         data_dir, port = live_daemon
         sid = _create_session(data_dir, port, str(tmp_path))
         runner = CliRunner()
+        # Approve a real policy rule id (pre-execution gates pause on rule
+        # ids before any finding exists). Arbitrary ids like "finding-x" are
+        # rejected by the API with 404.
         result = runner.invoke(
-            main, ["approve", "finding-x", "--scope", "/some/path", "--session-id", sid]
+            main,
+            ["approve", "destructive_file_op", "--scope", "/some/path", "--session-id", sid],
         )
         assert result.exit_code == 0, result.output
         assert "Approval granted" in result.output
         # The approval was recorded in the daemon's ledger, not a CLI-side copy.
         status = _call_api(f"/sessions/{sid}/verify")
         assert isinstance(status, dict) and status["verified"] is True
+
+    def test_approve_rejects_unknown_finding(self, tmp_path: Path, live_daemon) -> None:
+        data_dir, port = live_daemon
+        sid = _create_session(data_dir, port, str(tmp_path))
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["approve", "finding-x", "--scope", "/some/path", "--session-id", sid]
+        )
+        assert "Unknown finding" in result.output or "404" in result.output
 
 
 class TestShieldInstall:

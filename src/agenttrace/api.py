@@ -33,6 +33,7 @@ from agenttrace.models.events import ConfidenceLevel, EventType, FileMutationEve
 from agenttrace.models.session import AgentType
 from agenttrace.review_loop.loop import ReviewLoop
 from agenttrace.review_loop.serialization import loop_result_to_dict
+from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.token import ApiTokenManager
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,10 @@ class VerifyResponse(BaseModel):
     error: str = ""
     event_count: int
     last_event_hash: str
+    # Count of decrypt/integrity failures on stored evidence (corruption or
+    # tampering). Non-zero means some records were returned as degraded
+    # placeholders instead of their true content — never silently empty.
+    integrity_failures: int = 0
 
 
 class SimulationRequest(BaseModel):
@@ -342,6 +347,7 @@ async def verify_chain(session_id: UUID) -> VerifyResponse:
         error=error_msg,
         event_count=event_count,
         last_event_hash=last_hash,
+        integrity_failures=daemon._ledger.integrity_failure_count,
     )
 
 
@@ -527,26 +533,44 @@ async def record_approval(session_id: UUID, req: ApprovalRequest) -> dict[str, A
     if not mgr:
         raise HTTPException(status_code=409, detail="No active approval manager for this session")
 
+    # Reject unknown findings: the finding must reference a real event in
+    # this session's ledger (by event UUID), an existing finding type, or a
+    # current policy rule id (pre-execution gates pause on rule ids before
+    # any finding exists). Arbitrary client-chosen IDs would let a bearer
+    # mint approvals for actions no policy could ever flag.
+    finding_evt: Any = None
+    try:
+        finding_evt = daemon._ledger.get_event(UUID(req.finding_id))
+    except (ValueError, AttributeError):
+        finding_evt = None
+    if finding_evt is None:
+        for evt in daemon.get_findings(session_id):
+            if getattr(evt, "finding_type", "") == req.finding_id:
+                finding_evt = evt
+                break
+    if (
+        finding_evt is None
+        and req.finding_id not in PolicyEngine(session_id).get_rules()
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown finding: {req.finding_id} does not reference "
+            "any event, finding, or policy rule in this session",
+        )
+
     affected_paths = list(req.affected_paths)
     affected_commands = list(req.affected_commands)
-    if not affected_paths and not affected_commands:
-        finding_evt = None
-        try:
-            finding_evt = daemon._ledger.get_event(UUID(req.finding_id))
-        except (ValueError, AttributeError):
-            finding_evt = None
-        if finding_evt is None:
-            for evt in daemon.get_findings(session_id):
-                if getattr(evt, "finding_type", "") == req.finding_id:
-                    finding_evt = evt
-                    break
-        if finding_evt is not None:
-            path = getattr(finding_evt, "affected_path", "") or ""
-            command = getattr(finding_evt, "affected_command", "") or ""
-            if path:
-                affected_paths.append(path)
-            if command:
-                affected_commands.append(command)
+    if (
+        not affected_paths
+        and not affected_commands
+        and finding_evt is not None
+    ):
+        path = getattr(finding_evt, "affected_path", "") or ""
+        command = getattr(finding_evt, "affected_command", "") or ""
+        if path:
+            affected_paths.append(path)
+        if command:
+            affected_commands.append(command)
 
     event = mgr.record_approval(
         finding_id=req.finding_id,

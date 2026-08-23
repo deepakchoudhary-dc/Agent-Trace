@@ -466,7 +466,10 @@ class AgentTraceDaemon:
 
         # 4. Generate Baseline Graph & Persist Nodes
         baseline_gen = BaselineGenerator(session.session_id, config.workspace_path)
-        graph = baseline_gen.generate()
+        # Off-thread: hashing a real workspace is disk-bound and can take
+        # seconds-to-minutes; running it inline stalls the event loop (API,
+        # observers, adapter polls) for the whole daemon.
+        graph = await asyncio.to_thread(baseline_gen.generate)
         self._graphs[session.session_id] = graph
 
         # Persist baseline nodes
@@ -818,6 +821,42 @@ class AgentTraceDaemon:
                 self._ledger.add_destination_baseline(workspace_path, destination)
             return
 
+    def _terminate_contained(self, session_id: UUID) -> int:
+        """Terminate only kernel-verified members of the session's Job Object.
+
+        Heuristic signals ("descendant of a tracked process") are observation
+        metadata, never a kill criterion: a wrong guess would terminate an
+        unrelated developer process. If the daemon's own PID tree somehow
+        appears inside the job, containment is broken — refuse to arm rather
+        than kill ourselves.
+        """
+        job = self._job_objects.get(session_id)
+        if not job or not job.is_active:
+            return 0
+
+        verified = set(job.get_pids())
+        if not verified:
+            return 0
+
+        if os.getpid() in verified or os.getppid() in verified:
+            logger.critical(
+                "Daemon PID %d/%d present in session %s Job Object; "
+                "refusing to terminate",
+                os.getpid(),
+                os.getppid(),
+                session_id,
+            )
+            return 0
+
+        if job.terminate():
+            logger.info(
+                "Terminated %d kernel-verified contained process(es) for session %s",
+                len(verified),
+                session_id,
+            )
+            return len(verified)
+        return 0
+
     async def _apply_incident_response(self, incident: IncidentEvent) -> None:
         """Response ladder (R2): critical incidents freeze the session.
 
@@ -847,30 +886,8 @@ class AgentTraceDaemon:
                 except Exception:
                     logger.warning("Could not revoke approval %s", approval.finding_id)
 
-        # Terminate active child processes associated with session via Job Object and psutil (P1.19)
-        terminated_pids = 0
-        current_pid = os.getpid()
-        parent_pid = os.getppid()
-
-        job = self._job_objects.get(sid)
-        if job and job.is_active:
-            job.terminate()
-
-        for observer in self._observers.get(sid, []):
-            if isinstance(observer, ProcessTreeObserver):
-                for pid, pinfo in list(observer._tracked_pids.items()):
-                    if pid in (current_pid, parent_pid):
-                        continue
-                    # P1.19: Only terminate proven contained descendants automatically
-                    if isinstance(pinfo, dict) and not pinfo.get("contained_descendant", False):
-                        continue
-                    try:
-                        import psutil  # type: ignore[import-untyped]
-                        p = psutil.Process(pid)
-                        p.kill()
-                        terminated_pids += 1
-                    except Exception:
-                        pass
+        # Terminate only kernel-verified Job Object members (P1.19).
+        terminated_pids = self._terminate_contained(sid)
 
         for observer in self._observers.get(sid, []):
             try:

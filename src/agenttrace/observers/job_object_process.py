@@ -1,8 +1,12 @@
 """Windows Job Object process containment provider for AgentTrace.
 
-Traps 100% of agent child and grandchild processes at the Windows kernel level,
-preventing escaping via CWD changes, sub-second execution, or detached spawns.
-Provides atomic process enumeration and instant kill ladders.
+Containment applies ONLY to processes explicitly assigned via
+``assign_pid`` (kernel-verified membership afterwards). Nothing is ever
+assigned heuristically: a process whose parent happens to be tracked by
+the process-tree observer is *observed*, never claimed as contained.
+Where assignment has not happened (the current observe-only daemon
+lifecycle), the job exists but contains nothing, and kill operations are
+no-ops. Capability status is reported honestly instead of asserted.
 """
 
 from __future__ import annotations
@@ -77,8 +81,55 @@ def _get_kernel32() -> Any:
     """Safely obtain kernel32 DLL reference without platform attribute errors."""
     windll = getattr(ctypes, "windll", None)
     if windll is not None:
-        return getattr(windll, "kernel32", None)
+        kernel32 = getattr(windll, "kernel32", None)
+        if kernel32 is not None:
+            _set_prototypes(kernel32)
+        return kernel32
     return None
+
+
+def _set_prototypes(kernel32: Any) -> None:
+    """Pin exact Win32 signatures (idempotent).
+
+    Without explicit ``restype``, ctypes defaults to a 32-bit ``c_int``;
+    on 64-bit Windows every HANDLE above 2^31 would be truncated, so
+    ``AssignProcessToJobObject``/``CloseHandle`` would operate on corrupt
+    handles — potentially closing or terminating the wrong kernel object.
+    """
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        wintypes.INT,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+
+    kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        wintypes.INT,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+    ]
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    kernel32.GetLastError.argtypes = []
+    kernel32.GetLastError.restype = wintypes.DWORD
 
 
 class WindowsJobObject:
