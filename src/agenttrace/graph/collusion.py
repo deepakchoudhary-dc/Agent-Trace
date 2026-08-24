@@ -74,6 +74,14 @@ _GAPS: dict[str, str] = {
         "equally consistent with coincidental parallel work — intent is "
         "not observable at host level."
     ),
+    "rotated_identity": (
+        "Sessions contacting the same external endpoint claim DIFFERENT "
+        "actor identities. This compartmentalization pattern is consistent "
+        "with deliberate fingerprint rotation to fragment audit trails — "
+        "and equally with unrelated tools sharing common infrastructure. "
+        "Identity claims are self-reported; true attribution is not "
+        "observable at host level."
+    ),
 }
 
 
@@ -100,6 +108,7 @@ class CollusionCorrelationEngine:
             candidates.extend(self._reused_egress(sids))
             candidates.extend(self._shared_actors(sids))
             candidates.extend(self._complementary_roles(sids))
+            candidates.extend(self._rotated_identity(sids))
         return candidates
 
     def for_session(self, session_id: UUID) -> list[CollusionCandidate]:
@@ -281,4 +290,52 @@ class CollusionCorrelationEngine:
                     reasoning_gap=_GAPS["complementary_roles"],
                 ))
                 break  # one candidate per escalating session
+        return out
+
+    def _rotated_identity(self, sids: list[UUID]) -> list[CollusionCandidate]:
+        """Same endpoint, different claimed identities across sessions.
+
+        The fingerprint-rotation pattern: an actor that rotates its
+        self-reported identity per session cannot be linked by
+        ``shared_actors`` — but shared egress infrastructure still links
+        the activity. LOW confidence: common infrastructure is mundane.
+        """
+        egress_actors: dict[str, dict[str, tuple[set[str], list[str]]]] = {}
+        for sid in sids:
+            for evt in self._events(sid):
+                if not isinstance(evt, NetworkEvent) or evt.direction != "outbound":
+                    continue
+                if evt.actor_id in _INFRA_ACTORS or not evt.actor_id:
+                    continue
+                dest = f"{evt.destination_ip}:{evt.destination_port}"
+                entry = egress_actors.setdefault(dest, {})
+                actors, events = entry.setdefault(str(sid), (set(), []))
+                actors.add(evt.actor_id)
+                events.append(str(evt.event_id))
+
+        out: list[CollusionCandidate] = []
+        for dest, by_sid in egress_actors.items():
+            if len(by_sid) < 2:
+                continue
+            actor_sets = [actors for actors, _events in by_sid.values()]
+            # Disjoint claimed identities across every participating session
+            # is what distinguishes rotation from plain identity reuse.
+            if any(
+                set(a) & set(b)
+                for a, b in zip(actor_sets, actor_sets[1:], strict=False)
+            ):
+                continue
+            all_actors = sorted({a for actors in actor_sets for a in actors})
+            evidence = sorted(
+                eid for _actors, events in by_sid.values() for eid in events
+            )
+            out.append(CollusionCandidate(
+                signal="rotated_identity",
+                session_ids=sorted(by_sid),
+                actors=all_actors,
+                detail=f"shared endpoint {dest} with disjoint actor identities",
+                confidence=ConfidenceLevel.LOW,
+                evidence_event_ids=evidence,
+                reasoning_gap=_GAPS["rotated_identity"],
+            ))
         return out

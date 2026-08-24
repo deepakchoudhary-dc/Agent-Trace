@@ -1207,6 +1207,11 @@ _INTERPRETER_EXEC_RE = re.compile(
     r"(?:^|[\s/])(?:bash|sh|zsh|dash|ksh|pwsh|powershell|python3?|node|perl|ruby)\b",
     re.IGNORECASE,
 )
+_ASSEMBLE_RE = re.compile(
+    r"\b(?:cat|type|get-content)\b|copy\s+/b\b",
+    re.IGNORECASE,
+)
+_SCRIPT_TARGET_RE = re.compile(r">\s*\S+\.(?:sh|bat|ps1|py|js|rb|pl)\b", re.IGNORECASE)
 
 
 class ToolChainDetector:
@@ -1248,6 +1253,14 @@ class ToolChainDetector:
             "medium",
             "Anti-forensic cleanup shortly after privilege escalation",
         ),
+        (
+            "fragment_assembly",
+            "write",
+            "assemble",
+            "high",
+            "Multiple recent file fragments concatenated into an executable "
+            "artifact — payload splitting to evade per-file pattern detection",
+        ),
     )
 
     def __init__(self) -> None:
@@ -1267,6 +1280,26 @@ class ToolChainDetector:
         for recipe_id, first_kind, second_kind, severity, description in self._RECIPES:
             if recipe_id in fired or kind != second_kind:
                 continue
+            if recipe_id == "fragment_assembly":
+                # Stronger condition: the command must reference >=2 file
+                # basenames written recently in this session.
+                written = {v for k, v in history if k == "write"}
+                referenced = sum(1 for name in written if name and name in value)
+                if referenced < 2:
+                    continue
+                fired.add(recipe_id)
+                findings.append(
+                    DetectorFinding(
+                        detector_id=self.detector_id,
+                        name=self.name,
+                        severity=severity,
+                        confidence=ConfidenceLevel.MEDIUM,
+                        description=f"{description}: {value[:120]}",
+                        evidence_refs=[str(event.event_id)],
+                        affected_command=value[:200],
+                    )
+                )
+                break
             if any(k == first_kind for k, _v in history):
                 fired.add(recipe_id)
                 findings.append(
@@ -1299,6 +1332,10 @@ class ToolChainDetector:
                 return "cleanup", cmd
             if _SECRET_READ_RE.search(cmd):
                 return "secret_read", cmd
+            if _ASSEMBLE_RE.search(cmd) and (
+                _SCRIPT_TARGET_RE.search(cmd) or _INTERPRETER_EXEC_RE.search(cmd)
+            ):
+                return "assemble", cmd
             if _INTERPRETER_EXEC_RE.search(cmd):
                 return "exec", cmd
             return "", ""
@@ -1306,6 +1343,12 @@ class ToolChainDetector:
             dest = event.destination_ip or ""
             port = event.destination_port or 0
             return "egress", f"{dest}:{port}"
+        if isinstance(event, FileMutationEvent) and event.mutation_type in {
+            "create", "modify", "append"
+        }:
+            from pathlib import Path  # noqa: PLC0415 (basename only)
+
+            return "write", Path(event.file_path).name
         return "", ""
 
 

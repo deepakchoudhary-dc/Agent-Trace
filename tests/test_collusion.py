@@ -223,3 +223,49 @@ class TestComplementaryRoles:
         ))
         candidates = CollusionCorrelationEngine(ledger).candidates()
         assert not any(c.signal == "complementary_roles" for c in candidates)
+
+
+class TestRotatedIdentity:
+    def test_same_endpoint_disjoint_identities_flagged(self, tmp_path: Path) -> None:
+        ledger = _ledger(tmp_path)
+        s1 = _session(ledger, "/ws", "a")
+        s2 = _session(ledger, "/ws", "b")
+
+        # Same endpoint, deliberately different claimed identities.
+        for sid, actor in ((s1, "identityOne"), (s2, "identityTwo")):
+            ledger.append_event(NetworkEvent(
+                session_id=sid,
+                actor_id=actor,
+                source_adapter="net",
+                destination_ip="198.51.100.7",
+                destination_port=8443,
+                protocol="tcp",
+                direction="outbound",
+            ))
+
+        candidates = CollusionCorrelationEngine(ledger).candidates()
+        rotated = [c for c in candidates if c.signal == "rotated_identity"]
+        assert len(rotated) == 1
+        assert set(rotated[0].session_ids) == {str(s1), str(s2)}
+        assert rotated[0].confidence == ConfidenceLevel.LOW
+
+    def test_shared_identity_is_not_rotation(self, tmp_path: Path) -> None:
+        ledger = _ledger(tmp_path)
+        s1 = _session(ledger, "/ws", "a")
+        s2 = _session(ledger, "/ws", "b")
+
+        # Same identity across both sessions -> shared_actor territory,
+        # must NOT also be flagged as rotation.
+        for sid in (s1, s2):
+            ledger.append_event(NetworkEvent(
+                session_id=sid,
+                actor_id="oneIdentity",
+                source_adapter="net",
+                destination_ip="198.51.100.9",
+                destination_port=443,
+                protocol="tcp",
+                direction="outbound",
+            ))
+
+        candidates = CollusionCorrelationEngine(ledger).candidates()
+        assert not any(c.signal == "rotated_identity" for c in candidates)

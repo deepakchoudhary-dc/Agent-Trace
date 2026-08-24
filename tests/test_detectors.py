@@ -893,3 +893,37 @@ class TestBeaconingDetection:
         for i in range(rules_mod._BEACON_CONTACT_VOLUME + 2):
             findings.extend(engine.evaluate(self._net(f"203.0.113.{i}", 443)))
         assert not any("Repeated outbound contact" in f.description for f in findings)
+
+
+class TestFragmentedWriteDetection:
+    def _mutation(self, path: str, mutation_type: str = "create") -> FileMutationEvent:
+        return FileMutationEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="fs",
+            file_path=path,
+            mutation_type=mutation_type,
+        )
+
+    def test_fragment_assembly_fires(self) -> None:
+        engine = _engine()
+        engine.evaluate(self._mutation("/ws/parts/part1.sh"))
+        engine.evaluate(self._mutation("/ws/parts/part2.sh"))
+        findings = engine.evaluate(
+            _command("cat /ws/parts/part1.sh /ws/parts/part2.sh > run.sh && bash run.sh")
+        )
+        assert any(
+            f.detector_id == "benign_tool_chain"
+            and f.description.startswith("Multiple recent file fragments")
+            for f in findings
+        )
+
+    def test_single_file_concatenation_does_not_fire(self) -> None:
+        engine = _engine()
+        engine.evaluate(self._mutation("/ws/notes/readme.md"))
+        findings = engine.evaluate(_command("cat /ws/notes/readme.md > out.txt"))
+        assert not any(
+            f.detector_id == "benign_tool_chain"
+            and f.description.startswith("Multiple recent file fragments")
+            for f in findings
+        )
