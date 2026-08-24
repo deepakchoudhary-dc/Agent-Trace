@@ -80,6 +80,28 @@ const CLUSTER_ID = 'cluster:baseline';
 const STRONG_EDGES = new Set(['CAUSES', 'EXECUTES', 'MODIFIES', 'REQUESTS', 'SPAWNS', 'VIOLATES', 'VALIDATES']);
 const edgeWeight = (type: string) => (STRONG_EDGES.has(type) ? 10 : 2);
 
+// Actor-family accents: agent vs OS-tool vs terminal vs unattributed/system.
+// Derived from the observer's actor_id prefix contract (agent:*, tool:*,
+// terminal:*, process:*, etw:*, unattributed_etw:*) so a person can tell an
+// AI-agent process from a kernel/basic-OS process at a glance.
+interface ActorFamily {
+  label: string;
+  color: string;
+}
+const ACTOR_FAMILIES: ActorFamily[] = [
+  { label: 'AI Agent', color: '#c084fc' },          // violet — agent:*, etw:*
+  { label: 'Dev Tool / Terminal', color: '#38bdf8' }, // sky — tool:*, terminal:*
+  { label: 'OS / Unattributed', color: '#f59e0b' },  // amber — process:*, unattributed_*
+];
+
+function actorFamily(actorId: string | undefined): ActorFamily {
+  const a = (actorId || '').toLowerCase();
+  if (a.startsWith('agent:') || a.startsWith('etw:')) return ACTOR_FAMILIES[0];
+  if (a.startsWith('tool:') || a.startsWith('terminal:')) return ACTOR_FAMILIES[1];
+  if (a.startsWith('process:') || a.startsWith('unattributed')) return ACTOR_FAMILIES[2];
+  return { label: '', color: '' }; // baseline/daemon/etc — default styling
+}
+
 type BaselineMode = 'show' | 'collapse' | 'hide';
 
 /**
@@ -556,6 +578,31 @@ export const GraphView: React.FC<GraphViewProps> = ({
               ))}
             </select>
 
+            {/* Actor-family legend: agent vs dev-tool vs OS process */}
+            {viewMode === 'visual' && (
+              <div
+                className="flex"
+                style={{ gap: '10px', alignItems: 'center', fontSize: '9.5px', color: 'var(--text-muted)' }}
+                aria-label="Actor family color legend"
+              >
+                {ACTOR_FAMILIES.filter((f) => f.label).map((f) => (
+                  <span key={f.label} className="flex" style={{ gap: '4px', alignItems: 'center' }}>
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        background: '#09090b',
+                        border: `1.6px solid ${f.color}`,
+                        display: 'inline-block',
+                      }}
+                    />
+                    {f.label}
+                  </span>
+                ))}
+              </div>
+            )}
+
             {/* Follow latest live activity */}
             <button
               onClick={() => setFollowLatest((v) => !v)}
@@ -678,6 +725,7 @@ export const GraphView: React.FC<GraphViewProps> = ({
                   const hasSelection = Boolean(selectedNode);
                   const opacity = hasSelection ? (isSelected || isConnected ? 1 : 0.3) : 1;
                   const newFlag = isRecent(node.node_id);
+                  const family = actorFamily(node.actor_id);
 
                   return (
                     <g
@@ -763,12 +811,18 @@ export const GraphView: React.FC<GraphViewProps> = ({
                               className="node-body"
                               r={isSelected ? 19 : 14}
                               fill="#09090b"
-                              stroke={isSelected ? '#ffffff' : isConnected ? '#e4e4e7' : 'rgba(255, 255, 255, 0.4)'}
-                              strokeWidth={isSelected ? 2.5 : 1.5}
+                              stroke={
+                                isSelected
+                                  ? '#ffffff'
+                                  : isConnected
+                                    ? '#e4e4e7'
+                                    : family.color || 'rgba(255, 255, 255, 0.4)'
+                              }
+                              strokeWidth={isSelected ? 2.5 : family.color && !isConnected ? 1.8 : 1.5}
                             />
 
                             {/* Center pin */}
-                            <circle r={4} fill={isSelected || newFlag ? '#ffffff' : '#d4d4d8'} />
+                            <circle r={4} fill={isSelected || newFlag ? '#ffffff' : family.color || '#d4d4d8'} />
 
                             {/* Label */}
                             <text

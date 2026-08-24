@@ -1231,6 +1231,23 @@ class AgentTraceDaemon:
                 if p_node:
                     new_edges.append(link_edge(p_node.node_id, EdgeType.SPAWNS))
 
+        # 6b. Process events link to their parent process when the parent is
+        # observed in this session — the process tree becomes visible graph
+        # topology (SPAWNS), not just per-process isolated nodes. The ppid
+        # match is an observed fact (HIGH); unattributed kernel events keep
+        # their node but never claim a parent they cannot name.
+        elif isinstance(event, ProcessEvent):
+            parent_pid = event.ppid
+            if parent_pid:
+                parent = self._latest_matching(
+                    graph, NodeType.PROCESS,
+                    predicate=lambda n: n.data.get("pid") == parent_pid,
+                )
+                if parent and parent.data.get("pid") != event.pid:
+                    new_edges.append(
+                        link_edge(parent.node_id, EdgeType.SPAWNS, ConfidenceLevel.HIGH)
+                    )
+
         # 7. Policy findings link VIOLATES to the node that actually triggered
         #    them (matching command/path), never to an arbitrary recent node.
         elif isinstance(event, PolicyFindingEvent):

@@ -795,3 +795,57 @@ def test_path_within_is_segment_exact(tmp_path: Path) -> None:
     assert AgentTraceDaemon._path_within(ws, ws)
     assert not AgentTraceDaemon._path_within(tmp_path / "proj2", ws)
     assert not AgentTraceDaemon._path_within(tmp_path / "proj_extra", ws)
+
+
+@pytest.mark.asyncio
+async def test_process_spawns_edge_links_parent_to_child(tmp_path: Path) -> None:
+    """Observed ppid chains become SPAWNS edges: the process tree is visible."""
+    from agenttrace.models.events import ProcessEvent
+
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    try:
+        session = await daemon.create_session(
+            workspace_path=str(tmp_path),
+            task_description="Process tree topology test",
+            agent_type=AgentType.GENERIC,
+        )
+        sid = session.session_id
+
+        parent = ProcessEvent(
+            session_id=sid,
+            actor_id="agent:test_agent",
+            source_adapter="process_tree_observer",
+            pid=1000,
+            ppid=900,
+            command_line="agent-shell --workspace",
+            payload={"contained_descendant": True},
+        )
+        child = ProcessEvent(
+            session_id=sid,
+            actor_id="tool:git",
+            source_adapter="process_tree_observer",
+            pid=1001,
+            ppid=1000,
+            command_line="git status",
+            payload={"contained_descendant": True},
+        )
+        await daemon.project_event(parent)
+        await daemon.project_event(child)
+
+        edges = daemon._ledger.get_graph_edges(sid, edge_type="SPAWNS")
+        assert len(edges) == 1
+        # Edge direction: parent process -> child process.
+        parent_node = next(
+            n for n in daemon._ledger.get_graph_nodes(sid)
+            if n.get("data", {}).get("pid") == 1000
+        )
+        child_node = next(
+            n for n in daemon._ledger.get_graph_nodes(sid)
+            if n.get("data", {}).get("pid") == 1001
+        )
+        assert edges[0]["source_node_id"] == parent_node["node_id"]
+        assert edges[0]["target_node_id"] == child_node["node_id"]
+        assert edges[0]["confidence"] == "high"
+    finally:
+        await daemon.stop()
