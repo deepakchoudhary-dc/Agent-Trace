@@ -697,7 +697,13 @@ _PERSISTENCE_RE = re.compile(
     r"\bupdate-rc\.d\b|\bchkconfig\b|\bschtasks\s+/create\b|"
     r"HKCU\\[^ \"]*\\Run\b|HKEY_CURRENT_USER\\[^ \"]*\\Run\b|"
     r"\.config/autostart|/etc/init\.d/|\breg\s+add\b.*\\Run\b|"
-    r"(?:\.bashrc|\.zshrc|\.profile)\b",
+    r"(?:\.bashrc|\.zshrc|\.profile)\b|"
+    # Time-delayed re-execution triggers (activates after audits/session):
+    r"\bat\s+\d{1,2}:\d{2}\b"
+    r"|\b(?:systemctl|systemd-run)[^\n]*\.timer\b|on-calendar="
+    r"|new-scheduledtasktrigger[^\n]*\s-at\b"
+    r"|\bsleep\s+\d{2,}\s*(?:&&|;)"
+    r"|start-sleep\s+-seconds\s+\d{2,}[^\n]*(?:&&|;)",
     re.IGNORECASE,
 )
 
@@ -982,6 +988,10 @@ _DNS_TUNNEL_WINDOW_SECONDS = 60.0
 _DNS_TUNNEL_VOLUME = 15
 _ICMP_TUNNEL_VOLUME = 15
 _BEACON_CONTACT_VOLUME = 8
+# Low-and-slow exfiltration: enough contacts, spread far enough apart,
+# to be pacing rather than a burst. Never window-pruned (session horizon).
+_TRICKLE_CONTACTS = 6
+_TRICKLE_MIN_SPAN_SECONDS = 300.0
 
 
 class NetworkTunnelSignalsDetector:
@@ -1002,6 +1012,11 @@ class NetworkTunnelSignalsDetector:
     def __init__(self) -> None:
         self._recent: dict[str, dict[tuple[str, str], list[float]]] = {}
         self._volume_flagged: dict[str, set[tuple[str, str]]] = {}
+        # Long-horizon contact tracking (never window-pruned): catches the
+        # LOW-AND-SLOW exfiltration pattern that deliberately stays under
+        # burst thresholds by spacing small transfers minutes apart.
+        self._horizon: dict[str, dict[str, list[float]]] = {}
+        self._trickle_flagged: dict[str, set[str]] = {}
 
     def _volume_finding(
         self, event: EventBase, ctx: DetectionContext, kind: str, destination: str
@@ -1123,6 +1138,35 @@ class NetworkTunnelSignalsDetector:
             # Prune entries outside the window so the volume signal decays.
             for key, queue in bucket.items():
                 bucket[key] = [t for t in queue if t >= window]
+
+            # Low-and-slow: repeated small contact with one destination
+            # spread over a long horizon. Deliberately below every burst
+            # threshold — the pattern is pacing, not volume.
+            hkey = str(ctx.session_id)
+            horizon = self._horizon.setdefault(hkey, {})
+            span_queue = horizon.setdefault(destination, [])
+            span_queue.append(now)
+            count = len(span_queue)
+            duration = (span_queue[-1] - span_queue[0]) if count >= 2 else 0.0
+            if (
+                count >= _TRICKLE_CONTACTS
+                and duration >= _TRICKLE_MIN_SPAN_SECONDS
+                and destination not in self._trickle_flagged.get(hkey, set())
+            ):
+                self._trickle_flagged.setdefault(hkey, set()).add(destination)
+                findings.append(DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity="medium",
+                    confidence=ConfidenceLevel.LOW,
+                    description=(
+                        f"Slow-drip contact with {destination}: "
+                        f"{count} transfers over {int(duration)}s — pacing "
+                        "consistent with low-frequency exfiltration"
+                    ),
+                    evidence_refs=[str(event.event_id)],
+                    requires_approval=False,
+                ))
 
         return findings
 
@@ -1413,6 +1457,71 @@ class RecursiveAgentSpawnDetector:
         return findings
 
 
+# ---------------------------------------------------------------------------
+# 21. Log tampering — wiping or rewriting audit/log/history artifacts.
+#     The ledger itself is cryptographically tamper-evident; this covers the
+#     host-level half: OS logs, shell history, and AgentTrace's own files.
+# ---------------------------------------------------------------------------
+
+_LOG_TAMPER_RE = re.compile(
+    r"(?:shred|rm|mv|truncate|remove-item|clear-content)\b[^\n]*"
+    r"(?:\.log\b|/var/log|%systemroot%[^\n]*logs?|wevtutil)"
+    r"|\bwevtutil\s+cl\b"
+    r"|(?:rm|mv|shred|truncate)\b[^\n]*\.agenttrace[/\\]"
+    r"|(?:history\s+-c\b)|\bclear-history\b"
+    r"|(?:set-content|add-content|out-file|echo\s*>)[^\n]*\.agenttrace[/\\]",
+    re.IGNORECASE,
+)
+
+
+class LogTamperDetector:
+    """Flags attempts to wipe or rewrite logs, history, or AgentTrace files.
+
+    Standalone rule on purpose: until now, log wipes only mattered as the
+    second half of an escalation chain — a bare ``rm /var/log/syslog``
+    produced nothing. Ledger entries are separately protected by the hash
+    chain; this covers every tamper surface that is just a file.
+    """
+
+    detector_id = "log_tampering"
+    name = "Log / Audit Trail Tampering"
+    severity = "high"
+
+    def __init__(self) -> None:
+        self._flagged: dict[str, set[str]] = {}
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        cmd = _command(event)
+        if not cmd:
+            return []
+        match = _LOG_TAMPER_RE.search(cmd)
+        if not match:
+            return []
+
+        key = str(ctx.session_id)
+        # Dedupe per matched target family so one wipe sweep yields one
+        # finding, but distinct targets (OS logs vs history vs ledger dir)
+        # each stay visible.
+        family = match.group(0).lower()[:24]
+        flagged = self._flagged.setdefault(key, set())
+        if family in flagged:
+            return []
+        flagged.add(family)
+
+        return [
+            DetectorFinding(
+                detector_id=self.detector_id,
+                name=self.name,
+                severity=self.severity,
+                confidence=ConfidenceLevel.MEDIUM,
+                description=f"Log/audit artifact tampering attempt: {cmd[:120]}",
+                evidence_refs=[str(event.event_id)],
+                affected_command=cmd[:200],
+                requires_approval=False,
+            )
+        ]
+
+
 DEFAULT_DETECTORS: list[Any] = [
     PromptInjectionDetector(),
     ConfigTamperDetector(),
@@ -1434,4 +1543,5 @@ DEFAULT_DETECTORS: list[Any] = [
     SubagentPrivilegeDetector(),
     ToolChainDetector(),
     RecursiveAgentSpawnDetector(),
+    LogTamperDetector(),
 ]
