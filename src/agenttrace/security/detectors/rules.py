@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import deque
 from typing import Any
 
 from agenttrace.models.events import (
@@ -457,11 +458,15 @@ _PRIV_CMDS = {
     "setfcap",
     "mknod",
     "setuid",
+    "doas",
+    "pkexec",
+    "gsudo",
 }
 _PRIV_RE = re.compile(
     r"\bCAP_(NET_ADMIN|SYS_ADMIN|SYS_PTRACE|SETUID|DAC_OVERRIDE)\b|"
     r"\bip\s+netns\s+add|"
-    r"chmod\s+u\+s|chmod\s+[ug]\+s\b|chmod\s+\d*[4-7]\d\d[0127]?\s",
+    r"chmod\s+u\+s|chmod\s+[ug]\+s\b|chmod\s+\d*[4-7]\d\d[0127]?\s|"
+    r"\bsudo\b|\bsu\s+-|start-process\b[^\n]*-verb\s+runas",
     re.IGNORECASE,
 )
 
@@ -1092,6 +1097,188 @@ class NetworkTunnelSignalsDetector:
         return findings
 
 
+# ---------------------------------------------------------------------------
+# 18. Sub-agent privilege escalation — a spawned descendant running with
+#     more privilege than its parent context (elevation tooling observed
+#     inside the tracked process subtree).
+# ---------------------------------------------------------------------------
+
+class SubagentPrivilegeDetector:
+    """Flags elevation tooling executed by a *descendant* of the session.
+
+    The process-tree observer marks processes whose parent chain traces
+    back into the session subtree (``payload["contained_descendant"]``).
+    Elevation tooling inside that subtree means a sub-agent escalated
+    beyond what the parent session context implies.
+    """
+
+    detector_id = "subagent_privilege_escalation"
+    name = "Sub-agent Privilege Escalation"
+    severity = "high"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        if not isinstance(event, ProcessEvent):
+            return []
+        payload = event.payload or {}
+        # Only descendants attributed to this session's subtree qualify;
+        # unattributed kernel/process events are never claimed.
+        if not payload.get("contained_descendant", False):
+            return []
+        if str(event.actor_id).startswith("unattributed_"):
+            return []
+
+        cmd = event.command_line or ""
+        base = cmd.split()[0].split("/")[-1].lower() if cmd.split() else ""
+        if base in _PRIV_CMDS or _PRIV_RE.search(cmd):
+            return [
+                DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.HIGH,
+                    description=(
+                        f"Descendant process ran elevation tooling: {cmd[:120]}"
+                    ),
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=cmd[:200],
+                )
+            ]
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 19. Benign tool-chain composition — individually harmless calls that
+#     compose into harm (fetch→execute, credential read→egress,
+#     escalate→anti-forensic cleanup). Correlation-level signal: MEDIUM
+#     confidence by design.
+# ---------------------------------------------------------------------------
+
+_ELEVATION_TOOLING_RE = re.compile(
+    r"\b(?:sudo|doas|pkexec|gsudo)\b|\bsu\s+-|start-process\b[^\n]*-verb\s+runas",
+    re.IGNORECASE,
+)
+_FETCH_URL_RE = re.compile(
+    r"\b(?:curl|wget|iwr|invoke-webrequest|invoke-restmethod|fetch)\b[^\n]*https?://",
+    re.IGNORECASE,
+)
+_SECRET_READ_RE = re.compile(
+    r"\.aws[/\\]credentials|\.ssh[/\\]|id_rsa|id_ed25519|\.env\b|"
+    r"credentials\b|\.npmrc|\.pypirc|\.netrc|"
+    r"(?:password|api[_-]?key|secret[_-]?key|access[_-]?token)\s*[:=]",
+    re.IGNORECASE,
+)
+_CLEANUP_RE = re.compile(
+    r"(?:shred|rm|remove-item|clear-content|del|unlink)\b[^\n]*"
+    r"(?:bash_history|zsh_history|psreadline|/var/log|%systemroot%|wevtutil)|"
+    r"\bwevtutil\s+cl\b|\bclear-history\b",
+    re.IGNORECASE,
+)
+_INTERPRETER_EXEC_RE = re.compile(
+    r"(?:^|[\s/])(?:bash|sh|zsh|dash|ksh|pwsh|powershell|python3?|node|perl|ruby)\b",
+    re.IGNORECASE,
+)
+
+
+class ToolChainDetector:
+    """Correlates recent benign-looking steps into harmful compositions.
+
+    State is keyed per session (detector instances are shared across
+    engines). Window is a bounded command count, not wall-clock — an
+    attacker cannot outwait it and a slow machine cannot trip it.
+    Findings are correlation-level (MEDIUM confidence): each step alone
+    is legitimate; the composition is the risk.
+    """
+
+    detector_id = "benign_tool_chain"
+    name = "Suspicious Tool-Chain Composition"
+
+    _WINDOW = 30
+
+    # (recipe id, earlier step kind, later step kind, severity, description)
+    _RECIPES = (
+        (
+            "fetch_then_execute",
+            "fetch",
+            "exec",
+            "high",
+            "Downloaded content followed by interpreter execution "
+            "(split across separate benign-looking calls)",
+        ),
+        (
+            "secret_then_egress",
+            "secret_read",
+            "egress",
+            "high",
+            "Credential material accessed shortly before network egress",
+        ),
+        (
+            "escalate_then_cleanup",
+            "elevate",
+            "cleanup",
+            "medium",
+            "Anti-forensic cleanup shortly after privilege escalation",
+        ),
+    )
+
+    def __init__(self) -> None:
+        self._history: dict[str, deque[tuple[str, str]]] = {}
+        self._fired: dict[str, set[str]] = {}
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        key = str(ctx.session_id)
+        history = self._history.setdefault(key, deque(maxlen=self._WINDOW))
+        fired = self._fired.setdefault(key, set())
+
+        kind, value = self._classify(event)
+        if not kind:
+            return []
+
+        findings: list[DetectorFinding] = []
+        for recipe_id, first_kind, second_kind, severity, description in self._RECIPES:
+            if recipe_id in fired or kind != second_kind:
+                continue
+            if any(k == first_kind for k, _v in history):
+                fired.add(recipe_id)
+                findings.append(
+                    DetectorFinding(
+                        detector_id=self.detector_id,
+                        name=self.name,
+                        severity=severity,
+                        confidence=ConfidenceLevel.MEDIUM,
+                        description=f"{description}: {value[:120]}",
+                        evidence_refs=[str(event.event_id)],
+                        affected_command=value[:200],
+                    )
+                )
+                break
+
+        history.append((kind, value))
+        return findings
+
+    def _classify(self, event: EventBase) -> tuple[str, str]:
+        """Map one event to a chain-relevant (kind, value) pair."""
+        if isinstance(event, CommandEvent):
+            cmd = (event.command or "").strip()
+            if not cmd:
+                return "", ""
+            if _ELEVATION_TOOLING_RE.search(cmd):
+                return "elevate", cmd
+            if _FETCH_URL_RE.search(cmd):
+                return "fetch", cmd
+            if _CLEANUP_RE.search(cmd):
+                return "cleanup", cmd
+            if _SECRET_READ_RE.search(cmd):
+                return "secret_read", cmd
+            if _INTERPRETER_EXEC_RE.search(cmd):
+                return "exec", cmd
+            return "", ""
+        if isinstance(event, NetworkEvent):
+            dest = event.destination_ip or ""
+            port = event.destination_port or 0
+            return "egress", f"{dest}:{port}"
+        return "", ""
+
+
 DEFAULT_DETECTORS: list[Any] = [
     PromptInjectionDetector(),
     ConfigTamperDetector(),
@@ -1110,4 +1297,6 @@ DEFAULT_DETECTORS: list[Any] = [
     GitAuthorSpoofDetector(),
     OrphanedCommitDetector(),
     NetworkTunnelSignalsDetector(),
+    SubagentPrivilegeDetector(),
+    ToolChainDetector(),
 ]

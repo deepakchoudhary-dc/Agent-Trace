@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -175,6 +176,13 @@ _DEFAULT_RULES: list[PolicyRule] = [
 ]
 
 # Dependency manifest filenames
+_ELEVATION_RE = re.compile(
+    r"\b(?:sudo|doas|su|runas|pkexec|gsudo|calife)\b"
+    r"|start-process\b[^\n]*-verb\s+runas"
+    r"|\bverb\s+['\"]?runas\b",
+    re.IGNORECASE,
+)
+
 _MANIFEST_NAMES = {
     "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
     "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
@@ -318,9 +326,11 @@ class PolicyEngine:
         cmd = event.command.lower()
 
         # Privilege escalation
-        privilege_cmds = {"sudo", "runas", "su"}
-        cmd_base = cmd.split()[0] if cmd.split() else ""
-        if cmd_base in privilege_cmds:
+        # Match anywhere in the command, not just the first token:
+        # "env SUDO_ASKPASS=... sudo ...", "/usr/bin/sudo", "xargs sudo"
+        # all bypass first-token matching. Windows elevation covered via
+        # Start-Process -Verb RunAs / gsudo.
+        if _ELEVATION_RE.search(cmd):
             rule = self._rules.get("privilege_escalation")
             if rule and rule.enabled:
                 result.triggered_rules.append(rule)
