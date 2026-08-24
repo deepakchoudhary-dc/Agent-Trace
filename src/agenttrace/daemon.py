@@ -82,6 +82,36 @@ _FLOOD_EVENT_THRESHOLD = 500
 
 # Clock-jump tolerance and finding cooldown (seconds)
 _CLOCK_JUMP_TOLERANCE_SECONDS = 300.0
+
+# Gate hits that approval SCOPE can never satisfy. Secret access always
+# pauses and needs its own finding-specific decision: a broad (possibly
+# orphaned) path/command scope must not silently clear credential gates.
+_SCOPE_IMMUNE_HITS = frozenset({
+    "credential_access",
+    "credential_read",
+    "credential_read_heuristic",
+    "credential_access_drift",
+})
+
+
+def _over_broad_scope_entries(paths: list[str]) -> list[str]:
+    """Return allowed-path entries that effectively disable scope gating."""
+    home = Path.home()
+    over_broad: list[str] = []
+    for p in paths:
+        raw = (p or "").strip()
+        if not raw or raw in {"*", "**", "/", "~"}:
+            over_broad.append(raw or "(empty)")
+            continue
+        try:
+            resolved = Path(raw).expanduser().resolve()
+        except (OSError, ValueError, RuntimeError):
+            continue
+        # Filesystem root ("/", "C:\") or the user's home directory itself.
+        # A root path's parent is itself - the portable root check.
+        if resolved.parent == resolved or len(resolved.parts) <= 1 or resolved == home:
+            over_broad.append(raw)
+    return over_broad
 _CLOCK_FINDING_COOLDOWN_SECONDS = 300.0
 
 # Shell-capable tool names whose tool requests may legitimately explain a
@@ -412,6 +442,7 @@ class AgentTraceDaemon:
         )
 
         # 2. Task Contract & Boundary Engine
+        explicit_paths = allowed_paths is not None
         contract = TaskContract(
             session_id=session.session_id,
             goal=task_description,
@@ -422,6 +453,36 @@ class AgentTraceDaemon:
         )
         self._contracts[session.session_id] = contract
         self._boundaries[session.session_id] = TaskBoundaryEngine(contract)
+
+        # Misconfigured-scope tripwire: an explicitly supplied allowed_paths
+        # that covers the filesystem at large (root, drive, home, glob-all)
+        # silently disables the write_outside_scope gate for everything.
+        # Record it as a HIGH finding so the misconfiguration is visible in
+        # findings, timeline, and reports instead of passing silently.
+        if explicit_paths:
+            over_broad = _over_broad_scope_entries(contract.allowed_paths)
+            if over_broad:
+                logger.warning(
+                    "Session %s started with over-broad allowed scope: %s",
+                    session.session_id,
+                    over_broad,
+                )
+                with contextlib.suppress(Exception):
+                    self._ledger.append_event(PolicyFindingEvent(
+                        session_id=session.session_id,
+                        actor_id="daemon",
+                        source_adapter="task_boundary",
+                        confidence=ConfidenceLevel.HIGH,
+                        finding_type="over_broad_scope",
+                        severity="high",
+                        description=(
+                            "Session scope allowlist is over-broad "
+                            f"({', '.join(over_broad[:5])}) — writes outside "
+                            "meaningful boundaries will not be flagged. Narrow "
+                            "allowed_paths to real workspace subtrees."
+                        ),
+                        evidence_refs=[str(session.session_id)],
+                    ))
         self._ledger.store_task_contract(
             contract_id=contract.contract_id,
             session_id=session.session_id,
@@ -1484,17 +1545,21 @@ class AgentTraceDaemon:
                 self._ledger.append_event(blocked_event)
             return False, f"BLOCKED: {desc}", ""
 
-        # 4. Boundary hits — pause unless covered by an active approval
+        # 4. Boundary hits — pause unless covered by an active approval.
+        # Credential-family drift is scope-immune: an approval's path/command
+        # scope can never pre-clear secret access, no matter how the scope
+        # was worded — that is the "orphaned approval enables later misuse"
+        # failure mode.
         for drift_type, desc, path, cmd in boundary_hits:
-            if approvals and approvals.check_approval(
+            if drift_type not in _SCOPE_IMMUNE_HITS and approvals and approvals.check_approval(
                 finding_id=None, path=path or None, command=cmd or None
             ):
                 continue
             return False, f"APPROVAL REQUIRED: {desc}", drift_type
 
-        # 5. Policy hits — pause unless covered by an active approval
+        # 5. Policy hits — same rule: credential gates always pause.
         for rule_id, desc in policy_hits:
-            if approvals and approvals.check_approval(
+            if rule_id not in _SCOPE_IMMUNE_HITS and approvals and approvals.check_approval(
                 finding_id=None,
                 path=None if action_type == "command" else target,
                 command=target if action_type == "command" else None,

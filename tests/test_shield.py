@@ -61,7 +61,10 @@ def _create_session(data_dir: Path, port: int, workspace: str) -> str:
         data=payload,
         headers={"Content-Type": "application/json", "X-AgentTrace-Token": token},
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 (loopback only)
+    # Session creation baselines the workspace and starts observers —
+    # legitimately multi-second server-side work; a 5s timeout made this
+    # flaky under suite load.
+    with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (loopback only)
         return json.loads(resp.read().decode())["session_id"]
 
 

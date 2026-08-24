@@ -600,3 +600,83 @@ def test_run_server_watchdog_raises_after_many_crashes(
 
     with pytest.raises(RuntimeError):
         run_server(tmp_path / "data", 8765)
+
+
+# -- Human-in-the-loop hardening: fatigue, orphaned scope, misconfig -------
+
+@pytest.mark.asyncio
+async def test_credential_gate_is_scope_immune(tmp_path: Path) -> None:
+    """A broad approval scope must NOT pre-clear credential-access gates."""
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    await daemon.start()
+    try:
+        session = await daemon.create_session(
+            workspace_path=str(tmp_path),
+            task_description="t",
+            agent_type=AgentType.GENERIC,
+        )
+        sid = session.session_id
+
+        # Approve a WIDE path scope (covers the whole workspace).
+        approvals = daemon._approvals[sid]
+        approvals.record_approval(
+            finding_id="destructive_file_op",
+            approved=True,
+            reason="broad grant",
+            affected_paths=[str(tmp_path)],
+        )
+
+        allowed, reason, _ = await daemon.evaluate_proposed_action(
+            sid, "file_mutation", str(tmp_path / ".env"), {"mutation_type": "modify"}
+        )
+        assert not allowed
+        assert "APPROVAL REQUIRED" in reason
+        assert "credential" in reason.lower() or "secret" in reason.lower()
+    finally:
+        await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_over_broad_allowlist_recorded_as_finding(tmp_path: Path) -> None:
+    """Explicit root/home-level allowed_paths produce a visible HIGH finding."""
+    (tmp_path / "ws").mkdir()
+    (tmp_path / "ws2").mkdir()
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    await daemon.start()
+    try:
+        await daemon.create_session(
+            workspace_path=tmp_path / "ws",
+            task_description="t",
+            agent_type=AgentType.GENERIC,
+            allowed_paths=["/", str(tmp_path / "ws")],
+        )
+        findings = daemon.get_findings(daemon.list_sessions()[0].session_id)
+        assert any(f.finding_type == "over_broad_scope" for f in findings)
+
+        # Clean scope: no such finding.
+        clean = await daemon.create_session(
+            workspace_path=tmp_path / "ws2",
+            task_description="t",
+            agent_type=AgentType.GENERIC,
+            allowed_paths=None,
+        )
+        assert not any(
+            f.finding_type == "over_broad_scope"
+            for f in daemon.get_findings(clean.session_id)
+        )
+    finally:
+        await daemon.stop()
+
+
+def test_over_broad_scope_detector_unit(tmp_path: Path) -> None:
+    from pathlib import Path as _Path
+
+    from agenttrace.daemon import _over_broad_scope_entries
+
+    assert "/" in _over_broad_scope_entries(["/"])
+    assert "**" in _over_broad_scope_entries(["**"])
+    assert "(empty)" in _over_broad_scope_entries(["", str(tmp_path)])
+    home = _Path.home()
+    assert str(home) in _over_broad_scope_entries([str(home), "/x/y"])
+    deep = tmp_path / "a" / "b" / "proj"
+    assert _over_broad_scope_entries([str(deep)]) == []
