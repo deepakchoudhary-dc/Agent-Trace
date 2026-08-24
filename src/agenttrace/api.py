@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agenttrace.daemon import AgentTraceDaemon
+from agenttrace.graph.assistant import narrate_paths, recommended_action
 from agenttrace.graph.blast_radius import BlastRadiusAnalyzer
 from agenttrace.graph.causal_engine import CausalExplanationEngine
 from agenttrace.graph.replay import ReplayEngine
@@ -140,6 +141,9 @@ class FindingDTO(BaseModel):
     requires_approval: bool = True
     auto_resolved: bool = False
     timestamp: str
+    # Operator guidance for this finding type (imperative for a HUMAN,
+    # never an autonomous action the daemon will take).
+    recommended_action: str = ""
 
 
 class DiffItemDTO(BaseModel):
@@ -351,6 +355,76 @@ async def verify_chain(session_id: UUID) -> VerifyResponse:
     )
 
 
+@app.get("/sessions/{session_id}/brief")
+async def get_session_brief(session_id: UUID) -> dict[str, Any]:
+    """Operator briefing: what happened, what needs attention, what to do.
+
+    Read-only aggregation over findings, approvals, and activity — the
+    'catch me up' endpoint for a human returning to a session.
+    """
+    session = daemon.get_session(session_id)
+    stored = daemon._ledger.get_session(session_id)
+    if not session and not stored:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    findings = daemon.get_findings(session_id)
+    severity_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    for f in findings:
+        sev = getattr(f, "severity", "medium")
+        ftype = getattr(f, "finding_type", "policy_finding")
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+        type_counts[ftype] = type_counts.get(ftype, 0) + 1
+
+    critical = [
+        {
+            "finding_type": getattr(f, "finding_type", ""),
+            "severity": getattr(f, "severity", ""),
+            "description": getattr(f, "description", "")[:200],
+            "recommended_action": recommended_action(
+                getattr(f, "finding_type", None)
+            ),
+        }
+        for f in findings
+        if getattr(f, "severity", "") in {"critical", "high"}
+    ]
+
+    approvals = daemon._ledger.get_approvals(session_id)
+    now = datetime.now(timezone.utc)
+    open_approvals = []
+    for rec in approvals:
+        if rec.get("status") != "granted":
+            continue
+        try:
+            expiry = (
+                datetime.fromisoformat(rec["expiry"]) if rec.get("expiry") else None
+            )
+        except (ValueError, TypeError):
+            expiry = None
+        if expiry and now > expiry:
+            continue
+        open_approvals.append({
+            "finding_id": rec.get("finding_id", ""),
+            "scope": rec.get("scope", ""),
+            "expiry": rec.get("expiry", ""),
+        })
+
+    timeline = daemon.get_timeline(session_id)
+    last_activity = timeline[-1].timestamp.isoformat() if timeline else None
+
+    return {
+        "session_id": str(session_id),
+        "status": session.status.value if session else "stopped",
+        "total_findings": len(findings),
+        "by_severity": severity_counts,
+        "by_type": type_counts,
+        "attention": sorted(critical, key=lambda c: c["severity"] != "critical"),
+        "open_approvals": open_approvals,
+        "integrity_failures": daemon._ledger.integrity_failure_count,
+        "last_activity": last_activity,
+    }
+
+
 # -- Timeline & Diff Endpoints --
 
 @app.get("/sessions/{session_id}/timeline")
@@ -510,6 +584,9 @@ async def get_findings(session_id: UUID) -> list[FindingDTO]:
                 requires_approval=getattr(evt, "requires_approval", True),
                 auto_resolved=resolved,
                 timestamp=evt.timestamp.isoformat(),
+                recommended_action=recommended_action(
+                    getattr(evt, "finding_type", None)
+                ),
             )
         )
     return results
@@ -855,8 +932,14 @@ async def get_causal_chain(session_id: UUID, target_node_id: UUID) -> dict[str, 
 
     engine = CausalExplanationEngine(graph)
     paths = engine.explain(target_node_id)
+
+    target = graph.get_node(target_node_id)
+    target_label = target.label if target else str(target_node_id)
+    narrative = narrate_paths(
+        paths, target_label, graph.get_node, graph.get_edge
+    )
     if paths:
-        return paths[0].model_dump(mode="json")
+        return {**paths[0].model_dump(mode="json"), "narrative": narrative}
     return {
         "path_id": "direct_observation",
         "nodes": [str(target_node_id)],
@@ -864,6 +947,7 @@ async def get_causal_chain(session_id: UUID, target_node_id: UUID) -> dict[str, 
         "overall_confidence": 1.0,
         "description": "Direct node observation without prior causal antecedents",
         "evidence_summary": "Origin node reached",
+        "narrative": narrative,
     }
 
 

@@ -680,3 +680,52 @@ def test_over_broad_scope_detector_unit(tmp_path: Path) -> None:
     assert str(home) in _over_broad_scope_entries([str(home), "/x/y"])
     deep = tmp_path / "a" / "b" / "proj"
     assert _over_broad_scope_entries([str(deep)]) == []
+
+
+# -- GOD-Assistant layer: recommendations, narrative, brief ------------------
+
+def test_recommended_actions_cover_all_detectors_and_rules() -> None:
+    """Every detector/rule id must have operator guidance - no silent gaps."""
+    from agenttrace.graph.assistant import RECOMMENDED_ACTIONS, recommended_action
+    from agenttrace.security.detectors.rules import DEFAULT_DETECTORS
+    from agenttrace.security.policy import PolicyEngine
+
+    ids = {d.detector_id for d in DEFAULT_DETECTORS}
+    ids |= set(PolicyEngine(uuid4()).get_rules().keys())
+    missing = [i for i in sorted(ids) if i not in RECOMMENDED_ACTIONS]
+    assert not missing, f"no recommended_action for: {missing}"
+    assert recommended_action("totally_unknown")  # honest fallback exists
+
+
+def test_brief_endpoint_aggregates_session_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    test_tokens = ApiTokenManager(tmp_path / "data")
+    monkeypatch.setattr(api, "daemon", daemon)
+    monkeypatch.setattr(api, "token_manager", test_tokens)
+
+    with TestClient(api.app) as c:
+        token = {"X-AgentTrace-Token": test_tokens.token()}
+        res = c.post(
+            "/sessions",
+            json={"workspace_path": str(tmp_path), "task_description": "t",
+                  "agent_type": "generic"},
+            headers=token,
+        )
+        sid = res.json()["session_id"]
+
+        brief = c.get(f"/sessions/{sid}/brief", headers=token).json()
+        assert brief["session_id"] == sid
+        assert "by_severity" in brief and "attention" in brief
+        assert "open_approvals" in brief and "integrity_failures" in brief
+
+
+def test_causal_narrative_names_unexplained_origins() -> None:
+    """No causal chain -> the assistant says 'unexplained', never invents one."""
+    from agenttrace.graph.assistant import narrate_paths
+
+    result = narrate_paths([], "mystery-action", lambda _id: None, lambda _id: None)
+    assert "unexplained origin" in result["summary"]
+    assert result["steps"] == []
+    assert result["unknowns"]

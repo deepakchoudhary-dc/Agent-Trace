@@ -635,6 +635,48 @@ def verify(session_id: str) -> None:
 
 @main.command()
 @click.argument("session_id")
+def brief(session_id: str) -> None:
+    """Operator briefing: what happened and what needs your attention."""
+    sid = UUID(session_id)
+    try:
+        res = _call_api(f"/sessions/{sid}/brief")
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(res, dict):
+        console.print("[red]Unexpected API response[/red]")
+        return
+
+    sev = res.get("by_severity", {})
+    lines = [
+        f"Session:   {sid}",
+        f"Status:    {res.get('status', '?')}",
+        f"Findings:  {res.get('total_findings', 0)} "
+        f"(critical={sev.get('critical', 0)}, high={sev.get('high', 0)}, "
+        f"medium={sev.get('medium', 0)}, low={sev.get('low', 0)})",
+        f"Approvals open: {len(res.get('open_approvals', []))}",
+        f"Integrity failures: {res.get('integrity_failures', 0)}",
+        f"Last activity: {res.get('last_activity', 'none')}",
+    ]
+    console.print(Panel("\n".join(lines), title="📋 Session Brief", border_style="blue"))
+
+    attention = res.get("attention", [])
+    if attention:
+        console.print("[bold]Needs attention:[/bold]")
+        for item in attention[:8]:
+            console.print(
+                f"  [{item['severity']}] {item['finding_type']}: "
+                f"{item['description']}"
+            )
+            action = item.get("recommended_action")
+            if action:
+                console.print(f"    → [cyan]{action}[/cyan]")
+    else:
+        console.print("[green]Nothing needs immediate attention.[/green]")
+
+
+@main.command()
+@click.argument("session_id")
 @click.option(
     "--output", "-o",
     type=click.Path(),
