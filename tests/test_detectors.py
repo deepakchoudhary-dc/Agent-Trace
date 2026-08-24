@@ -661,7 +661,8 @@ class TestNetworkTunnelSignalsDetector:
         engine = _engine()
         session = uuid4()
         base = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
-        volume_findings = 0
+        dns_volume_findings = 0
+        beacon_findings = 0
         for i in range(30):
             findings = engine.evaluate(NetworkEvent(
                 actor_id="test",
@@ -673,10 +674,17 @@ class TestNetworkTunnelSignalsDetector:
                 direction="outbound",
                 timestamp=base + timedelta(seconds=i),
             ))
-            volume_findings += sum(
-                1 for f in findings if f.detector_id == "network_tunnel"
+            dns_volume_findings += sum(
+                1 for f in findings
+                if f.detector_id == "network_tunnel" and "covert channel" in f.description
             )
-        assert volume_findings == 1
+            beacon_findings += sum(
+                1 for f in findings if "Repeated outbound contact" in f.description
+            )
+        # Dense DNS burst -> one chunked-channel signal; the same stream is
+        # also repeated contact with a single endpoint -> one beacon signal.
+        assert dns_volume_findings == 1
+        assert beacon_findings == 1
 
 
 # -- Elevation widening, sub-agent escalation, tool-chain composition ------
@@ -816,3 +824,72 @@ class TestToolChainDetector:
             destination_ip="1.1.1.1", destination_port=443, protocol="tcp",
         )
         assert not any(f.detector_id == "benign_tool_chain" for f in engine.evaluate(net2))
+
+
+class TestRecursiveAgentSpawnDetector:
+    def test_flags_agent_cli_invocation(self) -> None:
+        engine = _engine()
+        findings = engine.evaluate(
+            _command("claude -p 'review this and act autonomously'")
+        )
+        assert any(f.detector_id == "recursive_agent_spawn" for f in findings)
+
+    def test_flags_codex_exec_invocation(self) -> None:
+        engine = _engine()
+        findings = engine.evaluate(_command("codex exec --full-auto 'fix it'"))
+        assert any(f.detector_id == "recursive_agent_spawn" for f in findings)
+
+    def test_flags_writing_spawnable_agent_surface(self) -> None:
+        from agenttrace.models.events import FileMutationEvent
+
+        engine = _engine()
+        findings = engine.evaluate(FileMutationEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="fs",
+            file_path="/ws/.claude/agents/backdoor.md",
+            mutation_type="create",
+            diff_summary="---\nname: helper\ntools: [Bash]\n---",
+        ))
+        assert any(f.detector_id == "recursive_agent_spawn" for f in findings)
+        assert any(f.detector_id == "config_tamper" for f in findings)
+
+    def test_normal_commands_do_not_fire(self) -> None:
+        engine = _engine()
+        for c in ("claude --version", "pip install claude-tools", "git push origin main"):
+            findings = engine.evaluate(_command(c))
+            assert not any(f.detector_id == "recursive_agent_spawn" for f in findings), c
+
+
+class TestBeaconingDetection:
+    def _net(self, dest: str, port: int) -> NetworkEvent:
+        return NetworkEvent(
+            actor_id="test",
+            session_id=uuid4(),
+            source_adapter="test",
+            destination_ip=dest,
+            destination_port=port,
+            protocol="tcp",
+            direction="outbound",
+        )
+
+    def test_repeated_contact_same_endpoint_fires_once(self) -> None:
+        import agenttrace.security.detectors.rules as rules_mod
+
+        engine = DetectionEngine(uuid4())
+        findings = []
+        for _ in range(rules_mod._BEACON_CONTACT_VOLUME):
+            findings.extend(engine.evaluate(self._net("203.0.113.50", 443)))
+        beacons = [
+            f for f in findings if "Repeated outbound contact" in f.description
+        ]
+        assert len(beacons) == 1
+
+    def test_distributed_destinations_do_not_beacon(self) -> None:
+        import agenttrace.security.detectors.rules as rules_mod
+
+        engine = DetectionEngine(uuid4())
+        findings = []
+        for i in range(rules_mod._BEACON_CONTACT_VOLUME + 2):
+            findings.extend(engine.evaluate(self._net(f"203.0.113.{i}", 443)))
+        assert not any("Repeated outbound contact" in f.description for f in findings)

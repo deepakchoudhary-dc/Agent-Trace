@@ -14,7 +14,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from agenttrace.models.events import ConfidenceLevel, EventBase, NetworkEvent
+from agenttrace.models.events import (
+    CommandEvent,
+    ConfidenceLevel,
+    EventBase,
+    NetworkEvent,
+)
 
 if TYPE_CHECKING:
     from agenttrace.storage.ledger import EventLedger
@@ -62,6 +67,13 @@ _GAPS: dict[str, str] = {
         "The same agent identity drove both sessions. Account sharing is "
         "observable; the intent behind it is not."
     ),
+    "complementary_roles": (
+        "One session showed privilege-escalation activity while another "
+        "showed anti-forensic cleanup, with a shared identity or egress "
+        "destination. Division of labor is consistent with collusion but "
+        "equally consistent with coincidental parallel work — intent is "
+        "not observable at host level."
+    ),
 }
 
 
@@ -87,6 +99,7 @@ class CollusionCorrelationEngine:
             candidates.extend(self._shared_artifacts(sids))
             candidates.extend(self._reused_egress(sids))
             candidates.extend(self._shared_actors(sids))
+            candidates.extend(self._complementary_roles(sids))
         return candidates
 
     def for_session(self, session_id: UUID) -> list[CollusionCandidate]:
@@ -187,4 +200,85 @@ class CollusionCorrelationEngine:
                 evidence_event_ids=sorted(entry["events"]),
                 reasoning_gap=_GAPS["shared_actor"],
             ))
+        return out
+
+    def _complementary_roles(self, sids: list[UUID]) -> list[CollusionCandidate]:
+        """One session escalates while another cleans up, sharing identity/egress.
+
+        The collusion hypothesis with the highest stakes: agents dividing
+        labor so one reaches for privilege while another erases traces.
+        Only fires when the two behavior families appear in DIFFERENT
+        sessions that also share an actor identity or egress destination —
+        a single session doing both is handled by per-session detectors.
+        """
+        import re
+
+        elevation_re = re.compile(
+            r"\b(?:sudo|doas|pkexec|gsudo)\b|\bsu\s+-|"
+            r"chmod\s+u\+s|start-process\b[^\n]*-verb\s+runas",
+            re.IGNORECASE,
+        )
+        cleanup_re = re.compile(
+            r"(?:shred|rm|remove-item|clear-content)\b[^\n]*"
+            r"(?:bash_history|zsh_history|psreadline|/var/log)|"
+            r"\bwevtutil\s+cl\b",
+            re.IGNORECASE,
+        )
+
+        escalating: dict[str, dict[str, set[str]]] = {}  # sid -> actor -> event ids
+        cleaning: dict[str, dict[str, set[str]]] = {}
+        actors_by_sid: dict[str, set[str]] = {}
+        egress_by_sid: dict[str, set[str]] = {}
+
+        for sid in sids:
+            for evt in self._events(sid):
+                if evt.actor_id and evt.actor_id not in _INFRA_ACTORS:
+                    actors_by_sid.setdefault(str(sid), set()).add(evt.actor_id)
+                if isinstance(evt, NetworkEvent) and evt.direction == "outbound":
+                    egress_by_sid.setdefault(str(sid), set()).add(
+                        f"{evt.destination_ip}:{evt.destination_port}"
+                    )
+                if not isinstance(evt, CommandEvent):
+                    continue
+                cmd = evt.command or ""
+                bucket = None
+                if elevation_re.search(cmd):
+                    bucket = escalating
+                elif cleanup_re.search(cmd):
+                    bucket = cleaning
+                if bucket is not None:
+                    entry = bucket.setdefault(str(sid), {})
+                    entry.setdefault(evt.actor_id, set()).add(str(evt.event_id))
+
+        out: list[CollusionCandidate] = []
+
+        def _linked(a: str, b: str) -> bool:
+            return bool(
+                actors_by_sid.get(a, set()) & actors_by_sid.get(b, set())
+                or egress_by_sid.get(a, set()) & egress_by_sid.get(b, set())
+            )
+
+        for esc_sid, esc_actors in escalating.items():
+            for clean_sid, _clean_actors in cleaning.items():
+                if esc_sid == clean_sid or not _linked(esc_sid, clean_sid):
+                    continue
+                evidence = sorted(
+                    eid
+                    for entry in (esc_actors, cleaning[clean_sid])
+                    for evs in entry.values()
+                    for eid in evs
+                )
+                out.append(CollusionCandidate(
+                    signal="complementary_roles",
+                    session_ids=sorted({esc_sid, clean_sid}),
+                    actors=sorted(set(esc_actors) | set(cleaning[clean_sid])),
+                    detail=(
+                        f"escalation in {esc_sid} paired with anti-forensic "
+                        f"cleanup in {clean_sid}"
+                    ),
+                    confidence=ConfidenceLevel.MEDIUM,
+                    evidence_event_ids=evidence,
+                    reasoning_gap=_GAPS["complementary_roles"],
+                ))
+                break  # one candidate per escalating session
         return out

@@ -129,10 +129,13 @@ class PromptInjectionDetector:
 _TAMPER_PATTERNS: tuple[str, ...] = (
     r"\.claude[/\\]settings(\.local)?\.json$",
     r"\.claude\.json$",
+    r"\.claude[/\\]agents[/\\]",
+    r"\.claude[/\\]commands[/\\]",
     r"CLAUDE\.md$",
     r"AGENTS\.md$",
     r"\.cursorrules$",
     r"\.cursor[/\\](rules[/\\]|mcp\.json$|settings\.json$)",
+    r"\.mcp\.json$",
     r"\.vscode[/\\]settings\.json$",
     r"\.vscode[/\\]tasks\.json$",
     r"\.copilot[/\\]config\.json$",
@@ -978,6 +981,7 @@ _DNS_BLOB_LABEL_RE = re.compile(
 _DNS_TUNNEL_WINDOW_SECONDS = 60.0
 _DNS_TUNNEL_VOLUME = 15
 _ICMP_TUNNEL_VOLUME = 15
+_BEACON_CONTACT_VOLUME = 8
 
 
 class NetworkTunnelSignalsDetector:
@@ -1089,6 +1093,32 @@ class NetworkTunnelSignalsDetector:
                     finding = self._volume_finding(event, ctx, "ICMP", destination)
                     if finding is not None:
                         findings.append(finding)
+
+            # Beaconing: dense contact with a single endpoint on ANY port —
+            # the C2-polling pattern used to fetch instructions that steer
+            # behavior around local policy. Correlation-level signal.
+            beacon_key = ("beacon", destination)
+            beacon_queue = bucket.setdefault(beacon_key, [])
+            beacon_queue.append(now)
+            if (
+                len(beacon_queue) >= _BEACON_CONTACT_VOLUME
+                and beacon_key not in self._volume_flagged.get(session_key, set())
+            ):
+                self._volume_flagged.setdefault(session_key, set()).add(beacon_key)
+                findings.append(DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity="medium",
+                    confidence=ConfidenceLevel.LOW,
+                    description=(
+                        f"Repeated outbound contact to {destination} "
+                        f"({len(beacon_queue)}x in "
+                        f"{int(_DNS_TUNNEL_WINDOW_SECONDS)}s) — consistent "
+                        "with external coordination/beaconing"
+                    ),
+                    evidence_refs=[str(event.event_id)],
+                    requires_approval=False,
+                ))
 
             # Prune entries outside the window so the volume signal decays.
             for key, queue in bucket.items():
@@ -1279,6 +1309,67 @@ class ToolChainDetector:
         return "", ""
 
 
+# ---------------------------------------------------------------------------
+# 20. Recursive agent spawning — an agent writing/spawning another agent.
+#     Out-of-spec by definition: the audited session was approved to act,
+#     not to mint new unapproved actors.
+# ---------------------------------------------------------------------------
+
+_AGENT_SPAWN_RE = re.compile(
+    r"(?:^|[\s/])claude\s+(?:-p\b|--print\b|--dangerously)"
+    r"|(?:^|[\s/])codex\s+(?:exec\b|e\b|--full-auto|--dangerously-bypass)"
+    r"|\bnpx\b[^\n]*(?:@anthropic-ai/)?claude"
+    r"|\bpip\s+install\b[^\n]*-e?\s*git\+https?://[^\n]*(?:agent|bot)",
+    re.IGNORECASE,
+)
+
+
+class RecursiveAgentSpawnDetector:
+    """Flags an agent creating or invoking additional agents.
+
+    Covers both directions of "recursive agent": command-line spawning of
+    agent CLIs from inside a session, and writing files whose content
+    registers/defines new agent behavior (subagent definitions, MCP server
+    registrations). Path-based registration is additionally caught by
+    ConfigTamperDetector; this rule adds the invocation/content signal.
+    """
+
+    detector_id = "recursive_agent_spawn"
+    name = "Recursive Agent Spawning"
+    severity = "high"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        surfaces: list[tuple[str, str]] = []
+        cmd = _command(event)
+        if cmd and _AGENT_SPAWN_RE.search(cmd):
+            surfaces.append((cmd[:200], "invoked an agent CLI recursively"))
+        if isinstance(event, FileMutationEvent) and event.diff_summary:
+            if _AGENT_SPAWN_RE.search(event.diff_summary):
+                surfaces.append(
+                    (event.diff_summary[:200], "wrote content that spawns an agent")
+                )
+            path = event.file_path.replace("\\", "/").lower()
+            if ".claude/agents/" in path or path.endswith(".mcp.json"):
+                surfaces.append(
+                    (event.file_path, f"{event.mutation_type} of spawnable agent surface")
+                )
+        findings: list[DetectorFinding] = []
+        for detail, what in surfaces:
+            findings.append(
+                DetectorFinding(
+                    detector_id=self.detector_id,
+                    name=self.name,
+                    severity=self.severity,
+                    confidence=ConfidenceLevel.HIGH,
+                    description=f"Agent {what}: {detail}",
+                    evidence_refs=[str(event.event_id)],
+                    affected_command=detail,
+                    requires_approval=False,
+                )
+            )
+        return findings
+
+
 DEFAULT_DETECTORS: list[Any] = [
     PromptInjectionDetector(),
     ConfigTamperDetector(),
@@ -1299,4 +1390,5 @@ DEFAULT_DETECTORS: list[Any] = [
     NetworkTunnelSignalsDetector(),
     SubagentPrivilegeDetector(),
     ToolChainDetector(),
+    RecursiveAgentSpawnDetector(),
 ]

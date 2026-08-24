@@ -163,3 +163,63 @@ class TestIsolation:
         d = c.to_dict()
         assert d["confidence"] == "high"
         assert isinstance(d, dict)
+
+
+class TestComplementaryRoles:
+    def test_escalation_cleanup_pairing_across_linked_sessions(
+        self, tmp_path: Path
+    ) -> None:
+        ledger = _ledger(tmp_path)
+        s1 = _session(ledger, "/ws", "a")
+        s2 = _session(ledger, "/ws", "b")
+
+        # Session 1 reaches for privilege; session 2 erases traces; both
+        # share actor identity "agentA" (same identity driving both).
+        ledger.append_event(CommandEvent(
+            session_id=s1, actor_id="agentA", source_adapter="shell",
+            command="sudo chmod 4755 /usr/bin/env",
+        ))
+        ledger.append_event(CommandEvent(
+            session_id=s2, actor_id="agentA", source_adapter="shell",
+            command="shred ~/.bash_history",
+        ))
+
+        candidates = CollusionCorrelationEngine(ledger).candidates()
+        comp = [c for c in candidates if c.signal == "complementary_roles"]
+        assert len(comp) == 1
+        assert set(comp[0].session_ids) == {str(s1), str(s2)}
+        assert comp[0].confidence == ConfidenceLevel.MEDIUM
+
+    def test_unlinked_sessions_are_not_candidates(self, tmp_path: Path) -> None:
+        ledger = _ledger(tmp_path)
+        s1 = _session(ledger, "/ws", "a")
+        s2 = _session(ledger, "/ws", "b")
+
+        # Same behavior families but NO shared actor or egress destination.
+        ledger.append_event(CommandEvent(
+            session_id=s1, actor_id="soloA", source_adapter="shell",
+            command="sudo chmod 4755 /usr/bin/env",
+        ))
+        ledger.append_event(CommandEvent(
+            session_id=s2, actor_id="soloB", source_adapter="shell",
+            command="shred ~/.bash_history",
+        ))
+
+        candidates = CollusionCorrelationEngine(ledger).candidates()
+        assert not any(c.signal == "complementary_roles" for c in candidates)
+
+    def test_single_session_doing_both_is_not_a_pair(self, tmp_path: Path) -> None:
+        ledger = _ledger(tmp_path)
+        s1 = _session(ledger, "/ws", "a")
+        _session(ledger, "/ws", "b")
+        # Both behaviors inside ONE session; other session is quiet.
+        ledger.append_event(CommandEvent(
+            session_id=s1, actor_id="agentA", source_adapter="shell",
+            command="sudo chmod 4755 /usr/bin/env",
+        ))
+        ledger.append_event(CommandEvent(
+            session_id=s1, actor_id="agentA", source_adapter="shell",
+            command="shred ~/.bash_history",
+        ))
+        candidates = CollusionCorrelationEngine(ledger).candidates()
+        assert not any(c.signal == "complementary_roles" for c in candidates)
