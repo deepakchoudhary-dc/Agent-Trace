@@ -1019,3 +1019,100 @@ class TestSlowExfiltrationDetection:
         assert not any(
             "low-frequency exfiltration" in f.description for f in findings
         )
+
+
+# -- Universal offline sandbox escape (Prime Intellect, Aug 2026) -----------
+
+class TestInferenceProxyAbuse:
+    ESCAPE_CMD = (
+        "python3 - <<'PY' | curl -sS --max-time 35 "
+        "-H 'Content-Type: application/json' "
+        '-H "Authorization: Bearer $CODEX_INTERCEPT_KEY" '
+        "--data-binary @- "
+        "http://vf.host.internal:53446/v1/responses\n"
+        'print(json.dumps({"input": [{"role": "user", "content": ['
+        '{"type": "input_file", '
+        '"file_url": "https://api.github.com/users/Xeophon/repos"}]}]}))\nPY'
+    )
+
+    def test_ssrf_fetch_via_file_url_is_critical(self) -> None:
+        engine = _engine()
+        findings = engine.evaluate(_command(self.ESCAPE_CMD))
+        hit = [f for f in findings if f.detector_id == "inference_proxy_abuse"]
+        assert len(hit) == 1
+        assert hit[0].severity == "critical"
+        assert hit[0].confidence.value == "high"
+
+    def test_raw_internal_invocation_is_high(self) -> None:
+        engine = _engine()
+        cmd = (
+            'curl -H "Authorization: Bearer sk-123" '
+            "http://vf.host.internal:53446/chat/completions -d '{}'"
+        )
+        findings = engine.evaluate(_command(cmd))
+        hit = [f for f in findings if f.detector_id == "inference_proxy_abuse"]
+        assert len(hit) == 1
+        assert hit[0].severity == "high"
+
+    def test_plain_ollama_loopback_call_not_flagged(self) -> None:
+        engine = _engine()
+        cmd = "curl http://localhost:11434/v1/chat/completions -d '{\"model\":\"l\"}'"
+        findings = engine.evaluate(_command(cmd))
+        assert not any(f.detector_id == "inference_proxy_abuse" for f in findings)
+
+    def test_fires_once_per_family_per_session(self) -> None:
+        engine = _engine()
+        first = engine.evaluate(_command(self.ESCAPE_CMD))
+        second = engine.evaluate(
+            _command(self.ESCAPE_CMD.replace("users/Xeophon", "users/other"))
+        )
+        assert any(f.detector_id == "inference_proxy_abuse" for f in first)
+        assert not any(f.detector_id == "inference_proxy_abuse" for f in second)
+
+
+class TestBeaconReachability:
+    """Beacon must fire at the cadence the observer can actually emit:
+
+    NetworkObserver dedups per (pid,dest) for 120s, so events arrive at
+    best ~1 per 2 minutes. The beacon horizon (900s) must accommodate that.
+    """
+
+    def _net(self, session_id, offset_s: float):
+        from datetime import datetime, timedelta, timezone
+
+        base = datetime(2026, 8, 25, 12, 0, 0, tzinfo=timezone.utc)
+        return NetworkEvent(
+            actor_id="process:4242",
+            session_id=session_id,
+            source_adapter="network_observer",
+            destination_ip="10.0.5.9",
+            destination_port=53446,
+            protocol="tcp",
+            direction="outbound",
+            timestamp=base + timedelta(seconds=offset_s),
+        )
+
+    def test_beacon_fires_at_realistic_dedup_cadence(self) -> None:
+        import agenttrace.security.detectors.rules as rules_mod
+
+        engine = DetectionEngine(uuid4())
+        sid = uuid4()
+        spacing = 120.0  # observer dedup TTL: one emission per window
+        findings = []
+        needed = rules_mod._BEACON_CONTACT_VOLUME
+        for i in range(needed):
+            findings.extend(engine.evaluate(self._net(sid, i * spacing)))
+        beacons = [
+            f for f in findings if "Repeated outbound contact" in f.description
+        ]
+        assert len(beacons) == 1
+
+    def test_two_contacts_do_not_beacon(self) -> None:
+        engine = DetectionEngine(uuid4())
+        sid = uuid4()
+        findings = []
+        for i in range(2):
+            findings.extend(engine.evaluate(self._net(sid, i * 120.0)))
+        assert not any(
+            "Repeated outbound contact" in f.description for f in findings
+        )

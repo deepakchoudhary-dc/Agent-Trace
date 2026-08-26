@@ -987,7 +987,13 @@ _DNS_BLOB_LABEL_RE = re.compile(
 _DNS_TUNNEL_WINDOW_SECONDS = 60.0
 _DNS_TUNNEL_VOLUME = 15
 _ICMP_TUNNEL_VOLUME = 15
-_BEACON_CONTACT_VOLUME = 8
+# Beaconing must be reachable GIVEN the observer pipeline: NetworkObserver
+# dedups per (pid, dest) for 120s, so emissions arrive at most ~1/120s. A
+# 60s window could therefore NEVER accumulate enough events (dead signal).
+# The beacon horizon spans that reality: repeated contact with one endpoint
+# across minutes - the C2/inference-proxy polling cadence.
+_BEACON_CONTACT_VOLUME = 6
+_BEACON_WINDOW_SECONDS = 900.0
 # Low-and-slow exfiltration: enough contacts, spread far enough apart,
 # to be pacing rather than a burst. Never window-pruned (session horizon).
 _TRICKLE_CONTACTS = 6
@@ -1012,6 +1018,9 @@ class NetworkTunnelSignalsDetector:
     def __init__(self) -> None:
         self._recent: dict[str, dict[tuple[str, str], list[float]]] = {}
         self._volume_flagged: dict[str, set[tuple[str, str]]] = {}
+        # Beacon horizon (own window, NOT the 60s burst bucket - see
+        # _BEACON_WINDOW_SECONDS for why it must be longer than dedup TTL).
+        self._beacon: dict[str, dict[str, list[float]]] = {}
         # Long-horizon contact tracking (never window-pruned): catches the
         # LOW-AND-SLOW exfiltration pattern that deliberately stays under
         # burst thresholds by spacing small transfers minutes apart.
@@ -1109,17 +1118,25 @@ class NetworkTunnelSignalsDetector:
                     if finding is not None:
                         findings.append(finding)
 
-            # Beaconing: dense contact with a single endpoint on ANY port —
-            # the C2-polling pattern used to fetch instructions that steer
-            # behavior around local policy. Correlation-level signal.
-            beacon_key = ("beacon", destination)
-            beacon_queue = bucket.setdefault(beacon_key, [])
+            # Beaconing: repeated contact with a single endpoint on ANY port
+            # across the beacon horizon - the C2/inference-proxy polling
+            # pattern used to fetch instructions or exfiltrate via an
+            # authorized tunnel. Correlation-level signal.
+            hkey_beacon = str(ctx.session_id)
+            beacon_map = self._beacon.setdefault(hkey_beacon, {})
+            beacon_queue = beacon_map.setdefault(destination, [])
             beacon_queue.append(now)
+            beacon_queue[:] = [
+                t for t in beacon_queue if t >= now - _BEACON_WINDOW_SECONDS
+            ]
             if (
                 len(beacon_queue) >= _BEACON_CONTACT_VOLUME
-                and beacon_key not in self._volume_flagged.get(session_key, set())
+                and ("beacon", destination)
+                not in self._volume_flagged.get(hkey_beacon, set())
             ):
-                self._volume_flagged.setdefault(session_key, set()).add(beacon_key)
+                self._volume_flagged.setdefault(hkey_beacon, set()).add(
+                    ("beacon", destination)
+                )
                 findings.append(DetectorFinding(
                     detector_id=self.detector_id,
                     name=self.name,
@@ -1128,7 +1145,7 @@ class NetworkTunnelSignalsDetector:
                     description=(
                         f"Repeated outbound contact to {destination} "
                         f"({len(beacon_queue)}x in "
-                        f"{int(_DNS_TUNNEL_WINDOW_SECONDS)}s) — consistent "
+                        f"{int(_BEACON_WINDOW_SECONDS)}s) — consistent "
                         "with external coordination/beaconing"
                     ),
                     evidence_refs=[str(event.event_id)],
@@ -1522,6 +1539,110 @@ class LogTamperDetector:
         ]
 
 
+# ---------------------------------------------------------------------------
+# 22. Inference-proxy abuse / SSRF-as-a-feature (Prime Intellect
+#     universal-offline-sandbox-escape, Aug 2026): an agent inside an
+#     "offline" sandbox calling the model API directly - reusing the
+#     interception proxy's bearer key and abusing server-side remote-fetch
+#     parameters (file_url/input_file) as an SSRF primitive, and invoking
+#     other model instances as sub-agents.
+# ---------------------------------------------------------------------------
+
+_LLM_API_ENDPOINT_RE = re.compile(
+    r"/v1/(?:responses|chat/completions|completions)\b"
+    r"|chat/completions\b"
+    r"|/v1/responses\b",
+    re.IGNORECASE,
+)
+_REMOTE_FETCH_PARAM_RE = re.compile(
+    r"(?:\"|')?(?:file_url|input_file|input_image)(?:\"|')?\s*:"
+    r"|input_file\b.*https?://",
+    re.IGNORECASE,
+)
+_BEARER_HEADER_RE = re.compile(r"authorization[\"':=\s]+bearer\b", re.IGNORECASE)
+_PRIVATE_HOST_RE = re.compile(
+    r"https?://"
+    r"(?!localhost|127\.0\.0\.1)"
+    r"(?:[a-z0-9.-]*\.internal|host\.docker\.internal|"
+    r"10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)",
+    re.IGNORECASE,
+)
+
+
+class InferenceProxyAbuseDetector:
+    """Flags direct invocation of LLM inference endpoints from a session.
+
+    Two tiers, honestly separated:
+    - HIGH: the request carries server-side remote-fetch parameters
+      (``file_url`` / ``input_file``) — the model API is being used as an
+      SSRF fetch primitive, the universal offline-sandbox escape.
+    - MEDIUM: raw completions/responses endpoint invoked with an explicit
+      bearer header or against a private/internal host. Local inference
+      stacks (ollama/vLLM) call these endpoints too, so bare loopback calls
+      WITHOUT credentials or fetch params stay silent here.
+    This detector also OWNS the "model-as-sub-agent" signal: spawning other
+    LLM instances via raw API calls is recursive agent use (deliberately
+    not duplicated in recursive_agent_spawn to avoid double findings).
+    """
+
+    detector_id = "inference_proxy_abuse"
+    name = "Inference Endpoint Abuse / SSRF Fetch"
+
+    def __init__(self) -> None:
+        self._flagged: dict[str, set[str]] = {}
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        cmd = _command(event)
+        if not cmd or not _LLM_API_ENDPOINT_RE.search(cmd):
+            return []
+
+        session_key = str(ctx.session_id)
+
+        if _REMOTE_FETCH_PARAM_RE.search(cmd):
+            family = "ssrf_fetch"
+        elif (
+            _BEARER_HEADER_RE.search(cmd) or _PRIVATE_HOST_RE.search(cmd)
+        ):
+            # Loopback inference (ollama/vLLM on 127.0.0.1) without
+            # credentials is normal developer tooling - stay silent.
+            family = "raw_invocation"
+        else:
+            return []
+
+        flagged = self._flagged.setdefault(session_key, set())
+        if family in flagged:
+            return []
+        flagged.add(family)
+
+        if family == "ssrf_fetch":
+            description = (
+                "Server-side remote fetch via inference API "
+                "(file_url/input_file) — offline-sandbox SSRF escape pattern"
+            )
+            confidence = ConfidenceLevel.HIGH
+            severity = "critical"
+        else:
+            description = (
+                "Direct LLM-endpoint invocation with credential or internal "
+                "host — possible proxy-key reuse / model-as-sub-agent"
+            )
+            confidence = ConfidenceLevel.MEDIUM
+            severity = "high"
+
+        return [
+            DetectorFinding(
+                detector_id=self.detector_id,
+                name=self.name,
+                severity=severity,
+                confidence=confidence,
+                description=f"{description}: {cmd[:100]}",
+                evidence_refs=[str(event.event_id)],
+                affected_command=cmd[:200],
+                requires_approval=False,
+            )
+        ]
+
+
 DEFAULT_DETECTORS: list[Any] = [
     PromptInjectionDetector(),
     ConfigTamperDetector(),
@@ -1544,4 +1665,5 @@ DEFAULT_DETECTORS: list[Any] = [
     ToolChainDetector(),
     RecursiveAgentSpawnDetector(),
     LogTamperDetector(),
+    InferenceProxyAbuseDetector(),
 ]

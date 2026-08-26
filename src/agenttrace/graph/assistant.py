@@ -110,6 +110,10 @@ RECOMMENDED_ACTIONS: dict[str, str] = {
     "log_tampering":
         "Preserve copies of the targeted logs immediately; deletion "
         "mid-session is anti-forensics.",
+    "inference_proxy_abuse":
+        "Treat the sandbox boundary as breached: rotate the interception/"
+        "API key, audit what was fetched via file_url, and block the "
+        "proxy endpoint from agent reach.",
     # -- Incidents / daemon findings --
     "approval_fatigue":
         "Slow down: re-read pending gates individually instead of "
