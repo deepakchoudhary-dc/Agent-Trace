@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.models.events import ConfidenceLevel
 from agenttrace.models.graph import GraphNode, GraphSnapshot, NodeType
+from agenttrace.security.isolation import IsolationError, IsolationRunner
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +102,24 @@ class ReplayEngine:
         "_JAVA_OPTIONS",
     })
 
-    def __init__(self, workspace_path: str, container_isolation: bool = False) -> None:
+    def __init__(
+        self,
+        workspace_path: str,
+        container_isolation: bool = False,
+        isolation_runner: IsolationRunner | None = None,
+    ) -> None:
         self.workspace_path = Path(workspace_path)
         self._active_simulations: dict[UUID, Path] = {}
         self.container_isolation = container_isolation
         self._container_engine = self._find_container_engine()
+        # P0.1: the single shared isolation path for every replay command.
+        # An explicitly injected runner (test seam / alternate runtime)
+        # takes precedence over the default container resolution.
+        self._isolation_runner: IsolationRunner | None = (
+            isolation_runner
+            if isolation_runner is not None
+            else (IsolationRunner() if container_isolation else None)
+        )
 
     @staticmethod
     def _find_container_engine() -> str | None:
@@ -414,76 +428,42 @@ class ReplayEngine:
                 "stderr": error,
                 "success": False,
             }
-        # Containerized isolation execution
-        if self.container_isolation and self._container_engine:
-            container_argv = [
-                self._container_engine,
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "-v",
-                f"{worktree.resolve()}:/workspace",
-                "-w",
-                "/workspace",
-                "--memory",
-                "1g",
-                "--cpus",
-                "2",
-                "python:3.11-slim",
-                *argv,
-            ]
-            try:
-                c_result = subprocess.run(
-                    container_argv,
-                    shell=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    stdin=subprocess.DEVNULL,
-                )
-                return {
-                    "command": command,
-                    "exit_code": c_result.returncode,
-                    "stdout": c_result.stdout[:5000],
-                    "stderr": c_result.stderr[:5000],
-                    "success": c_result.returncode == 0,
-                    "isolated_container": True,
-                }
-            except Exception as e:
-                logger.debug(
-                    "Container replay failed, falling back to scrubbed host runner: %s", e
-                )
+        # P0.1: all untrusted execution goes through the shared
+        # IsolationRunner. There is NO host fallback: without container
+        # isolation the verification command does not run at all, because
+        # project configuration (pytest plugins, hooks, make) is code
+        # execution, not a harmless default.
 
-        scrubbed_env = dict(os.environ)
-        for var in self._DANGEROUS_ENV_VARS:
-            scrubbed_env.pop(var, None)
-        try:
-            result = subprocess.run(
-                argv,
-                shell=False,
-                cwd=str(worktree),
-                capture_output=True,
-                text=True,
-                timeout=120,
-                stdin=subprocess.DEVNULL,
-                env=scrubbed_env,
-            )
-            return {
-                "command": command,
-                "exit_code": result.returncode,
-                "stdout": result.stdout[:5000],
-                "stderr": result.stderr[:5000],
-                "success": result.returncode == 0,
-            }
-        except subprocess.TimeoutExpired:
+        if self._isolation_runner is None:
             return {
                 "command": command,
                 "exit_code": -1,
                 "stdout": "",
-                "stderr": "Command timed out after 120s",
+                "stderr": (
+                    "isolation_unavailable: replay requires container "
+                    "isolation; verification commands are never executed "
+                    "directly on the host"
+                ),
                 "success": False,
             }
+        try:
+            iso = self._isolation_runner.run(argv, workspace_path=worktree)
+        except IsolationError as exc:
+            return {
+                "command": command,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": str(exc),
+                "success": False,
+            }
+        return {
+            "command": command,
+            "exit_code": iso.exit_code,
+            "stdout": iso.stdout,
+            "stderr": iso.error or iso.stderr,
+            "success": iso.succeeded,
+            "isolated_container": True,
+        }
 
     def _compute_graph_diff(
         self, original: GraphSnapshot, simulation: GraphSnapshot

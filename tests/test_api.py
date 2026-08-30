@@ -11,7 +11,14 @@ from fastapi.testclient import TestClient
 import agenttrace.api as api
 from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.models.events import CommandEvent
+from agenttrace.security.isolation import (
+    IsolationMetadata as _BrokerIsoMeta,
+)
+from agenttrace.security.isolation import (
+    IsolationResult as _BrokerIsoResult,
+)
 from agenttrace.security.token import ApiTokenManager
+from tests.conftest import HostIsolationStub
 
 
 @pytest.fixture()
@@ -268,7 +275,11 @@ async def _append_file_mutation(client, tokens, sid: str, workspace: str) -> Non
 
 
 @pytest.mark.asyncio
-async def test_review_run_endpoint_produces_real_verdicts(client, tmp_path):
+async def test_review_run_endpoint_produces_real_verdicts(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agenttrace.review_loop.worker.IsolationRunner",
+        lambda: HostIsolationStub(),
+    )
     c, (test_daemon, tokens) = client
     workspace = _make_workspace(tmp_path)
     sid = _create_session(c, tokens, workspace)
@@ -319,7 +330,11 @@ async def test_review_run_endpoint_redacts_secrets(client, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_review_run_persisted_and_fetchable(client, tmp_path):
+async def test_review_run_persisted_and_fetchable(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agenttrace.review_loop.worker.IsolationRunner",
+        lambda: HostIsolationStub(),
+    )
     c, (test_daemon, tokens) = client
     workspace = _make_workspace(tmp_path)
     sid = _create_session(c, tokens, workspace)
@@ -351,3 +366,107 @@ def test_review_run_missing_record_returns_404(client, tmp_path):
     sid = _create_session(c, tokens, str(tmp_path))
     res = c.get(f"/sessions/{sid}/review", headers=_auth_headers(tokens))
     assert res.status_code == 404
+
+# -- Brokered execution endpoints (plan2.md P0.2) -----------------------------
+
+
+
+
+class _StubBrokerIsolation:
+    """Stands in for an available isolation runtime inside the API broker."""
+
+    def run(self, argv, *, workspace_path, scratch_dir=None, env=None, workdir="/workspace"):
+        return _BrokerIsoResult(
+            exit_code=0,
+            stdout="broker-ok",
+            stderr="",
+            duration_ms=1,
+            metadata=_BrokerIsoMeta(
+                engine="stub",
+                image="test:latest",
+                image_digest="sha256:stub",
+                memory_limit_mb=64,
+                cpu_limit=1.0,
+                pids_limit=16,
+                timeout_seconds=10,
+            ),
+        )
+
+
+def test_broker_execute_requires_approval(client, tmp_path):
+    c, (test_daemon, tokens) = client
+    workspace = _make_workspace(tmp_path)
+    sid = _create_session(c, tokens, workspace)
+
+    challenge = c.post(
+        f"/sessions/{sid}/broker/challenge",
+        headers=_auth_headers(tokens),
+        json={"finding_id": "f-1", "argv": ["pytest", "-q"]},
+    )
+    assert challenge.status_code == 200, challenge.text
+    nonce = challenge.json()["nonce"]
+
+    res = c.post(
+        f"/sessions/{sid}/broker/execute",
+        headers=_auth_headers(tokens),
+        json={"finding_id": "f-1", "nonce": nonce, "argv": ["pytest", "-q"]},
+    )
+    assert res.status_code == 403
+    assert res.json()["detail"]["error"] == "approval_required"
+
+
+def test_broker_execute_happy_path_is_isolated_and_single_use(client, tmp_path, monkeypatch):
+    c, (test_daemon, tokens) = client
+    monkeypatch.setattr(api, "IsolationRunner", lambda: _StubBrokerIsolation())
+    workspace = _make_workspace(tmp_path)
+    sid = _create_session(c, tokens, workspace)
+    api.daemon._approvals[UUID(sid)].record_approval("f-2", True, "granted for test")
+
+    challenge = c.post(
+        f"/sessions/{sid}/broker/challenge",
+        headers=_auth_headers(tokens),
+        json={"finding_id": "f-2", "argv": ["pytest", "-q"]},
+    )
+    nonce = challenge.json()["nonce"]
+
+    res = c.post(
+        f"/sessions/{sid}/broker/execute",
+        headers=_auth_headers(tokens),
+        json={"finding_id": "f-2", "nonce": nonce, "argv": ["pytest", "-q"]},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["exit_code"] == 0
+    assert body["isolated"] is True
+
+    # single use: the same nonce cannot execute again
+    replay = c.post(
+        f"/sessions/{sid}/broker/execute",
+        headers=_auth_headers(tokens),
+        json={"finding_id": "f-2", "nonce": nonce, "argv": ["pytest", "-q"]},
+    )
+    assert replay.status_code == 400
+    assert replay.json()["detail"]["error"] == "challenge_invalid"
+
+
+def test_broker_rejects_argv_bait_and_switch(client, tmp_path, monkeypatch):
+    c, (test_daemon, tokens) = client
+    monkeypatch.setattr(api, "IsolationRunner", lambda: _StubBrokerIsolation())
+    workspace = _make_workspace(tmp_path)
+    sid = _create_session(c, tokens, workspace)
+    api.daemon._approvals[UUID(sid)].record_approval("f-3", True, "granted for test")
+
+    challenge = c.post(
+        f"/sessions/{sid}/broker/challenge",
+        headers=_auth_headers(tokens),
+        json={"finding_id": "f-3", "argv": ["pytest", "-q"]},
+    )
+    nonce = challenge.json()["nonce"]
+
+    res = c.post(
+        f"/sessions/{sid}/broker/execute",
+        headers=_auth_headers(tokens),
+        json={"finding_id": "f-3", "nonce": nonce, "argv": ["rm", "-rf", "/"]},
+    )
+    assert res.status_code == 400
+    assert res.json()["detail"]["error"] == "challenge_invalid"

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from agenttrace.review_loop.verification import VerificationResult
 
 from agenttrace.review_loop.verification import VerificationRunner
+from agenttrace.security.isolation import IsolationRunner
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,7 @@ class Worker:
 
     def _runner_for(self) -> VerificationRunner:
         if self._runner is None:
-            self._runner = VerificationRunner(self.workspace_path)
+            self._runner = VerificationRunner(self.workspace_path, isolation=IsolationRunner())
         return self._runner
 
     def execute(

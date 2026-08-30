@@ -61,12 +61,15 @@ class EventLedger:
         db_path: str | Path,
         encryption_mgr: EncryptionManager | None = None,
         redactor: SecretRedactor | None = None,
+        max_storage_bytes: int | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._encryption = encryption_mgr or EncryptionManager()
         self._redactor = redactor or SecretRedactor()
+        # P0.5: optional hard ceiling on total ledger storage (DB + WAL/SHM).
+        self._max_storage_bytes = max_storage_bytes
         # Count of decrypt/integrity failures on read paths. A failure means
         # stored evidence was corrupted or tampered with; it is logged loudly
         # AND surfaced via integrity_failure_count / row flags — never
@@ -104,6 +107,12 @@ class EventLedger:
     @_locked
     def _migrate_schema(self) -> None:
         """Add columns introduced after v0.2 to databases created before them."""
+        # P0.5: durable evidence-incomplete markers (survive daemon restarts).
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS evidence_state ("
+            "session_id TEXT PRIMARY KEY, state TEXT NOT NULL, "
+            "reason TEXT NOT NULL, recorded_at TEXT NOT NULL)"
+        )
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(events)")}
         if "canonical_json_enc" not in cols:
             self._conn.execute("ALTER TABLE events ADD COLUMN canonical_json_enc BLOB")
@@ -525,6 +534,46 @@ class EventLedger:
         ).fetchone()
         return int(row["next_seq"])
 
+    @property
+    def encryption(self) -> EncryptionManager:
+        """The encryption manager (for domain-separated key derivation)."""
+        return self._encryption
+
+    def _storage_usage(self) -> int:
+        """Total bytes used by the ledger DB (including WAL/SHM sidecars)."""
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = Path(str(self._db_path) + suffix)
+            try:
+                total += sidecar.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _set_evidence_incomplete(self, session_id: str, reason: str) -> None:
+        """Persist an evidence-incomplete marker for a session (P0.5)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO evidence_state "
+                "(session_id, state, reason, recorded_at) VALUES (?, ?, ?, ?)",
+                (
+                    session_id,
+                    "evidence_incomplete",
+                    reason,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            self._conn.commit()
+
+    @_locked
+    def is_evidence_incomplete(self, session_id: str) -> bool:
+        """Whether the session was marked evidence-incomplete (quota/truncation)."""
+        row = self._conn.execute(
+            "SELECT state FROM evidence_state WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        return row is not None and row["state"] == "evidence_incomplete"
+
     @_locked
     def append_event(self, event: EventBase) -> str:
         """Append an event to the ledger, extending the hash chain.
@@ -535,6 +584,22 @@ class EventLedger:
         The append runs inside an IMMEDIATE write transaction so concurrent
         appends cannot observe the same tail and duplicate a sequence number.
         """
+        # P0.5: storage quota. Mark the session evidence-incomplete BEFORE
+        # refusing the write, so a report can never present a silently
+        # truncated record as complete.
+        if (
+            self._max_storage_bytes is not None
+            and self._storage_usage() > self._max_storage_bytes
+        ):
+            self._set_evidence_incomplete(
+                str(event.session_id), "storage_quota_exceeded"
+            )
+            raise LedgerError(
+                f"storage_quota_exceeded: ledger storage exceeds quota of "
+                f"{self._max_storage_bytes} bytes; session marked "
+                f"evidence_incomplete"
+            )
+
         # Redact any sensitive content in the event dictionary
         raw_dict = event.model_dump(mode="json")
         redacted_dict = self._redactor.redact_any(raw_dict)

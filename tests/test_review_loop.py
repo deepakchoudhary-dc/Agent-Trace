@@ -1,4 +1,4 @@
-"""Tests for the self-improving review loop — real artifacts & evidence.
+﻿"""Tests for the self-improving review loop â€” real artifacts & evidence.
 
 The review loop must judge REAL evidence: actual file content from the
 audited workspace and actual exit codes from allowlisted verification
@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING
+
+import pytest
 
 from agenttrace.review_loop.loop import ReviewLoop
 from agenttrace.review_loop.planner import Planner, ReviewPlan, Subtask
@@ -21,9 +23,24 @@ from agenttrace.review_loop.reviewer import (
 from agenttrace.review_loop.serialization import loop_result_to_dict
 from agenttrace.review_loop.synthesizer import Synthesizer
 from agenttrace.review_loop.worker import Worker
+from tests.conftest import HostIsolationStub
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+@pytest.fixture(autouse=True)
+def _host_isolation_for_review_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every review-loop test uses the host stub as its isolation runtime.
+
+    Production stays fail-closed (no container runtime -> no execution);
+    these tests exercise the full loop with a stub standing in for one.
+    """
+    monkeypatch.setattr(
+        "agenttrace.review_loop.worker.IsolationRunner",
+        lambda: HostIsolationStub(),
+    )
+
 
 GOOD_MODULE = '''\
 """Math utilities."""
@@ -160,7 +177,7 @@ class TestPlanner:
 
 
 class TestWorker:
-    """Tests for the Worker component — real file and verification artifacts."""
+    """Tests for the Worker component â€” real file and verification artifacts."""
 
     def test_worker_reads_real_file_content(self, tmp_path: Path) -> None:
         ws = _make_workspace(tmp_path)
@@ -172,7 +189,13 @@ class TestWorker:
         assert len(code_artifacts) == 1
         assert code_artifacts[0].content == GOOD_MODULE
 
-    def test_worker_runs_real_verification(self, tmp_path: Path) -> None:
+    def test_worker_runs_real_verification(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "agenttrace.review_loop.worker.IsolationRunner",
+            lambda: HostIsolationStub(),
+        )
         ws = _make_workspace(tmp_path)
         worker = Worker(str(ws))
 
@@ -208,7 +231,13 @@ class TestWorker:
         assert verification[0].exit_code is None
         assert "allowlist" in verification[0].evidence["rejection_reason"]
 
-    def test_feedback_iteration_reruns_only_failed_commands(self, tmp_path: Path) -> None:
+    def test_feedback_iteration_reruns_only_failed_commands(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "agenttrace.review_loop.worker.IsolationRunner",
+            lambda: HostIsolationStub(),
+        )
         ws = _make_workspace(tmp_path, test_content=BAD_TEST)
         worker = Worker(str(ws))
 
@@ -237,7 +266,7 @@ class TestWorker:
 
 
 class TestReviewers:
-    """Tests for the reviewer components — verdicts from real evidence."""
+    """Tests for the reviewer components â€” verdicts from real evidence."""
 
     def test_spec_compliance_passes_on_real_evidence(self, tmp_path: Path) -> None:
         ws = _make_workspace(tmp_path)

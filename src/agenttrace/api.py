@@ -34,6 +34,8 @@ from agenttrace.models.events import ConfidenceLevel, EventType, FileMutationEve
 from agenttrace.models.session import AgentType
 from agenttrace.review_loop.loop import ReviewLoop
 from agenttrace.review_loop.serialization import loop_result_to_dict
+from agenttrace.security.broker import BrokerError, ExecutionBroker
+from agenttrace.security.isolation import IsolationRunner
 from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.token import ApiTokenManager
 
@@ -179,6 +181,23 @@ class EvaluateRequest(BaseModel):
     action_type: str  # file_mutation | command | network | git
     target: str
     details: dict[str, Any] = Field(default_factory=dict)
+
+
+class BrokerChallengeRequest(BaseModel):
+    """Request for a single-use execution challenge (plan2.md P0.2)."""
+
+    finding_id: str
+    argv: list[str]
+    path: str = ""
+
+
+class BrokerExecuteRequest(BaseModel):
+    """A brokered execution: structured argv + single-use challenge."""
+
+    finding_id: str
+    nonce: str
+    argv: list[str]
+    path: str = ""
 
 
 class EvaluateResponse(BaseModel):
@@ -670,6 +689,86 @@ async def record_approval(session_id: UUID, req: ApprovalRequest) -> dict[str, A
     }
 
 
+# -- Brokered execution (plan2.md P0.2) ---------------------------------------
+
+_brokers: dict[UUID, ExecutionBroker] = {}
+
+
+def _get_broker(session_id: UUID, workspace_path: str, approvals: Any) -> ExecutionBroker:
+    """Return (lazily creating) the session's execution broker."""
+    broker = _brokers.get(session_id)
+    if broker is None:
+        broker = ExecutionBroker(
+            session_id,
+            daemon._ledger,
+            approvals,
+            IsolationRunner(),
+            workspace_path,
+        )
+        _brokers[session_id] = broker
+    return broker
+
+
+@app.post("/sessions/{session_id}/broker/challenge")
+async def issue_broker_challenge(
+    session_id: UUID, req: BrokerChallengeRequest
+) -> dict[str, Any]:
+    """Issue a single-use nonce bound to finding, argv, and path (P0.2).
+
+    The challenge is short-lived and consumed by exactly one successful
+    ``broker/execute`` call; the argv hash binding prevents bait-and-switch.
+    """
+    session = daemon.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    approvals = daemon._approvals.get(session_id)
+    if approvals is None:
+        raise HTTPException(status_code=409, detail="Session has no approval manager")
+    broker = _get_broker(session_id, session.config.workspace_path, approvals)
+    try:
+        nonce = broker.issue_challenge(req.finding_id, req.argv, req.path)
+    except BrokerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"nonce": nonce, "binding": [req.finding_id, req.path], "ttl_seconds": 120}
+
+
+@app.post("/sessions/{session_id}/broker/execute")
+async def broker_execute(
+    session_id: UUID, req: BrokerExecuteRequest
+) -> dict[str, Any]:
+    """Execute structured argv through the broker: challenge -> approval -> spawn.
+
+    Fails closed: no approval, an invalid/consumed challenge, an out-of-scope
+    path, or an unavailable isolation runtime all refuse execution and never
+    fall back to the host.
+    """
+    session = daemon.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    approvals = daemon._approvals.get(session_id)
+    if approvals is None:
+        raise HTTPException(status_code=409, detail="Session has no approval manager")
+    broker = _get_broker(session_id, session.config.workspace_path, approvals)
+    try:
+        result = broker.execute(
+            req.argv, finding_id=req.finding_id, nonce=req.nonce, path=req.path
+        )
+    except BrokerError as exc:
+        code = str(exc).split(":", 1)[0]
+        status = 403 if code in ("approval_required", "path_outside_scope") else 400
+        raise HTTPException(
+            status_code=status, detail={"error": code, "detail": str(exc)}
+        ) from exc
+    return {
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "duration_ms": result.duration_ms,
+        "error": result.error,
+        "isolated": result.metadata is not None,
+    }
+
+
 @app.post("/sessions/{session_id}/evaluate", response_model=EvaluateResponse)
 async def evaluate_proposed_action(session_id: UUID, req: EvaluateRequest) -> EvaluateResponse:
     """Pre-execution mediated policy gate (P0-6).
@@ -836,10 +935,15 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
         ],
     }
 
-    # Cryptographic report signature
-    manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    manifest["report_signature_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
-    return manifest
+    # Cryptographic report signature (plan2.md P0.4): keyed HMAC over the
+    # canonical manifest, verifiable offline without the live daemon. A bare
+    # SHA-256 is not a signature — anyone who tampered with the manifest
+    # could recompute it. The key is domain-separated from the ledger key.
+    from agenttrace.security.report_auth import derive_report_key, sign_report
+
+    return sign_report(
+        manifest, derive_report_key(daemon._ledger.encryption.key_bytes)
+    )
 
 
 # -- Simulation & Causal Analysis --
@@ -869,7 +973,7 @@ async def run_simulation(session_id: UUID, req: SimulationRequest) -> dict[str, 
     if not graph:
         raise HTTPException(status_code=400, detail="No graph snapshot available for simulation")
 
-    replay = ReplayEngine(session.config.workspace_path)
+    replay = ReplayEngine(session.config.workspace_path, container_isolation=True)
     sim_config = replay.create_simulation(
         snapshot=graph.to_snapshot(),
         constraints=req.constraints,

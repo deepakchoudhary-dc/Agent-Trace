@@ -25,6 +25,7 @@ from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.graph.context_graph import ContextGraph
+from agenttrace.graph.covert_channel import CovertChannelDetector
 from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.graph.task_boundary import TaskBoundaryEngine
 from agenttrace.models.events import (
@@ -169,6 +170,7 @@ class AgentTraceDaemon:
         self._boundaries: dict[UUID, TaskBoundaryEngine] = {}
         self._network_observers: dict[UUID, NetworkObserver] = {}
         self._incidents: dict[UUID, IncidentCorrelationEngine] = {}
+        self._covert: dict[UUID, CovertChannelDetector] = {}
         self._detectors: dict[UUID, DetectionEngine] = {}
         self._job_objects: dict[UUID, WindowsJobObject] = {}
         # Most-recent node index per (session, node_type, actor) for causal
@@ -267,6 +269,7 @@ class AgentTraceDaemon:
                         internet_allowed=config.internet_access_allowed,
                         allowed_destinations=config.allowed_destinations,
                     )
+                    self._covert[sid] = CovertChannelDetector(sid)
 
                     # Threat-detection rule engine
                     self._detectors[sid] = DetectionEngine(
@@ -512,6 +515,7 @@ class AgentTraceDaemon:
             internet_allowed=config.internet_access_allowed,
             allowed_destinations=config.allowed_destinations,
         )
+        self._covert[session.session_id] = CovertChannelDetector(session.session_id)
 
         # Threat-detection rule engine
         self._detectors[session.session_id] = DetectionEngine(
@@ -837,6 +841,13 @@ class AgentTraceDaemon:
         incident_engine = self._incidents.get(event.session_id)
         if incident_engine:
             for incident in incident_engine.observe(event):
+                await self.ingest_event(incident)
+
+        # 5b-2. Covert-channel structural detection (METR incident pattern):
+        # improvised message boards, chunked encoded transfers, encoded names.
+        covert_engine = self._covert.get(event.session_id)
+        if covert_engine and not isinstance(event, IncidentEvent):
+            for incident in covert_engine.observe(event):
                 await self.ingest_event(incident)
 
         # R2: response ladder — any critical incident reaching the pipeline

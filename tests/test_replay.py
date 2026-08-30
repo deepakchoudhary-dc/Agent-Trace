@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from agenttrace.graph.replay import ReplayEngine
+from tests.conftest import HostIsolationStub
 
 
 class TestVerificationAllowlist:
@@ -152,7 +153,7 @@ class TestSimulationIsolation:
         (ws / "math_utils.py").write_text(
             "def add(a, b):\n    return a + b\n"
         )
-        engine = ReplayEngine(str(ws))
+        engine = ReplayEngine(str(ws), isolation_runner=HostIsolationStub())
         config = engine.create_simulation(
             snapshot=None,
             verification_commands=["python -m py_compile math_utils.py"],
@@ -169,7 +170,7 @@ class TestSimulationIsolation:
         ws.mkdir()
         (ws / "math_utils.py").write_text("def add(a, b):\n    return a + b\n")
         (ws / "deprecated.py").write_text("old = True\n")
-        engine = ReplayEngine(str(ws))
+        engine = ReplayEngine(str(ws), isolation_runner=HostIsolationStub())
         config = engine.create_simulation(
             snapshot=None,
             constraints={"prohibited_paths": ["deprecated.py"]},

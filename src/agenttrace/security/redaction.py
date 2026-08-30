@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -108,6 +109,7 @@ _SENSITIVE_KEY_NAMES = frozenset({
 _ZERO_WIDTH_CHARS = frozenset({
     "\u200b", "\u200c", "\u200d", "\ufeff", "\u00ad",
     "\u200e", "\u200f", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+    "\u2060", "\u2066", "\u2067", "\u2068", "\u2069",
 })
 
 
@@ -152,16 +154,25 @@ class SecretRedactor:
             for match in pattern.finditer(text):
                 spans.append((match.start(), match.end(), pattern_name))
 
-        # 1b. Defeat zero-width Unicode obfuscation (P1.14)
+        # 1b. Defeat Unicode obfuscation (P1.14 / plan2.md P1.8): strip
+        # zero-width and BiDi control characters (including the U+2066-2069
+        # isolate set), then fold every remaining character through NFKC so
+        # fullwidth-form confusables ("ｐａｓｓｗｏｒｄ＝...") still match
+        # the secret patterns. Each produced character maps back to its
+        # original index, so redaction spans are rewritten against the
+        # original text. Residual limitation: NFKC does not unify cross-
+        # script homoglyphs (e.g. Cyrillic 'а' inside 'pаssword').
         clean_chars: list[str] = []
         orig_indices: list[int] = []
         for i, ch in enumerate(text):
-            if ch not in _ZERO_WIDTH_CHARS:
-                clean_chars.append(ch)
+            if ch in _ZERO_WIDTH_CHARS:
+                continue
+            for folded_char in unicodedata.normalize("NFKC", ch):
+                clean_chars.append(folded_char)
                 orig_indices.append(i)
         clean_text = "".join(clean_chars)
 
-        if len(clean_text) != len(text):
+        if clean_text != text:
             for pattern_name, pattern in _SECRET_PATTERNS:
                 for match in pattern.finditer(clean_text):
                     c_start, c_end = match.start(), match.end()

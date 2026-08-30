@@ -1,4 +1,4 @@
-"""Tests for cybersecurity safeguards and vulnerability remediations (cyber.md)."""
+﻿"""Tests for cybersecurity safeguards and vulnerability remediations (cyber.md)."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from agenttrace.security.detectors.rules import (
     MultiAgentSabotageDetector,
 )
 from agenttrace.security.redaction import SecretRedactor
+from tests.conftest import HostIsolationStub
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -136,9 +137,17 @@ async def test_filesystem_observer_graceful_stop(tmp_path: Path) -> None:
 
 # -- VULN-08: Replay Engine Environment Scrubbing --
 
-def test_replay_scrubs_dangerous_injection_env_vars(
+def test_replay_forwards_no_host_env_to_isolation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Host env (including hostile vars) must NEVER reach the child process.
+
+    Since P0.1, replay hands execution to the IsolationRunner forwarding NO
+    host environment: the container gets only image defaults plus env the
+    caller passes explicitly. Poisoned vars (PYTHONHOME, LD_PRELOAD, ...)
+    cannot smuggle code into the isolated child because they never cross
+    the boundary.
+    """
     for var in (
         "PYTHONPATH",
         "PYTHONHOME",
@@ -150,17 +159,11 @@ def test_replay_scrubs_dangerous_injection_env_vars(
     ):
         monkeypatch.setenv(var, f"/malicious/path/{var}")
 
-    (tmp_path / "test_env.py").write_text(
-        "import os\n"
-        "def test_env_is_clean():\n"
-        "    for var in ('PYTHONPATH', 'PYTHONHOME', 'NODE_OPTIONS', 'LD_PRELOAD'):\n"
-        "        assert var not in os.environ, f'{var} was not scrubbed'\n",
-        encoding="utf-8",
-    )
-    engine = ReplayEngine(str(tmp_path))
-    result = engine._run_command("python -m pytest test_env.py", tmp_path)
-    assert result["exit_code"] == 0, result["stderr"]
-
+    stub = HostIsolationStub()
+    engine = ReplayEngine(str(tmp_path), isolation_runner=stub)
+    engine._run_command("python -m pytest test_env.py", tmp_path)
+    # The decisive guarantee: replay forwarded NO host environment.
+    assert stub.last_env is None
 
 # -- VULN-09: Active Child Process Termination in Containment Ladder --
 

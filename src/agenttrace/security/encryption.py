@@ -262,6 +262,11 @@ class EncryptionManager:
                 exc,
             )
 
+    @property
+    def key_bytes(self) -> bytes:
+        """Raw master key, for domain-separated subkey derivation only."""
+        return self._key
+
     def encrypt(self, plaintext: bytes, associated_data: bytes | None = None) -> bytes:
         """Encrypt data using AES-256-GCM.
 

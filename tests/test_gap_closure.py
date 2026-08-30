@@ -1,4 +1,4 @@
-"""Tests for the §11 gap-closure batch: N1–N14, R2, R3, R6, R7.
+﻿"""Tests for the Â§11 gap-closure batch: N1â€“N14, R2, R3, R6, R7.
 
 Covers write-boundary redaction, port consistency, observability gaps,
 detector/observer error surfacing, token expiry/rotation, incident-window
@@ -505,7 +505,11 @@ async def test_replay_runs_with_stdin_detached(tmp_path: Path) -> None:
     )
     engine = ReplayEngine(str(tmp_path))
     result = engine._run_command("python -m pytest test_stdin.py", tmp_path)
-    assert result["exit_code"] == 0, result["stderr"]
+    # P0.1: fail closed without a container runtime; the DEVNULL-stdin
+    # guarantee now lives inside IsolationRunner (asserted in
+    # tests/test_isolation.py) and applies to every isolated execution.
+    assert result["exit_code"] == -1
+    assert "isolation_unavailable" in result["stderr"]
 
 
 # -- S9: data-dir hardening --------------------------------------------------
