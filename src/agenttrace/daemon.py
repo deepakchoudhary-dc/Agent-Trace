@@ -26,6 +26,7 @@ from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.covert_channel import CovertChannelDetector
+from agenttrace.graph.evidence_boundary import ToolClaimReconciler
 from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.graph.task_boundary import TaskBoundaryEngine
 from agenttrace.models.events import (
@@ -171,6 +172,7 @@ class AgentTraceDaemon:
         self._network_observers: dict[UUID, NetworkObserver] = {}
         self._incidents: dict[UUID, IncidentCorrelationEngine] = {}
         self._covert: dict[UUID, CovertChannelDetector] = {}
+        self._reconcilers: dict[UUID, ToolClaimReconciler] = {}
         self._detectors: dict[UUID, DetectionEngine] = {}
         self._job_objects: dict[UUID, WindowsJobObject] = {}
         # Most-recent node index per (session, node_type, actor) for causal
@@ -270,6 +272,7 @@ class AgentTraceDaemon:
                         allowed_destinations=config.allowed_destinations,
                     )
                     self._covert[sid] = CovertChannelDetector(sid)
+                    self._reconcilers[sid] = ToolClaimReconciler(sid)
 
                     # Threat-detection rule engine
                     self._detectors[sid] = DetectionEngine(
@@ -516,6 +519,7 @@ class AgentTraceDaemon:
             allowed_destinations=config.allowed_destinations,
         )
         self._covert[session.session_id] = CovertChannelDetector(session.session_id)
+        self._reconcilers[session.session_id] = ToolClaimReconciler(session.session_id)
 
         # Threat-detection rule engine
         self._detectors[session.session_id] = DetectionEngine(
@@ -848,6 +852,13 @@ class AgentTraceDaemon:
         covert_engine = self._covert.get(event.session_id)
         if covert_engine and not isinstance(event, IncidentEvent):
             for incident in covert_engine.observe(event):
+                await self.ingest_event(incident)
+
+        # 5b-3. Evidence-boundary reconciliation (METR shortcoming #4):
+        # cross-validate agent tool claims against OS sensor ground truth.
+        reconciler = self._reconcilers.get(event.session_id)
+        if reconciler and not isinstance(event, IncidentEvent):
+            for incident in reconciler.observe(event):
                 await self.ingest_event(incident)
 
         # R2: response ladder — any critical incident reaching the pipeline
