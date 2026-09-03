@@ -695,6 +695,18 @@ def report(session_id: str, output: str | None) -> None:
         console.print("[red]Unexpected API response[/red]")
         return
 
+    binding = rep.get("chain_binding") or {}
+    if binding.get("anchored"):
+        console.print(
+            f"[green]Root of trust:[/green] ledger tip {binding.get('chain_tip', '')[:16]}… "
+            f"({binding.get('chain_length')} events) is bound into the signing key."
+        )
+    else:
+        console.print(
+            "[yellow]Root of trust:[/yellow] report is NOT chain-anchored — "
+            "treat as unverified provenance."
+        )
+
     report_json = json.dumps(rep, indent=2)
     if output:
         Path(output).write_text(report_json, encoding="utf-8")

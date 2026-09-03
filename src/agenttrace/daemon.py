@@ -28,6 +28,10 @@ from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.covert_channel import CovertChannelDetector
 from agenttrace.graph.evidence_boundary import ToolClaimReconciler
 from agenttrace.graph.incidents import IncidentCorrelationEngine
+from agenttrace.graph.meta_detection import (
+    DetectorStalenessMonitor,
+    MetaAnomalyDetector,
+)
 from agenttrace.graph.post_exit import PostExitRegistry
 from agenttrace.graph.task_boundary import TaskBoundaryEngine
 from agenttrace.models.events import (
@@ -63,7 +67,11 @@ from agenttrace.observers.network import NetworkObserver
 from agenttrace.observers.process_tree import ProcessTreeObserver
 from agenttrace.observers.terminal import TerminalObserver
 from agenttrace.security.approval import ApprovalManager
-from agenttrace.security.detectors import DetectionEngine, DetectorFinding
+from agenttrace.security.detectors import (
+    DEFAULT_DETECTORS,
+    DetectionEngine,
+    DetectorFinding,
+)
 from agenttrace.security.encryption import EncryptionManager
 from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.redaction import SecretRedactor
@@ -177,6 +185,12 @@ class AgentTraceDaemon:
         # Post-exit surveillance is daemon-wide: shared-infrastructure and
         # post-close detection only work across sessions.
         self._post_exit: PostExitRegistry = PostExitRegistry()
+        # Meta-detection (shortcoming #10): convention-free structural
+        # anomaly scoring and the detector-decay census, both daemon-wide.
+        self._meta_anomaly: MetaAnomalyDetector = MetaAnomalyDetector()
+        self._staleness: DetectorStalenessMonitor = DetectorStalenessMonitor(
+            detector_ids=[d.detector_id for d in DEFAULT_DETECTORS]
+        )
         self._detectors: dict[UUID, DetectionEngine] = {}
         self._job_objects: dict[UUID, WindowsJobObject] = {}
         # Most-recent node index per (session, node_type, actor) for causal
@@ -741,6 +755,10 @@ class AgentTraceDaemon:
         # become post-close signals.
         for incident in self._post_exit.close_session(session_id, session.stopped_at):
             await self.ingest_event(incident)
+        # Detector-decay census (shortcoming #10): fold this session into
+        # the daemon-wide fire-rate census at close.
+        for finding in self._staleness.close_session(session_id, session.stopped_at):
+            await self.ingest_event(finding)
         logger.info("Session %s stopped", session_id)
 
     def register_session_pid(self, session_id: UUID, pid: int) -> bool:
@@ -877,6 +895,12 @@ class AgentTraceDaemon:
             for incident in self._post_exit.observe(event):
                 await self.ingest_event(incident)
 
+        # 5b-5. Meta-detection (shortcoming #10): convention-free structural
+        # anomaly scoring over communication-shaped artifacts.
+        if not isinstance(event, (IncidentEvent, PolicyFindingEvent)):
+            for finding in self._meta_anomaly.observe(event):
+                await self.ingest_event(finding)
+
         # R2: response ladder — any critical incident reaching the pipeline
         # (created live, restored, or injected) freezes the session.
         if isinstance(event, IncidentEvent) and event.severity == "critical":
@@ -885,7 +909,11 @@ class AgentTraceDaemon:
         # 5c. Threat-detection rule engine — host-observable attack patterns
         detector_engine = self._detectors.get(event.session_id)
         if detector_engine and not isinstance(event, PolicyFindingEvent):
+            # Detector-decay census (shortcoming #10): every event reaches
+            # every detector, so record evaluation and fires per detector.
+            self._staleness.record_event(event.session_id)
             for detection in detector_engine.evaluate(event):
+                self._staleness.record_fire(event.session_id, detection.detector_id)
                 await self.ingest_event(self._detector_finding(event, detection))
 
         # 5d. Egress baseline learning — an approved egress destination becomes

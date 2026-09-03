@@ -900,7 +900,7 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
                     "excerpt": redacted_excerpt[:500],
                 })
 
-    manifest = {
+    manifest: dict[str, Any] = {
         "report_id": str(UUID(int=int.from_bytes(
             hashlib.sha256(f"{session_id}:{last_hash}".encode()).digest()[:16], "big"
         ))),
@@ -935,14 +935,28 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
         ],
     }
 
-    # Cryptographic report signature (plan2.md P0.4): keyed HMAC over the
-    # canonical manifest, verifiable offline without the live daemon. A bare
-    # SHA-256 is not a signature — anyone who tampered with the manifest
-    # could recompute it. The key is domain-separated from the ledger key.
-    from agenttrace.security.report_auth import derive_report_key, sign_report
+    # Cryptographic report signature (plan2.md P0.4, root of trust per
+    # shortcoming #10): keyed HMAC over the canonical manifest, with the key
+    # folded together with the session's hash-chain tip and length. The
+    # signature therefore attests "this report describes the ledger exactly
+    # up to this tip" — a forged report cannot restate a different history
+    # and still verify, because the tip participates in key derivation.
+    from agenttrace.security.report_auth import (
+        chain_binding_block,
+        derive_report_key,
+        sign_report,
+    )
 
+    chain_tip = daemon._ledger.get_last_hash(session_id)
+    chain_length = daemon._ledger.get_next_seq(session_id)
+    manifest["chain_binding"] = chain_binding_block(chain_tip, chain_length)
     return sign_report(
-        manifest, derive_report_key(daemon._ledger.encryption.key_bytes)
+        manifest,
+        derive_report_key(
+            daemon._ledger.encryption.key_bytes,
+            chain_tip=chain_tip,
+            chain_length=chain_length,
+        ),
     )
 
 
