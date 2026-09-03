@@ -28,6 +28,7 @@ from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.covert_channel import CovertChannelDetector
 from agenttrace.graph.evidence_boundary import ToolClaimReconciler
 from agenttrace.graph.incidents import IncidentCorrelationEngine
+from agenttrace.graph.post_exit import PostExitRegistry
 from agenttrace.graph.task_boundary import TaskBoundaryEngine
 from agenttrace.models.events import (
     ApprovalEvent,
@@ -173,6 +174,9 @@ class AgentTraceDaemon:
         self._incidents: dict[UUID, IncidentCorrelationEngine] = {}
         self._covert: dict[UUID, CovertChannelDetector] = {}
         self._reconcilers: dict[UUID, ToolClaimReconciler] = {}
+        # Post-exit surveillance is daemon-wide: shared-infrastructure and
+        # post-close detection only work across sessions.
+        self._post_exit: PostExitRegistry = PostExitRegistry()
         self._detectors: dict[UUID, DetectionEngine] = {}
         self._job_objects: dict[UUID, WindowsJobObject] = {}
         # Most-recent node index per (session, node_type, actor) for causal
@@ -732,6 +736,11 @@ class AgentTraceDaemon:
             SessionStatus.STOPPED,
             stopped_at=session.stopped_at.isoformat(),
         )
+        # Post-exit accounting (METR shortcoming #6): emit the close-time
+        # persistence summary and mark the session closed so later events
+        # become post-close signals.
+        for incident in self._post_exit.close_session(session_id, session.stopped_at):
+            await self.ingest_event(incident)
         logger.info("Session %s stopped", session_id)
 
     def register_session_pid(self, session_id: UUID, pid: int) -> bool:
@@ -859,6 +868,13 @@ class AgentTraceDaemon:
         reconciler = self._reconcilers.get(event.session_id)
         if reconciler and not isinstance(event, IncidentEvent):
             for incident in reconciler.observe(event):
+                await self.ingest_event(incident)
+
+        # 5b-4. Post-exit surveillance (METR shortcoming #6): persistence
+        # artifacts outliving the session, events arriving after close,
+        # and persistence infrastructure shared across sessions.
+        if not isinstance(event, IncidentEvent):
+            for incident in self._post_exit.observe(event):
                 await self.ingest_event(incident)
 
         # R2: response ladder — any critical incident reaching the pipeline
