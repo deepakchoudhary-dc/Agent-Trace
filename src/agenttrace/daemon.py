@@ -26,6 +26,7 @@ from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.covert_channel import CovertChannelDetector
+from agenttrace.graph.credential_loops import CredentialLoopTracker
 from agenttrace.graph.evidence_boundary import ToolClaimReconciler
 from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.graph.meta_detection import (
@@ -185,6 +186,9 @@ class AgentTraceDaemon:
         # Post-exit surveillance is daemon-wide: shared-infrastructure and
         # post-close detection only work across sessions.
         self._post_exit: PostExitRegistry = PostExitRegistry()
+        # Credential-loop tracking is daemon-wide: cross-session sharing and
+        # lateral spread are invisible to per-session engines.
+        self._credential_loops: CredentialLoopTracker = CredentialLoopTracker()
         # Meta-detection (shortcoming #10): convention-free structural
         # anomaly scoring and the detector-decay census, both daemon-wide.
         self._meta_anomaly: MetaAnomalyDetector = MetaAnomalyDetector()
@@ -759,6 +763,8 @@ class AgentTraceDaemon:
         # the daemon-wide fire-rate census at close.
         for finding in self._staleness.close_session(session_id, session.stopped_at):
             await self.ingest_event(finding)
+        # Secrets held by this session now escalate on later sightings (#7).
+        self._credential_loops.mark_session_closed(session_id)
         logger.info("Session %s stopped", session_id)
 
     def register_session_pid(self, session_id: UUID, pid: int) -> bool:
@@ -893,6 +899,13 @@ class AgentTraceDaemon:
         # and persistence infrastructure shared across sessions.
         if not isinstance(event, IncidentEvent):
             for incident in self._post_exit.observe(event):
+                await self.ingest_event(incident)
+
+        # 5b-5. Credential loops (METR shortcoming #7): the same secret in
+        # more than one session's hands — discovery -> sharing -> lateral
+        # movement, the primary shared currency of the incident.
+        if not isinstance(event, IncidentEvent):
+            for incident in self._credential_loops.observe(event):
                 await self.ingest_event(incident)
 
         # 5b-5. Meta-detection (shortcoming #10): convention-free structural
