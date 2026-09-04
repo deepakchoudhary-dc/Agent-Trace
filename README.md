@@ -50,6 +50,19 @@ telemetry.
   database destruction, persistence establishment, test-integrity rigging,
   PowerShell cradles, git-author spoofing, orphaned commits, DNS/ICMP tunnel
   signals, and more. Every finding carries a confidence level.
+- **Incident-Derived Sabotage Detection** — six detector families built from
+  documented real-world agent behavior (the OpenAI / Hugging Face agent
+  incident and the monitoring literature): covert-channel structures
+  (improvised message boards, chunked encoded transfers, encoded artifact
+  names); tool-claim spoofing (agent-narrated results cross-validated against
+  OS sensor ground truth — "tests passed" while the process crashed);
+  post-exit persistence (cron, launch agents, and heartbeats that outlive the
+  session, including the same artifact re-armed by a later session);
+  cross-session credential loops (discovery → sharing → lateral reuse on
+  token-identity fingerprints); refusal-then-act divergence (verbalized
+  refusal followed by the refused action); and meta-detection staleness
+  (detector silence is itself a signal). Incidents are hash-chained,
+  confidence-labeled, and carry correlated evidence IDs.
 - **Risk-Tiered Approval Gates** — pre-execution policy evaluation pauses or
   blocks destructive operations, out-of-scope writes, secret exposure, and
   unsanctioned network egress. Approvals are scoped (segment-exact paths,
@@ -68,8 +81,10 @@ telemetry.
   `mypy`) against the workspace and records every iteration as auditable
   evidence.
 - **Replay Simulation** — branch-and-replay in isolated temporary worktrees;
-  stdin detached, environment scrubbed, interactive/debug flags rejected.
-  Live workspaces are never modified.
+  commands execute through a fail-closed isolation runner (container-based,
+  refuses host fallback, reports `isolation_unavailable` rather than running
+  anything unsandboxed), stdin detached, environment scrubbed,
+  interactive/debug flags rejected. Live workspaces are never modified.
 - **Honest Observability Gaps** — when something cannot be seen (kernel
   memory execution, unprivileged ETW, sealed-environment ambiguity),
   AgentTrace says so explicitly in reports instead of fabricating an
@@ -125,7 +140,7 @@ pip install -e ".[dev]"
 
 ```bash
 agenttrace --help          # CLI entry point works
-pytest tests/ -q           # optional: full test suite (~490 tests)
+pytest tests/ -q           # optional: full test suite (515+ tests)
 ```
 
 ### 4. (Optional) Set up the dashboard
@@ -212,9 +227,12 @@ src/agenttrace/
 ├── models/          # Pydantic data models (events, graph, session, task contract)
 ├── storage/         # SQLite ledger + encrypted content-addressed blob store
 ├── observers/       # Filesystem, process-tree, git, terminal, network, kernel (ETW)
-├── graph/           # Context graph engine, baseline, causal, blast-radius, replay
+├── graph/           # Context graph engine, baseline, causal, blast-radius, replay,
+│                    #   incident-derived detectors (covert-channel, evidence-boundary,
+│                    #   post-exit, credential-loop, hesitation, meta-detection)
 ├── security/        # Redaction, AES-256-GCM encryption, policy engine, approvals,
-│                    #   permissions hardening, detectors (17 attack patterns)
+│                    #   permissions hardening, detectors (17 attack patterns
+│                    #   + 6 incident-derived families)
 ├── adapters/        # Codex CLI, Claude Code, Copilot, universal, composite
 ├── review_loop/     # Planner/Worker/Reviewer/Synthesiser loop + verification runner
 ├── daemon.py        # Main async daemon: ingest pipeline, response ladder, flood guard
@@ -223,13 +241,16 @@ src/agenttrace/
 └── api.py           # FastAPI localhost API (token-authenticated)
 
 dashboard/           # React + TypeScript web UI (Vite, Zustand, vitest)
-tests/               # pytest suite (~490 tests) + replayable eval corpus
+tests/               # pytest suite (515+ tests) + replayable eval corpus
 .github/workflows/   # CI: ruff → mypy --strict (win+linux) → pytest → dashboard gates
 ```
 
 **Ingest pipeline order** (per event): redact → detect (17 rule engines) →
-policy evaluation → hash-chain append (encrypted) → graph projection. An
-anti-forensic flood guard and clock-anomaly detector watch the stream itself.
+policy evaluation → hash-chain append (encrypted) → graph projection. The
+projection stage runs the incident-derivation engines (covert-channel,
+evidence-boundary, post-exit, credential-loop, hesitation, meta-detection).
+An anti-forensic flood guard and clock-anomaly detector watch the stream
+itself.
 
 ## Security & Privacy Model
 
@@ -267,8 +288,10 @@ claim kernel-grade enforcement:
 - Windows Job Object containment exists but is currently observe-only unless
   processes were explicitly launched into it; heuristic "descendant"
   classification is never used as a kill criterion.
-- Replay and review-loop verification execute allowlisted commands directly on
-  the host (no container isolation yet). Treat audited workspaces accordingly.
+- Replay and review-loop verification are fail-closed: command execution
+  requires the container-based isolation runner and never falls back to the
+  host; without a container runtime, replayed verification reports
+  `isolation_unavailable` instead of executing.
 
 These limits are stated in reports as observability gaps rather than hidden.
 
@@ -304,9 +327,12 @@ Every change to this repo passes all of the above in CI before merge.
 
 ## Known Limitations
 
-- Replay isolation is host-based (allowlist + scrubbing), not containerized;
-  do not point AgentTrace at workspaces you do not trust without understanding
-  this.
+- Container isolation (replay, review-loop verification) requires a container
+  runtime and the pinned image; without them execution fails closed rather
+  than running on the host. Live-session containment is the remaining gap:
+  Windows Job Object containment is observe-only unless processes were
+  explicitly launched into it (daemon-owned sandbox lifecycle is not yet
+  implemented).
 - Kernel-tier observation is Windows-only today; Linux uses process polling
   (psutil) as the attribution source.
 - The local API token is bearer authority: anything running as your user can
