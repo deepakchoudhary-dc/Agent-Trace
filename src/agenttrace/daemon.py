@@ -28,6 +28,7 @@ from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.covert_channel import CovertChannelDetector
 from agenttrace.graph.credential_loops import CredentialLoopTracker
 from agenttrace.graph.evidence_boundary import ToolClaimReconciler
+from agenttrace.graph.hesitation import HesitationDetector
 from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.graph.meta_detection import (
     DetectorStalenessMonitor,
@@ -183,6 +184,7 @@ class AgentTraceDaemon:
         self._incidents: dict[UUID, IncidentCorrelationEngine] = {}
         self._covert: dict[UUID, CovertChannelDetector] = {}
         self._reconcilers: dict[UUID, ToolClaimReconciler] = {}
+        self._hesitations: dict[UUID, HesitationDetector] = {}
         # Post-exit surveillance is daemon-wide: shared-infrastructure and
         # post-close detection only work across sessions.
         self._post_exit: PostExitRegistry = PostExitRegistry()
@@ -295,6 +297,7 @@ class AgentTraceDaemon:
                     )
                     self._covert[sid] = CovertChannelDetector(sid)
                     self._reconcilers[sid] = ToolClaimReconciler(sid)
+                    self._hesitations[sid] = HesitationDetector(sid)
 
                     # Threat-detection rule engine
                     self._detectors[sid] = DetectionEngine(
@@ -542,6 +545,7 @@ class AgentTraceDaemon:
         )
         self._covert[session.session_id] = CovertChannelDetector(session.session_id)
         self._reconcilers[session.session_id] = ToolClaimReconciler(session.session_id)
+        self._hesitations[session.session_id] = HesitationDetector(session.session_id)
 
         # Threat-detection rule engine
         self._detectors[session.session_id] = DetectionEngine(
@@ -913,6 +917,13 @@ class AgentTraceDaemon:
         if not isinstance(event, (IncidentEvent, PolicyFindingEvent)):
             for finding in self._meta_anomaly.observe(event):
                 await self.ingest_event(finding)
+
+        # 5b-6. Hesitation divergence (shortcoming #8): verbalized refusal or
+        # concern followed by a risk-adjacent action anyway.
+        hesitation_engine = self._hesitations.get(event.session_id)
+        if hesitation_engine and not isinstance(event, IncidentEvent):
+            for incident in hesitation_engine.observe(event):
+                await self.ingest_event(incident)
 
         # R2: response ladder — any critical incident reaching the pipeline
         # (created live, restored, or injected) freezes the session.
