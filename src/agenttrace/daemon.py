@@ -27,6 +27,10 @@ from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationE
 from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.covert_channel import CovertChannelDetector
 from agenttrace.graph.credential_loops import CredentialLoopTracker
+from agenttrace.graph.eval_integrity import (
+    SandbaggingDetector,
+    task_is_safety_flavored,
+)
 from agenttrace.graph.evidence_boundary import ToolClaimReconciler
 from agenttrace.graph.hesitation import HesitationDetector
 from agenttrace.graph.incidents import IncidentCorrelationEngine
@@ -185,6 +189,7 @@ class AgentTraceDaemon:
         self._covert: dict[UUID, CovertChannelDetector] = {}
         self._reconcilers: dict[UUID, ToolClaimReconciler] = {}
         self._hesitations: dict[UUID, HesitationDetector] = {}
+        self._eval_detectors: dict[UUID, SandbaggingDetector] = {}
         # Post-exit surveillance is daemon-wide: shared-infrastructure and
         # post-close detection only work across sessions.
         self._post_exit: PostExitRegistry = PostExitRegistry()
@@ -298,6 +303,12 @@ class AgentTraceDaemon:
                     self._covert[sid] = CovertChannelDetector(sid)
                     self._reconcilers[sid] = ToolClaimReconciler(sid)
                     self._hesitations[sid] = HesitationDetector(sid)
+                    self._eval_detectors[sid] = SandbaggingDetector(
+                        sid,
+                        safety_flavored=task_is_safety_flavored(
+                            contract.goal, contract.risk_level.value
+                        ),
+                    )
 
                     # Threat-detection rule engine
                     self._detectors[sid] = DetectionEngine(
@@ -546,6 +557,12 @@ class AgentTraceDaemon:
         self._covert[session.session_id] = CovertChannelDetector(session.session_id)
         self._reconcilers[session.session_id] = ToolClaimReconciler(session.session_id)
         self._hesitations[session.session_id] = HesitationDetector(session.session_id)
+        self._eval_detectors[session.session_id] = SandbaggingDetector(
+            session.session_id,
+            safety_flavored=task_is_safety_flavored(
+                contract.goal, contract.risk_level.value
+            ),
+        )
 
         # Threat-detection rule engine
         self._detectors[session.session_id] = DetectionEngine(
@@ -923,6 +940,15 @@ class AgentTraceDaemon:
         hesitation_engine = self._hesitations.get(event.session_id)
         if hesitation_engine and not isinstance(event, IncidentEvent):
             for incident in hesitation_engine.observe(event):
+                await self.ingest_event(incident)
+
+        # 5b-7. Eval integrity (shortcoming #5; the CoT-concealment
+        # direction): stall, repetition, scorer-gaming, and behavioral
+        # sandbagging/capability-underreporting — OS-observable statistics
+        # only, never the model's self-report.
+        eval_engine = self._eval_detectors.get(event.session_id)
+        if eval_engine and not isinstance(event, IncidentEvent):
+            for incident in eval_engine.observe(event):
                 await self.ingest_event(incident)
 
         # R2: response ladder — any critical incident reaching the pipeline
