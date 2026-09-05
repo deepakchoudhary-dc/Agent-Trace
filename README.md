@@ -342,6 +342,22 @@ Every change to this repo passes all of the above in CI before merge.
   (disk-bound hashing); standard ignore dirs (`.git`, `.venv`,
   `node_modules`, `__pycache__`) are pruned automatically.
 
+## Community & feedback
+
+AgentTrace improves from adversarial use. All channels are described in
+[CONTRIBUTING.md](CONTRIBUTING.md):
+
+- **Detector feedback** — false positives and false negatives are the most
+  valuable input we get; there is a structured template for exactly this.
+- **Bugs** — a structured report template; scrub every line before pasting.
+- **Security vulnerabilities** — never in public issues; see
+  [SECURITY.md](SECURITY.md) for private disclosure, scope, and safe harbor.
+- **Questions** — GitHub Discussions for usage, reports, and configuration.
+
+Every PR is reviewed against the project's honesty invariants (hash-chain
+integrity, confidence labeling, no fabricated explanations, replay
+isolation, local-only operation) — the PR template walks you through them.
+
 ## License
 
 Released under the [MIT License](LICENSE).

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & usage help
+    url: https://github.com/deepakchoudhary-dc/Agent-Trace/discussions
+    about: Ask how to run AgentTrace, interpret reports, or configure sessions.
+  - name: Security vulnerabilities
+    url: https://github.com/deepakchoudhary-dc/Agent-Trace/security/advisories/new
+    about: Report vulnerabilities privately — never in a public issue.

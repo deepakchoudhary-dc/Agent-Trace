@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose a capability, tied to a problem it solves
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project does not add speculative features. Every capability must
+        trace to a concrete problem: a failure class agents actually exhibit
+        (cite the incident or research), a guarantee the tool claims but does
+        not yet deliver, or a workflow gap real users hit. The strongest
+        proposals name the problem first and the mechanism second.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What failure, gap, or false sense of security does this address? Link incidents, papers, or reproduction steps if you have them.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should exist, from the user's point of view?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve the same problem, including "do nothing" and what that costs.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This stays local-first — no telemetry, no data leaving the machine
+        - label: This is observable evidence or honest documentation, not speculation about model internals

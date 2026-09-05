@@ -2,11 +2,18 @@
 # STRICT EXCLUSIONS - ZERO LEAKS
 # ==========================================
 
-# Ignore ALL Markdown files everywhere except README.md
+# Ignore ALL Markdown files everywhere except shipped docs.
+# plan2/gotchas/AGENTS/mind/review stay private (process docs);
+# SECURITY/CONTRIBUTING/CODE_OF_CONDUCT are community contracts and must ship.
 **/*.md
 *.md
 !README.md
 !**/README.md
+!SECURITY.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!.github/PULL_REQUEST_TEMPLATE.md
+!.github/ISSUE_TEMPLATE/*.md
 
 # Ignore ALL screenshots, media & graphic assets
 **/*.png

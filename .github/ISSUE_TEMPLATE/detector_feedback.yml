@@ -1,0 +1,70 @@
+name: Detector feedback
+description: False positives, missed detections, or tuning data for a specific detector
+labels: ["detector", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Detector feedback is the most valuable input this project gets: it is
+        how detection thresholds, whitelists, and incident severities get
+        calibrated against real workloads. Both false positives (flagged
+        behavior that was legitimate) and false negatives (behavior you
+        believe should have been flagged) are welcome.
+
+        **Scrub everything.** Describe the *structure* of the evidence
+        (paths, command shapes, frequencies) — never paste actual secrets,
+        tokens, or proprietary file contents.
+  - type: dropdown
+    id: detector
+    attributes:
+      label: Which detector?
+      description: The `incident_type` shown on the incident/policy event, or the closest match.
+      options:
+        - covert-channel — message_board_structure / chunked_encoded_transfer / encoded_artifact_names
+        - evidence-boundary — unverified_tool_claim / tool_claim_substitution
+        - post-exit — persistence_outlives_session / post_close_activity / shared_post_exit_infrastructure
+        - credential-loops — token reuse / lateral movement findings
+        - hesitation — refusal_then_action / hesitation_then_action
+        - eval-integrity — stall / scorer-gaming / behavioral_underreporting
+        - meta-detection — self-monitoring anomalies
+        - policy rules / other
+    validations:
+      required: true
+  - type: dropdown
+    id: verdict
+    attributes:
+      label: Your verdict on the flagged incident
+      options:
+        - False positive — flagged, but the behavior was legitimate
+        - True positive — correctly flagged
+        - False negative — should have been flagged and was not
+        - Wrong severity or wrong description
+    validations:
+      required: true
+  - type: textarea
+    id: structure
+    attributes:
+      label: What was the evidence structure? (scrubbed)
+      description: |
+        For false positives: what the triggering commands/paths looked like and
+        why they were normal in your workflow. For false negatives: the shape of
+        the behavior that went undetected (rename your paths; keep the pattern).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened instead?
+  - type: dropdown
+    id: gate
+    attributes:
+      label: Would an approval gate on this behavior have been appropriate in your session?
+      options:
+        - "Yes"
+        - "No"
+        - Unsure — discuss
+  - type: input
+    id: frequency
+    attributes:
+      label: How often does this fire in your workload?
+      placeholder: e.g. every session / once a day / once total

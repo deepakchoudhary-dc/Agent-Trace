@@ -1,0 +1,60 @@
+name: Bug report
+description: A crash, a wrong result, a detector that misfires, or a broken guarantee
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A bug is: a crash, a wrong result, a detector that misfires, a report that
+        misleads, or anything that violates the project's stated guarantees
+        (hash-chain integrity, local-only operation, redaction before storage).
+
+        **Before submitting:** never paste raw secrets, tokens, or workspace file
+        contents. AgentTrace redacts what it stores, but your own notes, configs,
+        and terminal history are yours to scrub. Treat every log line as
+        publishable before you paste it.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the wrong behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: The behavior consistent with the README or documentation.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How do we reproduce?
+      description: Steps, starting from the exact command you ran.
+      placeholder: |
+        agenttrace start --workspace ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, Python version, install method, AgentTrace version (`agenttrace --version`), agent being audited (Claude Code / Codex CLI / other / N/A)
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output (scrubbed)
+      description: Logs / stack trace. Scrub every line before pasting.
+      render: shell
+  - type: checkboxes
+    id: severity
+    attributes:
+      label: Severity of impact
+      options:
+        - label: Crash or data loss
+        - label: Wrong/missing audit evidence
+        - label: Detector misfire (please use the Detector feedback template instead)
+        - label: Cosmetic / documentation
