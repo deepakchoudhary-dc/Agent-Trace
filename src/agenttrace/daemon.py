@@ -25,6 +25,7 @@ from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.graph.context_graph import ContextGraph
+from agenttrace.graph.coverage import CoverageMonitor
 from agenttrace.graph.covert_channel import CovertChannelDetector
 from agenttrace.graph.credential_loops import CredentialLoopTracker
 from agenttrace.graph.eval_integrity import (
@@ -196,6 +197,10 @@ class AgentTraceDaemon:
         # Credential-loop tracking is daemon-wide: cross-session sharing and
         # lateral spread are invisible to per-session engines.
         self._credential_loops: CredentialLoopTracker = CredentialLoopTracker()
+        # Sensor coverage accounting (shortcoming #9): which observation
+        # planes actually saw each session — daemon-wide, like the other
+        # completeness state.
+        self._coverage: CoverageMonitor = CoverageMonitor()
         # Meta-detection (shortcoming #10): convention-free structural
         # anomaly scoring and the detector-decay census, both daemon-wide.
         self._meta_anomaly: MetaAnomalyDetector = MetaAnomalyDetector()
@@ -749,6 +754,9 @@ class AgentTraceDaemon:
         for observer in self._observers.get(session_id, []):
             await observer.stop()
         self._observers.pop(session_id, None)
+        # Observation has stopped before the close finding is emitted; the
+        # coverage account must show that gap, not imply full visibility.
+        self._coverage.blind_from(datetime.now(timezone.utc), session_id)
 
         adapter = self._adapters.pop(session_id, None)
         if adapter:
@@ -783,6 +791,10 @@ class AgentTraceDaemon:
         # Detector-decay census (shortcoming #10): fold this session into
         # the daemon-wide fire-rate census at close.
         for finding in self._staleness.close_session(session_id, session.stopped_at):
+            await self.ingest_event(finding)
+        # Sensor coverage accounting (shortcoming #9): state what each
+        # observation plane actually saw for this session.
+        for finding in self._coverage.close_session(session_id, session.stopped_at):
             await self.ingest_event(finding)
         # Secrets held by this session now escalate on later sightings (#7).
         self._credential_loops.mark_session_closed(session_id)
@@ -907,6 +919,12 @@ class AgentTraceDaemon:
         if covert_engine and not isinstance(event, IncidentEvent):
             for incident in covert_engine.observe(event):
                 await self.ingest_event(incident)
+
+        # 5b-2b. Sensor coverage accounting (shortcoming #9): attribute every
+        # raw event to its observation plane so the close report states what
+        # each plane actually saw. Derived events are not sensor output.
+        if not isinstance(event, (IncidentEvent, PolicyFindingEvent)):
+            self._coverage.observe(event)
 
         # 5b-3. Evidence-boundary reconciliation (METR shortcoming #4):
         # cross-validate agent tool claims against OS sensor ground truth.
@@ -1080,6 +1098,10 @@ class AgentTraceDaemon:
         if adapter:
             with contextlib.suppress(Exception):
                 await adapter.stop()
+
+        # Containment stops observation; the coverage account must record
+        # the planes going blind here rather than imply they saw everything.
+        self._coverage.blind_from(datetime.now(timezone.utc), sid)
 
         containment = PolicyFindingEvent(
             session_id=sid,
@@ -1817,6 +1839,19 @@ class AgentTraceDaemon:
 
         for observer in observers:
             await observer.start()
+            # Coverage accounting (shortcoming #9): record the plane this
+            # sensor feeds, only after its start actually succeeded — a
+            # failed sensor is a DOWN plane in the close report, not silence
+            # to be mistaken for health.
+            if isinstance(observer, (FilesystemObserver, GitMonitor)):
+                plane = "filesystem_plane"
+            elif isinstance(observer, (ProcessTreeObserver, KernelObserver)):
+                plane = "process_plane"
+            elif isinstance(observer, NetworkObserver):
+                plane = "network_plane"
+            else:
+                plane = "terminal_plane"
+            self._coverage.watch(plane, session.session_id)
 
         return observers
 
