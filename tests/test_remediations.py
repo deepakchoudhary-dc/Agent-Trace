@@ -11,6 +11,7 @@ from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.observers.job_object_process import WindowsJobObject
 from agenttrace.observers.kernel import KernelObserver
 from agenttrace.security.approval import ApprovalManager
+from agenttrace.security.containment import ContainmentManager
 from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.redaction import SecretRedactor
 from agenttrace.storage.ledger import EventLedger
@@ -119,30 +120,46 @@ class _FakeJob:
         self.terminated = True
         return True
 
+    def close(self) -> None:
+        self.closed = True
+
+
+def _manager_with(fake: _FakeJob) -> ContainmentManager:
+    """A real ContainmentManager whose provider is the scripted fake."""
+    manager = ContainmentManager(uuid4())
+    manager._provider = fake  # type: ignore[assignment]
+    return manager
+
 
 def test_incident_kill_requires_kernel_verified_membership(tmp_path: Path) -> None:
-    """Heuristic descendants are never killed; only Job Object members."""
+    """Heuristic descendants are never killed; only containment-unit members."""
     daemon = AgentTraceDaemon(tmp_path / "data")
     sid = uuid4()
 
     # A heuristic "contained_descendant" tracked by the observer must NOT
-    # influence the kill decision: the fake job reports empty membership.
-    daemon._job_objects[sid] = _FakeJob(pids=set())
+    # influence the kill decision: the fake provider reports empty membership.
+    empty = _FakeJob(pids=set())
+    daemon._containment[sid] = _manager_with(empty)
     assert daemon._terminate_contained(sid) == 0
-    assert not daemon._job_objects[sid].terminated
+    assert not empty.terminated
 
-    daemon._job_objects[sid] = _FakeJob(pids={1001, 1002})
+    populated = _FakeJob(pids={1001, 1002})
+    daemon._containment[sid] = _manager_with(populated)
     assert daemon._terminate_contained(sid) == 2
-    assert daemon._job_objects[sid].terminated
+    assert populated.terminated
 
 
 def test_incident_kill_refuses_daemon_own_tree(tmp_path: Path) -> None:
-    """If the daemon's own PIDs appear inside a job, refuse to arm."""
+    """If the daemon's own PIDs appear inside a containment unit, refuse."""
     daemon = AgentTraceDaemon(tmp_path / "data")
     sid = uuid4()
-    daemon._job_objects[sid] = _FakeJob(pids={os.getpid(), os.getppid(), 4242})
+    fake = _FakeJob(pids={os.getpid(), os.getppid(), 4242})
+    daemon._containment[sid] = _manager_with(fake)
     assert daemon._terminate_contained(sid) == 0
-    assert not daemon._job_objects[sid].terminated
+    assert not fake.terminated
+    # The provider must be left open: closing it would arm KILL_ON_JOB_CLOSE
+    # and commit the very kill that was just refused.
+    assert daemon._containment[sid].provider() is fake
 
 
 def test_kernel_observer_parses_hex_pid_and_scopes_confidence(tmp_path: Path) -> None:

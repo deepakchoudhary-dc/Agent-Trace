@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,12 +67,12 @@ from agenttrace.models.session import (
 from agenttrace.models.task_contract import RiskLevel, ScopeDriftResult, TaskContract
 from agenttrace.observers.filesystem import FilesystemObserver
 from agenttrace.observers.git_monitor import GitMonitor
-from agenttrace.observers.job_object_process import WindowsJobObject
 from agenttrace.observers.kernel import KernelObserver
 from agenttrace.observers.network import NetworkObserver
 from agenttrace.observers.process_tree import ProcessTreeObserver
 from agenttrace.observers.terminal import TerminalObserver
 from agenttrace.security.approval import ApprovalManager
+from agenttrace.security.containment import ContainmentError, ContainmentManager
 from agenttrace.security.detectors import (
     DEFAULT_DETECTORS,
     DetectionEngine,
@@ -88,6 +87,8 @@ from agenttrace.storage.ledger import EventLedger
 if TYPE_CHECKING:
     from agenttrace.adapters.sdk import AdapterBase
     from agenttrace.observers.base import BaseObserver
+    from agenttrace.observers.cgroup_process import CgroupV2Controller
+    from agenttrace.observers.job_object_process import WindowsJobObject
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,7 @@ class AgentTraceDaemon:
             detector_ids=[d.detector_id for d in DEFAULT_DETECTORS]
         )
         self._detectors: dict[UUID, DetectionEngine] = {}
-        self._job_objects: dict[UUID, WindowsJobObject] = {}
+        self._containment: dict[UUID, ContainmentManager] = {}
         # Most-recent node index per (session, node_type, actor) for causal
         # correlation: links events to the *latest* cause, not the first match
         self._latest: dict[tuple[UUID, NodeType, str], UUID] = {}
@@ -431,6 +432,18 @@ class AgentTraceDaemon:
             observers = await self._start_observers(session)
             self._observers[sid] = observers
 
+            # Restored sessions must not run uncontained silently: re-arm
+            # containment here (the old provider died with the previous
+            # daemon process) and disclose if the host cannot provide it.
+            if sid not in self._containment:
+                manager = ContainmentManager(sid)
+                try:
+                    manager.ensure()
+                except ContainmentError as e:
+                    self._emit_containment_unavailable(sid, str(e))
+                else:
+                    self._containment[sid] = manager
+
             adapter = self._select_adapter(session)
             cursor_state = self._ledger.get_adapter_cursor(sid)
             if cursor_state:
@@ -627,9 +640,16 @@ class AgentTraceDaemon:
             data=task_node.data,
         )
 
-        # 6. Windows Job Object Containment & Observers
-        if session.session_id not in self._job_objects:
-            self._job_objects[session.session_id] = WindowsJobObject(session.session_id)
+        # 6. Daemon-owned containment (P0.3) & observers. The provider is
+        # created and limits applied BEFORE any observer can spawn or attach.
+        if session.session_id not in self._containment:
+            manager = ContainmentManager(session.session_id)
+            try:
+                manager.ensure()
+            except ContainmentError as e:
+                self._emit_containment_unavailable(session.session_id, str(e))
+            else:
+                self._containment[session.session_id] = manager
 
         observers = await self._start_observers(session)
         self._observers[session.session_id] = observers
@@ -772,9 +792,13 @@ class AgentTraceDaemon:
                 )
             await adapter.stop()
 
-        job = self._job_objects.pop(session_id, None)
-        if job:
-            job.close()
+        # P0.3: release the owned containment unit — terminate verified
+        # members, close the provider. The daemon pid tree is protected;
+        # a refusal leaves the provider open (closing it would arm
+        # KILL_ON_JOB_CLOSE and commit the refused kill).
+        manager = self._containment.pop(session_id, None)
+        if manager is not None:
+            manager.release(kill=True)
 
         session.status = SessionStatus.STOPPED
         session.stopped_at = datetime.now(timezone.utc)
@@ -801,11 +825,15 @@ class AgentTraceDaemon:
         logger.info("Session %s stopped", session_id)
 
     def register_session_pid(self, session_id: UUID, pid: int) -> bool:
-        """Register an agent launcher PID to be trapped in the Job Object and tracked."""
-        job = self._job_objects.get(session_id)
-        assigned = False
-        if job:
-            assigned = job.assign_pid(pid)
+        """Register an agent launcher PID into the session's containment unit.
+
+        Post-attach assignment is best-effort containment (an existing race);
+        the race-free path is ContainmentManager.spawn. The process-tree
+        observer re-checks on every poll, so late-discovered descendants are
+        still swept into the unit.
+        """
+        manager = self._containment.get(session_id)
+        assigned = manager.assign_pid(pid) if manager is not None else False
         for obs in self._observers.get(session_id, []):
             if isinstance(obs, ProcessTreeObserver):
                 obs.boost_polling(2.0)
@@ -1016,6 +1044,40 @@ class AgentTraceDaemon:
                 self._ledger.add_destination_baseline(workspace_path, destination)
             return
 
+    def _containment_provider(
+        self, session_id: UUID
+    ) -> WindowsJobObject | CgroupV2Controller | None:
+        """The live kernel containment provider, if this session has one."""
+        manager = self._containment.get(session_id)
+        return manager.provider() if manager is not None else None
+
+    def _emit_containment_unavailable(self, session_id: UUID, reason: str) -> None:
+        """Disclosed degradation (fail honest, never implied containment)."""
+        logger.warning(
+            "Containment unavailable for session %s: %s", session_id, reason
+        )
+        try:
+            self._ledger.append_event(
+                PolicyFindingEvent(
+                    session_id=session_id,
+                    actor_id="daemon",
+                    source_adapter="incident_response",
+                    confidence=ConfidenceLevel.HIGH,
+                    finding_type="containment_unavailable",
+                    severity="medium",
+                    description=(
+                        "Session running WITHOUT kernel containment: "
+                        + reason
+                        + " Actions remain observed but process-lifetime "
+                        "limits are not enforced."
+                    ),
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Could not record containment_unavailable finding", exc_info=True
+            )
+
     def _terminate_contained(self, session_id: UUID) -> int:
         """Terminate only kernel-verified members of the session's Job Object.
 
@@ -1025,32 +1087,29 @@ class AgentTraceDaemon:
         appears inside the job, containment is broken — refuse to arm rather
         than kill ourselves.
         """
-        job = self._job_objects.get(session_id)
-        if not job or not job.is_active:
+        manager = self._containment.get(session_id)
+        if manager is None:
             return 0
 
-        verified = set(job.get_pids())
+        verified = set(manager.member_pids())
         if not verified:
             return 0
 
-        if os.getpid() in verified or os.getppid() in verified:
+        # The manager refuses (and leaves the provider open) if the daemon's
+        # own pid tree is inside the unit — see ContainmentManager.release.
+        if not manager.release(kill=True):
             logger.critical(
-                "Daemon PID %d/%d present in session %s Job Object; "
-                "refusing to terminate",
-                os.getpid(),
-                os.getppid(),
+                "Refused to terminate containment for session %s "
+                "(daemon pid tree detected inside the unit)",
                 session_id,
             )
             return 0
-
-        if job.terminate():
-            logger.info(
-                "Terminated %d kernel-verified contained process(es) for session %s",
-                len(verified),
-                session_id,
-            )
-            return len(verified)
-        return 0
+        logger.info(
+            "Terminated %d kernel-verified contained process(es) for session %s",
+            len(verified),
+            session_id,
+        )
+        return len(verified)
 
     async def _apply_incident_response(self, incident: IncidentEvent) -> None:
         """Response ladder (R2): critical incidents freeze the session.
@@ -1796,7 +1855,7 @@ class AgentTraceDaemon:
             workspace,
             callback,
             on_pids_updated=lambda pids: net_observer.update_tracked_pids(pids),
-            job_object=self._job_objects.get(session.session_id),
+            job_object=self._containment_provider(session.session_id),
         )
 
         observers: list[BaseObserver] = [

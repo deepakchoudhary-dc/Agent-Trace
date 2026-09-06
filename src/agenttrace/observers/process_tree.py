@@ -12,7 +12,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 import psutil  # type: ignore[import-untyped]
 
@@ -23,7 +23,12 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from uuid import UUID
 
+    from agenttrace.observers.cgroup_process import CgroupV2Controller
     from agenttrace.observers.job_object_process import WindowsJobObject
+
+# Either kernel containment unit; both expose get_pids/assign_pid. Runtime
+# alias with quoted members (names live in TYPE_CHECKING).
+ContainmentUnit = Union["WindowsJobObject", "CgroupV2Controller"]
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +104,7 @@ class ProcessTreeObserver(BaseObserver):
         callback: EventCallback,
         poll_interval: float = _POLL_INTERVAL,
         on_pids_updated: Callable[[set[int]], None] | None = None,
-        job_object: WindowsJobObject | None = None,
+        job_object: ContainmentUnit | None = None,
     ) -> None:
         super().__init__(session_id, workspace_path, callback)
         self._poll_interval = poll_interval

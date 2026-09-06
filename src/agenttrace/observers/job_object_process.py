@@ -194,6 +194,18 @@ class WindowsJobObject:
         """Whether the Job Object handle is open and operational."""
         return self._handle is not None and bool(self._handle)
 
+    @property
+    def handle(self) -> int:
+        """The raw job-object handle (for containment-layer Win32 calls).
+
+        Raises if the job was never initialized; callers should gate on
+        :attr:`is_active` first. Returned as a plain int so consumers apply
+        their own 64-bit-safe prototypes.
+        """
+        if self._handle is None:
+            raise RuntimeError("Job Object handle is not initialized")
+        return int(self._handle)
+
     def assign_pid(self, pid: int) -> bool:
         """Assign a process ID to the Job Object."""
         if not self.is_active or not self._is_windows:
