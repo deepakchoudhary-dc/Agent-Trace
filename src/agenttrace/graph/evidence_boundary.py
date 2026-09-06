@@ -31,8 +31,11 @@ they contradict:
 - ``unverified_tool_claim`` — a tool result narrated success or failure
   but no OS sensor saw the tool's process activity at all (medium).
 - ``tool_claim_substitution`` — the claim contradicts observed OS
-  activity: "tests passed" while the process crashed, or failure
-  narrated while the process succeeded (high).
+  activity: "tests passed" while the process exited non-zero, or failure
+  narrated while the process exited zero (high). Contradiction needs real
+  exit-status evidence (kernel observer or spawned-process exits); sensor
+  presence without an observable exit status is an honest gap, never
+  fabricated into a verdict.
 """
 
 from __future__ import annotations
@@ -73,6 +76,7 @@ _OS_ADAPTERS = frozenset({
     "process_tree_observer",
     "network_observer",
     "kernel_etw",
+    "auditd",
     "git_monitor",
 })
 
@@ -125,7 +129,7 @@ class ToolClaimReconciler:
         self.session_id = session_id
         self._window = timedelta(seconds=window_seconds)
         self._cooldown = cooldown if cooldown is not None else timedelta(minutes=10)
-        self._recent: deque[tuple[datetime, str, int]] = deque(maxlen=512)
+        self._recent: deque[tuple[datetime, str, int | None]] = deque(maxlen=512)
         self._last_emitted: dict[str, datetime] = {}
 
     def observe(self, event: EventBase) -> list[IncidentEvent]:
@@ -145,8 +149,7 @@ class ToolClaimReconciler:
         outcome = self._claimed_outcome(claim)
         if outcome is None:
             return []
-        signals = [code for _, _, code in self._recent]
-        if not signals:
+        if not self._recent:
             if not self._can_emit("unverified_tool_claim", claim.timestamp):
                 return []
             logger.warning(
@@ -163,7 +166,7 @@ class ToolClaimReconciler:
                     f"'{claim.tool_name}' as "
                     f"{'successful' if outcome else 'failed'}, but no "
                     "OS-level process, filesystem, network, kernel, or git "
-                    "sensor recorded any process exit within the "
+                    "sensor recorded any activity within the "
                     f"{int(self._window.total_seconds())}s window. The claim "
                     "is agent-narrated only (METR incident pattern: "
                     "suppressed or replaced tool output) and must not be "
@@ -173,7 +176,16 @@ class ToolClaimReconciler:
                 claim.timestamp,
             )]
 
-        mismatch = any((code == 0) is not outcome for code in signals)
+        # Outcome contradiction requires real exit-status evidence. Only the
+        # kernel observer and spawned-process paths carry actual exit codes;
+        # polling observers record presence without exit status. Fabricating
+        # a success value for those events would indict every honest failing
+        # claim in an active session, so with no exit evidence the outcome is
+        # simply not judgeable — the honest gap is silence, not an incident.
+        exits = [code for _, _, code in self._recent if code is not None]
+        if not exits:
+            return []
+        mismatch = any((code == 0) is not outcome for code in exits)
         if mismatch and self._can_emit("tool_claim_substitution", claim.timestamp):
             logger.warning(
                 "EVIDENCE BOUNDARY: tool claim contradicts OS ground truth "
@@ -213,9 +225,10 @@ class ToolClaimReconciler:
     # -- OS signal bookkeeping ---------------------------------------------------
 
     def _record_os_signal(self, event: EventBase) -> None:
+        # Record the event's real exit status, or None when the sensor could
+        # not observe one. Inventing 0 ("success") here would turn every
+        # polling-plane event into fabricated OS ground truth.
         exit_code: int | None = getattr(event, "exit_code", None)
-        if exit_code is None:
-            exit_code = 0  # OS presence is the signal; exit status when available
         self._recent.append((event.timestamp, event.source_adapter, exit_code))
 
     def _prune(self, now: datetime) -> None:

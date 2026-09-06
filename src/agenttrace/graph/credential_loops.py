@@ -172,10 +172,15 @@ class CredentialLoopTracker:
         for provider, token in extract_secret_candidates(text):
             fp = _fingerprint(provider, token)
             sid = event.session_id
-            sessions = self._sightings.setdefault(fp, {})
-            if sid not in sessions:
-                if len(self._sightings) > self._max_tracked:
+            sessions = self._sightings.get(fp)
+            if sessions is None:
+                # Evict BEFORE inserting the new fingerprint: the eviction
+                # key computes min() over per-fingerprint sightings, so an
+                # empty entry added first would raise on the next eviction.
+                if len(self._sightings) >= self._max_tracked:
                     self._evict_oldest()
+                sessions = self._sightings.setdefault(fp, {})
+            if sid not in sessions:
                 sessions[sid] = (event.timestamp, str(event.event_id))
             self._origin.setdefault(fp, sid)
             new_sessions = len(sessions)
@@ -280,9 +285,12 @@ class CredentialLoopTracker:
         if not self._sightings:
             return
         oldest_fp = min(
-            self._sightings,
+            (fp for fp, seen in self._sightings.items() if seen),
             key=lambda fp: min(ts for ts, _ in self._sightings[fp].values()),
+            default=None,
         )
+        if oldest_fp is None:
+            return
         del self._sightings[oldest_fp]
         self._origin.pop(oldest_fp, None)
         self._emitted.pop(oldest_fp, None)

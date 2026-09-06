@@ -47,6 +47,10 @@ def _edge(
         actor_id="test",
         source_adapter="test",
         confidence=confidence,
+        # Production baseline edges carry their derivation input (the file
+        # node the import was parsed from); the evidence rule rejects
+        # inference edges without one.
+        data={"inputs": [str(source.node_id)]} if confidence != ConfidenceLevel.HIGH else {},
     ))
 
 

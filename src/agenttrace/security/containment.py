@@ -83,10 +83,12 @@ def _apply_windows_limits(
 ) -> None:
     """Job-wide memory + active-process caps (JobObjectExtendedLimitInformation).
 
-    Written through explicit ctypes structures so LimitFlags starts at 0 for
-    the *limit* call only -- this does not disturb the KILL_ON_JOB_CLOSE flag
-    the provider set at creation (that lives in the job's own state, not in
-    this request structure).
+    ``SetInformationJobObject`` REPLACES the entire LimitFlags set of the
+    info class -- ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` lives in
+    ``BasicLimitInformation.LimitFlags``, so writing only the new flags here
+    silently disarmed kill-on-close. The current limits are therefore
+    queried first and the new flags OR-merged into them, preserving every
+    flag the provider armed at creation.
     """
     ext = _EXTENDED()
     ext.BasicLimitInformation.LimitFlags = (
@@ -107,6 +109,33 @@ def _apply_windows_limits(
         wintypes.DWORD,
     ]
     k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    k32.QueryInformationJobObject.restype = wintypes.BOOL
+
+    current = _EXTENDED()
+    returned = wintypes.DWORD(0)
+    queried = k32.QueryInformationJobObject(
+        provider.handle,
+        9,  # JobObjectExtendedLimitInformation
+        ctypes.byref(current),
+        ctypes.sizeof(current),
+        ctypes.byref(returned),
+    )
+    if not queried:
+        # Without the current flag set we cannot merge safely, and writing
+        # unmerged would silently disarm KILL_ON_JOB_CLOSE -- fail closed
+        # with a disclosed error instead.
+        raise ContainmentError(
+            f"QueryInformationJobObject failed (error {k32.GetLastError()})"
+        )
+    ext.BasicLimitInformation.LimitFlags |= current.BasicLimitInformation.LimitFlags
+
     ok = k32.SetInformationJobObject(
         provider.handle,
         9,  # JobObjectExtendedLimitInformation
@@ -454,14 +483,36 @@ class ContainmentManager:
     def release(self, *, kill: bool = True) -> bool:
         """Terminate kernel-verified members and close the provider.
 
-        The daemon's own pid tree is a protected set: if it is ever observed
-        inside the containment unit, termination is refused AND the provider
-        is left open -- closing it would arm KILL_ON_JOB_CLOSE and commit the
-        very kill this method just refused.
+        Returns False when there is no provider to release or the release
+        was REFUSED (the daemon's own pid tree is inside the unit — see
+        release_with_verdict); use :meth:`release_with_verdict` when the
+        caller must know whether the kill itself was verified, not just
+        issued.
         """
+        had_provider = self._provider is not None
+        verdict = self.release_with_verdict(kill=kill)
+        return had_provider and not verdict["refused"]
+
+    def release_with_verdict(self, *, kill: bool = True) -> dict[str, bool]:
+        """Release with the P1.7-proof verdict, not just a success flag.
+
+        - ``refused``: the daemon pid tree is inside the unit; nothing was
+          done and the provider stays open (closing it would arm
+          KILL_ON_JOB_CLOSE and commit the refused kill).
+        - ``kill_verified``: ``provider.terminate()`` returned success.
+        - ``closed_unverified``: the kernel refused the kill signal and the
+          unit was closed instead — members are EXPECTED to die via
+          KILL_ON_JOB_CLOSE, but that is expectation, not proof, and the
+          audit record must say so.
+        """
+        verdict = {
+            "refused": False,
+            "kill_verified": False,
+            "closed_unverified": False,
+        }
         provider = self._provider
         if provider is None:
-            return False
+            return verdict
         if kill:
             members = set(provider.get_pids())
             protected = self._protected_pids()
@@ -472,18 +523,23 @@ class ContainmentManager:
                     "left open (closing it would arm KILL_ON_JOB_CLOSE)",
                     self.session_id,
                 )
-                return False
-            if not provider.terminate():
+                verdict["refused"] = True
+                return verdict
+            if provider.terminate():
+                verdict["kill_verified"] = True
+            else:
                 # Kernel refused the kill; closing the unit still ends every
-                # member via KILL_ON_JOB_CLOSE, so the release stands.
+                # member via KILL_ON_JOB_CLOSE, so the release stands — as
+                # an expectation the record discloses, never as proof.
                 logger.warning(
                     "terminate() failed for session %s; closing the unit "
                     "instead (KILL_ON_JOB_CLOSE ends remaining members)",
                     self.session_id,
                 )
+                verdict["closed_unverified"] = True
         provider.close()
         self._provider = None
-        return True
+        return verdict
 
     def member_pids(self) -> list[int]:
         """Every live pid currently inside the containment unit."""

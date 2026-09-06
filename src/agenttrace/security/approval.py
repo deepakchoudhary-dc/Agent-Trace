@@ -7,6 +7,7 @@ expiry, and affected commands/paths/destinations.
 from __future__ import annotations
 
 import logging
+import posixpath
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -139,6 +140,24 @@ class ApprovalManager:
 
         if approved:
             self._active_approvals[finding_id] = event
+        else:
+            # A denial must retire the grant everywhere it lives: the
+            # in-process cache AND a persisted 'granted' row — store_approval
+            # upserts only 'requested' records, so a grant followed by a
+            # denial leaves both and reload_from_storage would resurrect the
+            # grant after a restart. A plain request→denial stores 'denied'
+            # directly and needs no revocation.
+            self._active_approvals.pop(finding_id, None)
+            if hasattr(self._ledger, "revoke_approval") and hasattr(
+                self._ledger, "get_approvals"
+            ):
+                for row in self._ledger.get_approvals(self.session_id):
+                    if (
+                        row.get("finding_id") == finding_id
+                        and row.get("status") == "granted"
+                    ):
+                        self._ledger.revoke_approval(self.session_id, finding_id)
+                        break
 
         logger.info(
             "Approval %s for %s: %s (expires %s)",
@@ -238,10 +257,12 @@ class ApprovalManager:
 
         `approved_path` covers `action_path` only when the action is the
         approved path itself or a descendant at a separator boundary —
-        `/a/.env` never covers `/a/.env.bak` or `/a/.env-2`.
+        `/a/.env` never covers `/a/.env.bak` or `/a/.env-2`. Both paths are
+        lexically normalized first, so a `..` traversal in the action path
+        (`/workspace/../../home/u/.ssh`) cannot satisfy a workspace scope.
         """
-        approved = cls._normalize_path(approved_path)
-        action = cls._normalize_path(action_path)
+        approved = posixpath.normpath(cls._normalize_path(approved_path))
+        action = posixpath.normpath(cls._normalize_path(action_path))
         if not approved or not action:
             return False
         if action == approved:

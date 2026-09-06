@@ -192,12 +192,15 @@ class CausalExplanationEngine:
         paths = state["paths"]
         if len(paths) >= state["max_paths"]:
             return
-        # Build description from node labels
+        # Build description from node labels. The enum VALUE is interpolated
+        # explicitly: Python 3.11 changed __format__ for str-mixin enums to
+        # render "NodeType.MEMBER" instead of the bare value, which would
+        # make path descriptions version-dependent.
         descriptions: list[str] = []
         for nid in node_ids:
             node = self.graph.get_node(nid)
             if node:
-                descriptions.append(f"{node.node_type}({node.label})")
+                descriptions.append(f"{node.node_type.value}({node.label})")
 
         path = EvidencePath(
             nodes=list(node_ids),

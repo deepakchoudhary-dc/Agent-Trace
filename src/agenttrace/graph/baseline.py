@@ -329,7 +329,7 @@ class BaselineGenerator:
                         actor_id="baseline",
                         source_adapter="baseline_generator",
                         confidence=ConfidenceLevel.LOW,
-                        data={"import_path": imp},
+                        data={"import_path": imp, "inputs": [str(node.node_id)]},
                     ))
 
     @staticmethod

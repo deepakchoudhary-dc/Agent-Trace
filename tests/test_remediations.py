@@ -140,12 +140,19 @@ def test_incident_kill_requires_kernel_verified_membership(tmp_path: Path) -> No
     # influence the kill decision: the fake provider reports empty membership.
     empty = _FakeJob(pids=set())
     daemon._containment[sid] = _manager_with(empty)
-    assert daemon._terminate_contained(sid) == 0
+    verdict = daemon._terminate_contained(sid)
+    assert verdict == {
+        "targeted": [], "terminated": 0, "refused": False,
+        "closed_unverified": False, "left_running": [],
+    }
     assert not empty.terminated
 
     populated = _FakeJob(pids={1001, 1002})
     daemon._containment[sid] = _manager_with(populated)
-    assert daemon._terminate_contained(sid) == 2
+    verdict = daemon._terminate_contained(sid)
+    assert verdict["terminated"] == 2
+    assert sorted(verdict["targeted"]) == [1001, 1002]
+    assert verdict["left_running"] == []
     assert populated.terminated
 
 
@@ -155,7 +162,12 @@ def test_incident_kill_refuses_daemon_own_tree(tmp_path: Path) -> None:
     sid = uuid4()
     fake = _FakeJob(pids={os.getpid(), os.getppid(), 4242})
     daemon._containment[sid] = _manager_with(fake)
-    assert daemon._terminate_contained(sid) == 0
+    verdict = daemon._terminate_contained(sid)
+    # P1.7: the refusal is a recorded verdict — nothing terminated, and
+    # every member is disclosed as left running inside the open unit.
+    assert verdict["refused"] is True
+    assert verdict["terminated"] == 0
+    assert verdict["left_running"] == sorted([os.getpid(), os.getppid(), 4242])
     assert not fake.terminated
     # The provider must be left open: closing it would arm KILL_ON_JOB_CLOSE
     # and commit the very kill that was just refused.
@@ -223,3 +235,73 @@ def test_auto_agent_type_selects_composite_adapter(tmp_path: Path) -> None:
     adapter = daemon._select_adapter(session)
     assert isinstance(adapter, CompositeAdapter)
 
+
+
+def test_expired_token_auto_rotates(tmp_path: Path) -> None:
+    """An expired token used to fail closed forever: token() only minted when
+    the file was MISSING, so after the 90-day TTL the daemon locked out every
+    client and the CLI's recovery message was wrong. token() must rotate."""
+    import datetime
+
+    from agenttrace.security.token import ApiTokenManager
+
+    manager = ApiTokenManager(tmp_path)
+    old = manager.token()
+
+    # Force the stored token past its TTL.
+    past = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    manager.expiry_path.write_text(past.isoformat() + "\n", encoding="utf-8")
+    assert manager.is_expired() is True
+
+    new = manager.token()
+    assert new != old
+    assert manager.is_expired() is False
+    assert manager.verify(new) is True
+    assert manager.verify(old) is False
+
+
+def test_kill_verdict_discloses_unverified_close(tmp_path: Path) -> None:
+    """When the kernel refuses the kill signal but the unit closes anyway
+    (KILL_ON_JOB_CLOSE expected to finish the job), the verdict must say
+    'closed_unverified' with every member listed — never claim a kill it
+    did not prove (P1.7)."""
+    from agenttrace.security.containment import ContainmentManager
+
+    class _FakeNoTerminate:
+        """Unit whose terminate() fails but closes cleanly."""
+
+        def __init__(self) -> None:
+            self.pids: set[int] = {5001, 5002}
+            self.closed = False
+
+        @property
+        def is_active(self) -> bool:
+            return not self.closed
+
+        def assign_pid(self, pid: int) -> bool:
+            self.pids.add(pid)
+            return True
+
+        def get_pids(self) -> list[int]:
+            return sorted(self.pids)
+
+        def terminate(self, exit_code: int = 1) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.closed = True
+
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    sid = uuid4()
+    fake = _FakeNoTerminate()
+    manager = ContainmentManager(sid)
+    manager._provider = fake  # type: ignore[assignment]
+    manager._is_windows = False
+    manager._is_linux = False
+    daemon._containment[sid] = manager
+
+    verdict = daemon._terminate_contained(sid)
+    assert verdict["closed_unverified"] is True
+    assert verdict["terminated"] == 0
+    assert verdict["left_running"] == [5001, 5002]
+    assert verdict["refused"] is False

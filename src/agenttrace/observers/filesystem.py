@@ -105,7 +105,15 @@ class FilesystemObserver(BaseObserver):
         return ""
 
     async def build_initial_cache(self) -> None:
-        """Build initial hash cache by scanning the workspace."""
+        """Build initial hash cache by scanning the workspace.
+
+        Off-thread: hashing a real workspace is disk-bound and can take
+        minutes; inline it would stall the event loop (API, adapter polls,
+        other observers) for the whole scan.
+        """
+        await asyncio.to_thread(self._build_initial_cache_sync)
+
+    def _build_initial_cache_sync(self) -> None:
         workspace = Path(self.workspace_path)
         count = 0
         try:
@@ -173,6 +181,14 @@ class FilesystemObserver(BaseObserver):
                     if mutation_type == "modify" and before_hash and before_hash == after_hash:
                         continue
 
+                    # Post-change size (best-effort): consumers like the
+                    # actor-identity dossier correlation need volume, and
+                    # "0" would mean invisible, not small.
+                    try:
+                        size_delta = Path(path_str).stat().st_size
+                    except OSError:
+                        size_delta = 0
+
                     event = FileMutationEvent(
                         session_id=self.session_id,
                         actor_id="filesystem",
@@ -183,6 +199,7 @@ class FilesystemObserver(BaseObserver):
                         before_hash=before_hash,
                         after_hash=after_hash,
                         diff_summary=diff_summary,
+                        size_delta=size_delta,
                     )
                     await self.emit(event)
 

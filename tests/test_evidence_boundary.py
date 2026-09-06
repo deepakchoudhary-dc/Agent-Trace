@@ -250,3 +250,49 @@ def test_filesystem_events_count_as_os_presence() -> None:
         )
     )
     assert reconciler.observe(_claim(exit_code=0)) == []
+
+
+# -- Sprint-1 honesty fixes: fabricated exit codes are gone ----------------------
+
+
+def test_failing_claim_with_benign_file_activity_is_not_substitution() -> None:
+    """A file mutation carries no exit status and must never be invented into
+    an OS 'success' that indicts a truthful failure claim (the regression
+    that made the reconciler fire on every honest failing claim)."""
+    reconciler = ToolClaimReconciler(_SID)
+    reconciler.observe(
+        FileMutationEvent(
+            session_id=_SID,
+            actor_id="system",
+            source_adapter="filesystem_observer",
+            file_path="/ws/src/main.py",
+            mutation_type="modify",
+            timestamp=_T0 - timedelta(seconds=5),
+        )
+    )
+    assert reconciler.observe(_claim(exit_code=1)) == []
+
+
+def test_exit_status_absent_on_process_event_is_not_a_verdict() -> None:
+    """Polling observers record process presence without exit codes; an
+    honest gap is silence, not a HIGH substitution incident."""
+    reconciler = ToolClaimReconciler(_SID)
+    reconciler.observe(_os_process(exit_code=None))  # type: ignore[arg-type]
+    assert reconciler.observe(_claim(exit_code=1)) == []
+
+
+def test_os_activity_without_exit_evidence_is_not_unverified() -> None:
+    """OS sensors saw activity (just no exit status): the claim is neither
+    corroborated as to outcome nor 'unverified' — no incident is honest."""
+    reconciler = ToolClaimReconciler(_SID)
+    reconciler.observe(
+        FileMutationEvent(
+            session_id=_SID,
+            actor_id="system",
+            source_adapter="filesystem_observer",
+            file_path="/ws/src/main.py",
+            mutation_type="modify",
+            timestamp=_T0 - timedelta(seconds=5),
+        )
+    )
+    assert reconciler.observe(_claim(exit_code=0)) == []

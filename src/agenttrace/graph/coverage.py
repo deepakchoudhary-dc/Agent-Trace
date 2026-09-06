@@ -61,6 +61,7 @@ _PLANE_BY_SOURCE: dict[str, str] = {
     "git_monitor": "filesystem",
     "process_tree_observer": "process",
     "kernel_etw": "process",
+    "auditd": "process",
     "network_observer": "network",
     "terminal_observer": "terminal",
 }

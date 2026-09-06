@@ -200,3 +200,48 @@ class TestProcessIdentity:
             _FakeProc(4001, "svchost.exe", ["svchost.exe", "-k", "netsvcs"], "", 1111.0),
         ])
         assert looked_up == []
+
+
+# -- Sprint-1 fix: containment is never a kill set for bystander processes -------
+
+
+def test_gui_editor_host_never_containment_eligible(tmp_path: Path) -> None:
+    """Assigning the user's own editor into the job object put VS Code /
+    Cursor in the kill set that session stop and incident response
+    terminate. Editors are tracked, never captured."""
+    observer, _ = _make_observer(str(tmp_path))
+    for name in ("code.exe", "cursor", "windsurf", "antigravity"):
+        assert observer._containment_eligible(False, name, str(tmp_path)) is False, name
+
+
+def test_agent_harness_in_workspace_is_containment_eligible(
+    tmp_path: Path,
+) -> None:
+    observer, _ = _make_observer(str(tmp_path))
+    assert observer._containment_eligible(False, "claude", str(tmp_path)) is True
+    assert observer._containment_eligible(False, "codex.exe", str(tmp_path)) is True
+
+
+def test_toolchain_and_shells_are_observed_not_captured(tmp_path: Path) -> None:
+    """The user's own dev server, terminal, or tools in the workspace cwd are
+    observation targets, not containment targets."""
+    observer, _ = _make_observer(str(tmp_path))
+    for name in ("node", "bash", "python", "npm", "powershell"):
+        assert observer._containment_eligible(False, name, str(tmp_path)) is False, name
+
+
+def test_descendant_processes_always_eligible(tmp_path: Path) -> None:
+    """The agent's spawn tree is contained even when a child escapes the
+    workspace cwd (VULN-04), and even for editor-host names (an extension
+    host spawned BY the agent belongs to the agent's tree)."""
+    observer, _ = _make_observer(str(tmp_path))
+    assert observer._containment_eligible(True, "bash", "") is True
+    assert observer._containment_eligible(True, "code.exe", "C:/elsewhere") is True
+
+
+def test_harness_outside_workspace_not_captured(tmp_path: Path) -> None:
+    """An agent CLI running for a DIFFERENT project must not be captured into
+    this session's kill set."""
+    observer, _ = _make_observer(str(tmp_path))
+    other = tmp_path.parent / "other-project"
+    assert observer._containment_eligible(False, "claude", str(other)) is False

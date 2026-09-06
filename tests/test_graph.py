@@ -3,6 +3,7 @@
 from uuid import uuid4
 
 from agenttrace.graph.context_graph import ContextGraph
+from agenttrace.models.events import ConfidenceLevel
 from agenttrace.models.graph import EdgeType, GraphEdge, GraphNode, NodeType
 
 
@@ -183,3 +184,79 @@ class TestContextGraph:
         # Filter by time
         after_2hrs = graph.get_timeline(after=base_time + timedelta(hours=1, minutes=30))
         assert len(after_2hrs) == 3
+
+
+# -- Sprint 2: enforced evidence rules (plan2 P1.4) ------------------------------
+
+
+class TestEvidenceRules:
+    """An inference edge (confidence below HIGH) is a claim about the graph;
+    the machine-checked rule is that every claim carries the inputs it was
+    derived from. Without this the graph quietly grows assertions that look
+    like observations."""
+
+    def _two_nodes(self, graph: ContextGraph) -> None:
+        graph.add_node(GraphNode(node_type=NodeType.COMMAND, label="cmd"))
+        graph.add_node(GraphNode(node_type=NodeType.FILESYSTEM_MUTATION, label="edit"))
+
+    def test_inference_edge_without_inputs_is_rejected(self) -> None:
+        graph = ContextGraph(uuid4())
+        self._two_nodes(graph)
+        edge = GraphEdge(
+            source_node_id=graph.get_nodes_by_type(NodeType.COMMAND)[0].node_id,
+            target_node_id=graph.get_nodes_by_type(NodeType.FILESYSTEM_MUTATION)[0].node_id,
+            edge_type=EdgeType.MODIFIES,
+            confidence=ConfidenceLevel.MEDIUM,
+        )
+        assert graph.add_edge(edge) is False
+        assert graph.edge_count == 0
+
+    def test_inference_edge_with_inputs_is_accepted(self) -> None:
+        graph = ContextGraph(uuid4())
+        self._two_nodes(graph)
+        src = graph.get_nodes_by_type(NodeType.COMMAND)[0]
+        edge = GraphEdge(
+            source_node_id=src.node_id,
+            target_node_id=graph.get_nodes_by_type(NodeType.FILESYSTEM_MUTATION)[0].node_id,
+            edge_type=EdgeType.MODIFIES,
+            confidence=ConfidenceLevel.MEDIUM,
+            data={"inputs": [str(src.node_id)]},
+        )
+        assert graph.add_edge(edge) is True
+        assert graph.edge_count == 1
+
+    def test_direct_edge_needs_no_inputs(self) -> None:
+        graph = ContextGraph(uuid4())
+        self._two_nodes(graph)
+        edge = GraphEdge(
+            source_node_id=graph.get_nodes_by_type(NodeType.COMMAND)[0].node_id,
+            target_node_id=graph.get_nodes_by_type(NodeType.FILESYSTEM_MUTATION)[0].node_id,
+            edge_type=EdgeType.MODIFIES,
+        )
+        assert graph.add_edge(edge) is True
+        assert graph.audit_evidence() == []
+
+    def test_audit_evidence_reports_unanchored_inference(self) -> None:
+        """An edge injected past add_edge (snapshot mutation) is still found
+        by the audit — defense in depth."""
+        graph = ContextGraph(uuid4())
+        self._two_nodes(graph)
+        src = graph.get_nodes_by_type(NodeType.COMMAND)[0]
+        bad = GraphEdge(
+            source_node_id=src.node_id,
+            target_node_id=graph.get_nodes_by_type(NodeType.FILESYSTEM_MUTATION)[0].node_id,
+            edge_type=EdgeType.SHARED_ARTIFACT,
+            confidence=ConfidenceLevel.MEDIUM,
+        )
+        graph._edges[bad.edge_id] = bad  # bypass the choke point
+        assert graph.audit_evidence() == [bad.edge_id]
+
+    def test_edge_to_missing_node_is_refused(self) -> None:
+        graph = ContextGraph(uuid4())
+        self._two_nodes(graph)
+        edge = GraphEdge(
+            source_node_id=uuid4(),
+            target_node_id=graph.get_nodes_by_type(NodeType.COMMAND)[0].node_id,
+            edge_type=EdgeType.EXECUTES,
+        )
+        assert graph.add_edge(edge) is False

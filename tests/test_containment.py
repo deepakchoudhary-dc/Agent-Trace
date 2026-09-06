@@ -6,14 +6,24 @@ exercise the real CreateProcessW(CREATE_SUSPENDED) -> assign -> resume path.
 
 from __future__ import annotations
 
+import ctypes
 import os
+from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
 
+from agenttrace.observers.job_object_process import (
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+)
+from agenttrace.security import containment
 from agenttrace.security.containment import (
+    _JOB_LIMIT_ACTIVE_PROCESS,
+    _JOB_LIMIT_JOB_MEMORY,
     ContainmentError,
     ContainmentManager,
+    _apply_windows_limits,
 )
 
 
@@ -190,3 +200,68 @@ class TestSpawnPathSelection:
         manager = ContainmentManager(uuid4())
         protected = manager._protected_pids()
         assert os.getpid() in protected
+
+
+# -- Sprint-1 fix: limit writes must merge flags, not clear KILL_ON_JOB_CLOSE ----
+
+
+def _make_fake_kernel32(current_flags: int) -> tuple[Any, dict[str, Any]]:
+    """Plain-function kernel32 stand-in: _apply_windows_limits assigns
+    argtypes/restype onto the functions, so they must not be bound methods."""
+    state: dict[str, Any] = {"set_flags": 0}
+
+    def QueryInformationJobObject(handle: int, cls: int, ptr: Any, size: int, ret: Any) -> int:  # noqa: N802
+        ext = ctypes.cast(ptr, ctypes.POINTER(containment._EXTENDED)).contents
+        ext.BasicLimitInformation.LimitFlags = current_flags
+        return 1
+
+    def SetInformationJobObject(handle: int, cls: int, ptr: Any, size: int) -> int:  # noqa: N802
+        ext = ctypes.cast(ptr, ctypes.POINTER(containment._EXTENDED)).contents
+        state["set_flags"] = ext.BasicLimitInformation.LimitFlags
+        return 1
+
+    def GetLastError() -> int:  # noqa: N802
+        return 0
+
+    fake = SimpleNamespace(
+        QueryInformationJobObject=QueryInformationJobObject,
+        SetInformationJobObject=SetInformationJobObject,
+        GetLastError=GetLastError,
+    )
+    return fake, state
+
+
+def test_windows_limits_merge_preserves_kill_on_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SetInformationJobObject REPLACES LimitFlags, so writing memory/process
+    caps without querying first silently disarmed KILL_ON_JOB_CLOSE — daemon
+    crash no longer killed contained children, and release() logged false
+    success. The write must OR-merge into the queried flags."""
+    fake, state = _make_fake_kernel32(_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=fake), raising=False)
+    _apply_windows_limits(
+        SimpleNamespace(handle=1234),  # type: ignore[arg-type]
+        memory_limit_mb=1024,
+        max_active_processes=64,
+    )
+    set_flags = int(state["set_flags"])
+    assert set_flags & _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    assert set_flags & _JOB_LIMIT_JOB_MEMORY
+    assert set_flags & _JOB_LIMIT_ACTIVE_PROCESS
+
+
+def test_windows_limits_fail_closed_when_query_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the current flag set a merge is impossible, and an unmerged
+    write disarms kill-on-close: the failure must be raised, never silent."""
+    fake, _state = _make_fake_kernel32(0)
+    fake.QueryInformationJobObject = lambda *a: 0  # type: ignore[method-assign]
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=fake), raising=False)
+    with pytest.raises(ContainmentError, match="QueryInformationJobObject"):
+        _apply_windows_limits(
+            SimpleNamespace(handle=1234),  # type: ignore[arg-type]
+            memory_limit_mb=1024,
+            max_active_processes=64,
+        )

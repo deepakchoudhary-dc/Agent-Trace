@@ -87,7 +87,8 @@ def _call_api(
             detail = json.loads(e.read().decode("utf-8")).get("detail", "")
         if e.code == 401:
             raise ApiError(
-                "Invalid or missing API token. Restart the daemon to regenerate it."
+                "Invalid or missing API token. Run 'agenttrace daemon rotate-token' "
+                "or restart the daemon (expired tokens auto-rotate on startup)."
             ) from e
         raise ApiError(f"API returned HTTP {e.code}: {detail}") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:

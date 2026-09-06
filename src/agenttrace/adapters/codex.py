@@ -99,6 +99,11 @@ class CodexAdapter(AdapterBase):
         self._invoked: set[str] = set()
         self._staged_positions: dict[str, int] | None = None
         self._staged_invoked: set[str] | None = None
+        # Working directory declared in each rollout's session_meta. Codex
+        # stores ALL sessions under one home directory, so without a cwd
+        # filter this adapter would ingest other projects' transcripts and
+        # stamp them with this session's workspace as provenance.
+        self._rollout_cwd: dict[str, str] = {}
 
     @staticmethod
     def _is_shell_tool(name: str) -> bool:
@@ -110,6 +115,7 @@ class CodexAdapter(AdapterBase):
         return {
             "positions": dict(self._positions),
             "invoked": sorted(self._invoked),
+            "rollout_cwd": dict(self._rollout_cwd),
         }
 
     def restore_cursor(self, state: dict[str, Any]) -> None:
@@ -119,6 +125,9 @@ class CodexAdapter(AdapterBase):
                 str(k): int(v) for k, v in positions.items()
             }
         self._invoked = set(state.get("invoked", []))
+        rollout_cwd = state.get("rollout_cwd", {})
+        if isinstance(rollout_cwd, dict):
+            self._rollout_cwd = {str(k): str(v) for k, v in rollout_cwd.items()}
 
     def commit_cursor(self) -> None:
         """The ingest batch succeeded: staged cursor state becomes durable."""
@@ -183,6 +192,8 @@ class CodexAdapter(AdapterBase):
                     envelope = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if self._foreign_rollout(rollout, envelope):
+                    continue
                 translated = self._translate_envelope(rollout, envelope)
                 timestamp = _parse_iso(envelope.get("timestamp"))
                 if timestamp is not None:
@@ -191,6 +202,46 @@ class CodexAdapter(AdapterBase):
                 events.extend(translated)
 
         return events
+
+    def _foreign_rollout(self, rollout: Path, envelope: dict[str, Any]) -> bool:
+        """Record the rollout's declared cwd and report cross-project rollouts.
+
+        Returns True when the rollout belongs to a different project: its
+        events must not enter this session's ledger under this workspace's
+        provenance. The cwd arrives in the (first) ``session_meta`` line and
+        is cached so later lines are filtered without re-parsing it.
+        """
+        path_key = str(rollout)
+        payload = envelope.get("payload")
+        if isinstance(payload, dict) and payload.get("type") == "session_meta":
+            cwd = payload.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                self._rollout_cwd[path_key] = cwd
+        declared = self._rollout_cwd.get(path_key)
+        if declared is None:
+            # Stated assumption: Codex writes session_meta as the first line
+            # of every rollout, so only the meta line itself precedes cwd
+            # discovery. A rollout with NO session_meta at all is ingested
+            # with empty working_dir (fail-open for unknown provenance).
+            return False
+        if self._cwd_in_workspace(declared):
+            return False
+        logger.debug(
+            "Skipping Codex rollout %s: cwd %s outside session workspace %s",
+            rollout.name,
+            declared,
+            self.workspace_path,
+        )
+        return True
+
+    def _cwd_in_workspace(self, cwd: str) -> bool:
+        """Segment-exact containment of a declared cwd inside the workspace."""
+        try:
+            declared = Path(cwd).resolve()
+            workspace = Path(self.workspace_path).resolve()
+        except (ValueError, TypeError, OSError):
+            return False
+        return declared == workspace or workspace in declared.parents
 
     def _read_new_lines(self, rollout: Path) -> list[str | None]:
         """Read new rollout lines as text, in binary mode so byte-offset
@@ -420,13 +471,19 @@ class CodexAdapter(AdapterBase):
                 or ""
             )
             if command:
+                # Stamp the rollout's REAL declared cwd when known; this
+                # session's workspace path is not evidence of where the
+                # command ran and must not be fabricated as provenance.
+                declared_cwd = self._rollout_cwd.get(
+                    str(common.get("rollout", "")), ""
+                )
                 events.append(CommandEvent(
                     session_id=self.session_id,
                     actor_id=actor,
                     source_adapter=self.adapter_name,
                     confidence=ConfidenceLevel.HIGH,
                     command=str(command)[:1000],
-                    working_dir=self.workspace_path,
+                    working_dir=declared_cwd,
                     payload=common,
                 ))
         return events

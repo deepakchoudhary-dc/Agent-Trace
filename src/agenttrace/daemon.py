@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,7 @@ from agenttrace.adapters.codex import CodexAdapter
 from agenttrace.adapters.composite import CompositeAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.universal import UniversalAgentAdapter
+from agenttrace.graph.actor_identity import ActorIdentityGraph
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.graph.context_graph import ContextGraph
@@ -31,7 +33,7 @@ from agenttrace.graph.eval_integrity import (
     SandbaggingDetector,
     task_is_safety_flavored,
 )
-from agenttrace.graph.evidence_boundary import ToolClaimReconciler
+from agenttrace.graph.evidence_boundary import ToolClaimReconciler, event_evidence_class
 from agenttrace.graph.hesitation import HesitationDetector
 from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.graph.meta_detection import (
@@ -65,6 +67,7 @@ from agenttrace.models.session import (
     SessionStatus,
 )
 from agenttrace.models.task_contract import RiskLevel, ScopeDriftResult, TaskContract
+from agenttrace.observers.auditd import AuditdObserver
 from agenttrace.observers.filesystem import FilesystemObserver
 from agenttrace.observers.git_monitor import GitMonitor
 from agenttrace.observers.kernel import KernelObserver
@@ -82,9 +85,11 @@ from agenttrace.security.encryption import EncryptionManager
 from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.redaction import SecretRedactor
 from agenttrace.storage.blob_store import BlobStore
-from agenttrace.storage.ledger import EventLedger
+from agenttrace.storage.ledger import EventLedger, LedgerError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from agenttrace.adapters.sdk import AdapterBase
     from agenttrace.observers.base import BaseObserver
     from agenttrace.observers.cgroup_process import CgroupV2Controller
@@ -132,6 +137,9 @@ def _over_broad_scope_entries(paths: list[str]) -> list[str]:
             over_broad.append(raw)
     return over_broad
 _CLOCK_FINDING_COOLDOWN_SECONDS = 300.0
+# Cooldown for the degraded-coverage finding emitted when an ingest-pipeline
+# detector raises: one disclosure per engine per episode, not per event.
+_INGEST_ERROR_COOLDOWN_SECONDS = 300.0
 
 # Shell-capable tool names whose tool requests may legitimately explain a
 # CommandEvent (used for explicit command↔tool-request correlation).
@@ -224,6 +232,15 @@ class AgentTraceDaemon:
         self._flood_state: dict[UUID, tuple[float, int, bool]] = {}
         # Clock-jump finding cooldown per session
         self._clock_findings: dict[UUID, float] = {}
+        # Ingest-pipeline detector failure cooldown per (session, engine):
+        # one degraded-coverage finding per engine per episode, not per event.
+        self._ingest_error_cooldown: dict[tuple[UUID, str], float] = {}
+        # Persistent actor-identity memory (METR #2 deeper half):
+        # daemon-wide, rebuilt silently from the ledger on restart.
+        self._actor_graph: ActorIdentityGraph = ActorIdentityGraph()
+        # Total ledger event count at the last collusion scan: a cheap O(1)
+        # gate so the scan runs only when the ledger actually grew.
+        self._collusion_last_count: int = -1
 
         self._running = False
 
@@ -272,7 +289,11 @@ class AgentTraceDaemon:
                     )
                     self._sessions[sid] = session
 
-                    # Restore task contract
+                    # Restore task contract. May be absent (sessions can run
+                    # without one); the variable must stay bound so the
+                    # engines below neither crash nor inherit the PREVIOUS
+                    # restored session's contract scope.
+                    contract: TaskContract | None = None
                     contract_dict = self._ledger.get_task_contract(sid)
                     if contract_dict:
                         contract = TaskContract(
@@ -311,15 +332,21 @@ class AgentTraceDaemon:
                     self._hesitations[sid] = HesitationDetector(sid)
                     self._eval_detectors[sid] = SandbaggingDetector(
                         sid,
-                        safety_flavored=task_is_safety_flavored(
-                            contract.goal, contract.risk_level.value
+                        safety_flavored=(
+                            task_is_safety_flavored(
+                                contract.goal, contract.risk_level.value
+                            )
+                            if contract is not None
+                            else False
                         ),
                     )
 
                     # Threat-detection rule engine
                     self._detectors[sid] = DetectionEngine(
                         sid,
-                        workspace_paths=contract.allowed_paths,
+                        workspace_paths=(
+                            contract.allowed_paths if contract is not None else []
+                        ),
                         internet_allowed=config.internet_access_allowed,
                     )
 
@@ -368,7 +395,11 @@ class AgentTraceDaemon:
                                 confidence=ConfidenceLevel(e.get("confidence", "high")),
                                 data=e.get("data", {}),
                             )
-                            graph.add_edge(edge)
+                            if not graph.add_edge(edge):
+                                # Evidence-rule rejection (pre-rule inference
+                                # edges carry no inputs) — an integrity loss
+                                # the restore finding must state, not hide.
+                                skipped_edges += 1
                         except Exception:
                             skipped_edges += 1
                             continue
@@ -405,14 +436,33 @@ class AgentTraceDaemon:
                     # seconds before shutdown must still pair with post-restart
                     # egress).
                     try:
-                        self._incidents[sid].seed_events(
-                            self._ledger.query_events(sid, limit=None)
-                        )
+                        actor_events = self._ledger.query_events(sid, limit=None)
+                        self._incidents[sid].seed_events(actor_events)
+                        # Identity memory rebuilds silently: incidents for
+                        # pre-restart history are already in the ledger.
+                        for actor_event in actor_events:
+                            self._actor_graph.seed_event(actor_event)
                     except Exception:
                         logger.warning(
                             "Could not seed incident correlation state",
                             exc_info=True,
                         )
+
+                    # Identity memory: a restored STOPPED session must be
+                    # marked closed, or its pre-restart late writes can
+                    # never pair with post-restart activity (dossier half).
+                    if session.status == SessionStatus.STOPPED:
+                        stopped_raw = s_dict.get("stopped_at")
+                        if stopped_raw:
+                            try:
+                                self._actor_graph.close_session(
+                                    sid, datetime.fromisoformat(stopped_raw)
+                                )
+                            except ValueError:
+                                logger.warning(
+                                    "Could not parse stopped_at for session %s",
+                                    sid,
+                                )
 
                     # Zombie sessions: a restored ACTIVE session has live
                     # state but nothing observing it. Resume observers and
@@ -822,6 +872,9 @@ class AgentTraceDaemon:
             await self.ingest_event(finding)
         # Secrets held by this session now escalate on later sightings (#7).
         self._credential_loops.mark_session_closed(session_id)
+        # Actor-identity memory: late large writes in a closing session
+        # become dossier candidates for cross-session correlation (#2).
+        self._actor_graph.close_session(session_id, session.stopped_at)
         logger.info("Session %s stopped", session_id)
 
     def register_session_pid(self, session_id: UUID, pid: int) -> bool:
@@ -885,6 +938,64 @@ class AgentTraceDaemon:
 
         return event_hash
 
+    async def _safe_observe(
+        self,
+        engine: str,
+        event: EventBase,
+        observe: Callable[[], object],
+    ) -> list[EventBase]:
+        """Run one ingest-pipeline detector, isolating its failures.
+
+        Same contract as DetectionEngine: a detector bug must never break
+        event ingestion, but it must also never vanish silently — the blind
+        spot surfaces as a ledger-backed degraded-coverage finding (direct
+        append, cooldown-capped, so a crashing engine cannot recurse or
+        flood).
+        """
+        try:
+            result = observe()
+        except Exception as exc:  # noqa: BLE001 — surface, never break ingestion
+            logger.warning(
+                "Ingest detector '%s' raised on event %s: %s",
+                engine,
+                event.event_id,
+                exc,
+                exc_info=True,
+            )
+            self._record_ingest_detector_error(event.session_id, engine, exc)
+            return []
+        if isinstance(result, list):
+            return [e for e in result if isinstance(e, EventBase)]
+        return []
+
+    def _record_ingest_detector_error(
+        self, session_id: UUID, engine: str, exc: Exception
+    ) -> None:
+        now = time.monotonic()
+        key = (session_id, engine)
+        last = self._ingest_error_cooldown.get(key)
+        if last is not None and now - last < _INGEST_ERROR_COOLDOWN_SECONDS:
+            return
+        self._ingest_error_cooldown[key] = now
+        finding = PolicyFindingEvent(
+            session_id=session_id,
+            actor_id="daemon",
+            source_adapter="daemon",
+            confidence=ConfidenceLevel.HIGH,
+            finding_type="ingest_detector_error",
+            severity="low",
+            description=(
+                f"Ingest detector '{engine}' raised {type(exc).__name__}: "
+                f"{exc}. Coverage is degraded for affected events; the "
+                "detector is isolated so ingestion continues."
+            ),
+            evidence_refs=[],
+        )
+        try:
+            self._ledger.append_event(finding)
+        except Exception:
+            logger.warning("Could not record ingest detector error", exc_info=True)
+
     async def project_event(self, event: EventBase) -> None:
         """Apply graph projection, boundary/policy evaluation, and session state
         for an event that has already been appended to the ledger.
@@ -900,29 +1011,46 @@ class AgentTraceDaemon:
         # 4. Scope Drift & Task Boundary Check
         boundary = self._boundaries.get(event.session_id)
         if boundary:
-            if isinstance(event, FileMutationEvent):
-                drift = boundary.check_file_mutation(event.file_path, event.mutation_type)
-                if drift:
-                    await self.ingest_event(self._boundary_finding(event, drift))
+            # (drift, extra kwargs for _boundary_finding); checks run inside
+            # the guard so a boundary bug cannot break ingestion, while the
+            # findings themselves ingest outside it.
+            boundary_drifts: list[tuple[Any, dict[str, Any]]] = []
+            try:
+                if isinstance(event, FileMutationEvent):
+                    drift = boundary.check_file_mutation(event.file_path, event.mutation_type)
+                    if drift:
+                        boundary_drifts.append((drift, {}))
 
-            elif isinstance(event, CommandEvent):
-                for drift in boundary.check_command(event.command):
-                    await self.ingest_event(self._boundary_finding(event, drift))
+                elif isinstance(event, CommandEvent):
+                    for drift in boundary.check_command(event.command):
+                        boundary_drifts.append((drift, {}))
 
-            # 4b. Credential content check (P1-6) — scans actual content for
-            #     credential patterns rather than only filenames/keywords
-            if isinstance(event, CommandEvent) and event.command:
-                drift = boundary.check_credential_access(event.command)
-                if drift:
-                    await self.ingest_event(
-                        self._boundary_finding(event, drift, affected_command=event.command[:80])
-                    )
-            elif isinstance(event, FileMutationEvent) and event.diff_summary:
-                drift = boundary.check_credential_access(event.diff_summary)
-                if drift:
-                    await self.ingest_event(
-                        self._boundary_finding(event, drift, affected_path=event.file_path)
-                    )
+                # 4b. Credential content check (P1-6) — scans actual content for
+                #     credential patterns rather than only filenames/keywords.
+                #     Independent of the scope-drift branch above: a file
+                #     mutation can be both out-of-scope and credential-bearing.
+                if isinstance(event, CommandEvent) and event.command:
+                    drift = boundary.check_credential_access(event.command)
+                    if drift:
+                        boundary_drifts.append(
+                            (drift, {"affected_command": event.command[:80]})
+                        )
+                elif isinstance(event, FileMutationEvent) and event.diff_summary:
+                    drift = boundary.check_credential_access(event.diff_summary)
+                    if drift:
+                        boundary_drifts.append(
+                            (drift, {"affected_path": event.file_path})
+                        )
+            except Exception as exc:  # noqa: BLE001 — surface, never break ingestion
+                logger.warning(
+                    "Task-boundary check raised on event %s: %s",
+                    event.event_id,
+                    exc,
+                    exc_info=True,
+                )
+                self._record_ingest_detector_error(event.session_id, "task_boundary", exc)
+            for drift, extra in boundary_drifts:
+                await self.ingest_event(self._boundary_finding(event, drift, **extra))
 
         # 5. Security Policy Evaluation
         policy = self._policies.get(event.session_id)
@@ -931,61 +1059,79 @@ class AgentTraceDaemon:
             and not isinstance(event, PolicyFindingEvent)
             and not event.payload.get("gate_proposal")
         ):
-            evaluation = policy.evaluate(event)
-            for finding in evaluation.findings:
+            evaluation = await self._safe_observe(
+                "policy_engine", event, lambda: policy.evaluate(event).findings
+            )
+            for finding in evaluation:
                 await self.ingest_event(finding)
 
         # 5b. Incident correlation — multi-stage attack patterns
         incident_engine = self._incidents.get(event.session_id)
         if incident_engine:
-            for incident in incident_engine.observe(event):
+            for incident in await self._safe_observe(
+                "incident_correlation", event, lambda: incident_engine.observe(event)
+            ):
                 await self.ingest_event(incident)
 
         # 5b-2. Covert-channel structural detection (METR incident pattern):
         # improvised message boards, chunked encoded transfers, encoded names.
         covert_engine = self._covert.get(event.session_id)
         if covert_engine and not isinstance(event, IncidentEvent):
-            for incident in covert_engine.observe(event):
+            for incident in await self._safe_observe(
+                "covert_channel", event, lambda: covert_engine.observe(event)
+            ):
                 await self.ingest_event(incident)
 
         # 5b-2b. Sensor coverage accounting (shortcoming #9): attribute every
         # raw event to its observation plane so the close report states what
         # each plane actually saw. Derived events are not sensor output.
         if not isinstance(event, (IncidentEvent, PolicyFindingEvent)):
-            self._coverage.observe(event)
+            await self._safe_observe(
+                "coverage", event, lambda: self._coverage.observe(event)
+            )
 
         # 5b-3. Evidence-boundary reconciliation (METR shortcoming #4):
         # cross-validate agent tool claims against OS sensor ground truth.
         reconciler = self._reconcilers.get(event.session_id)
         if reconciler and not isinstance(event, IncidentEvent):
-            for incident in reconciler.observe(event):
+            for incident in await self._safe_observe(
+                "evidence_boundary", event, lambda: reconciler.observe(event)
+            ):
                 await self.ingest_event(incident)
 
         # 5b-4. Post-exit surveillance (METR shortcoming #6): persistence
         # artifacts outliving the session, events arriving after close,
         # and persistence infrastructure shared across sessions.
         if not isinstance(event, IncidentEvent):
-            for incident in self._post_exit.observe(event):
+            for incident in await self._safe_observe(
+                "post_exit", event, lambda: self._post_exit.observe(event)
+            ):
                 await self.ingest_event(incident)
 
         # 5b-5. Credential loops (METR shortcoming #7): the same secret in
         # more than one session's hands — discovery -> sharing -> lateral
         # movement, the primary shared currency of the incident.
         if not isinstance(event, IncidentEvent):
-            for incident in self._credential_loops.observe(event):
+            for incident in await self._safe_observe(
+                "credential_loops", event, lambda: self._credential_loops.observe(event)
+            ):
                 await self.ingest_event(incident)
 
         # 5b-5. Meta-detection (shortcoming #10): convention-free structural
         # anomaly scoring over communication-shaped artifacts.
         if not isinstance(event, (IncidentEvent, PolicyFindingEvent)):
-            for finding in self._meta_anomaly.observe(event):
+            for finding in await self._safe_observe(
+                "meta_detection", event, lambda: self._meta_anomaly.observe(event)
+            ):
                 await self.ingest_event(finding)
 
         # 5b-6. Hesitation divergence (shortcoming #8): verbalized refusal or
         # concern followed by a risk-adjacent action anyway.
         hesitation_engine = self._hesitations.get(event.session_id)
         if hesitation_engine and not isinstance(event, IncidentEvent):
-            for incident in hesitation_engine.observe(event):
+            for incident in await self._safe_observe(
+                "hesitation", event, lambda: hesitation_engine.observe(event)
+            ):
                 await self.ingest_event(incident)
 
         # 5b-7. Eval integrity (shortcoming #5; the CoT-concealment
@@ -994,7 +1140,17 @@ class AgentTraceDaemon:
         # only, never the model's self-report.
         eval_engine = self._eval_detectors.get(event.session_id)
         if eval_engine and not isinstance(event, IncidentEvent):
-            for incident in eval_engine.observe(event):
+            for incident in await self._safe_observe(
+                "eval_integrity", event, lambda: eval_engine.observe(event)
+            ):
+                await self.ingest_event(incident)
+
+        # 5b-8. Actor-identity memory (shortcoming #2 deeper half): which
+        # handles span sessions, and cross-session handoff patterns.
+        if not isinstance(event, IncidentEvent):
+            for incident in await self._safe_observe(
+                "actor_identity", event, lambda: self._actor_graph.observe(event)
+            ):
                 await self.ingest_event(incident)
 
         # R2: response ladder — any critical incident reaching the pipeline
@@ -1032,17 +1188,28 @@ class AgentTraceDaemon:
         """Persist an approved egress destination into the workspace baseline."""
         session = self._sessions.get(event.session_id)
         policy = self._policies.get(event.session_id)
-        if not session or not policy:
+        if not session or not policy or not event.finding_id:
             return
-        workspace_path = session.config.workspace_path
-        for evt in self._ledger.query_events(event.session_id, limit=None):
-            if str(evt.event_id) != event.finding_id:
-                continue
-            destination = evt.payload.get("destination")
-            if destination:
-                policy.add_known_destination(destination)
-                self._ledger.add_destination_baseline(workspace_path, destination)
+        # Direct indexed lookup by the finding's event id. This used to
+        # decrypt and integrity-verify the session's ENTIRE ledger to find
+        # one event — O(whole ledger) per approval.
+        try:
+            source = self._ledger.get_event(UUID(event.finding_id))
+        except (ValueError, LedgerError):
+            logger.warning(
+                "Could not resolve approved finding %s for egress baseline",
+                event.finding_id,
+                exc_info=True,
+            )
             return
+        if source is None or source.session_id != event.session_id:
+            return
+        destination = source.payload.get("destination")
+        if destination:
+            policy.add_known_destination(destination)
+            self._ledger.add_destination_baseline(
+                session.config.workspace_path, destination
+            )
 
     def _containment_provider(
         self, session_id: UUID
@@ -1078,7 +1245,7 @@ class AgentTraceDaemon:
                 "Could not record containment_unavailable finding", exc_info=True
             )
 
-    def _terminate_contained(self, session_id: UUID) -> int:
+    def _terminate_contained(self, session_id: UUID) -> dict[str, Any]:
         """Terminate only kernel-verified members of the session's Job Object.
 
         Heuristic signals ("descendant of a tracked process") are observation
@@ -1086,30 +1253,61 @@ class AgentTraceDaemon:
         unrelated developer process. If the daemon's own PID tree somehow
         appears inside the job, containment is broken — refuse to arm rather
         than kill ourselves.
+
+        Returns the kill verdict for the P1.7 proof-based record: what was
+        targeted, what was terminated, and — on refusal — every process left
+        running inside the open unit.
         """
+        outcome: dict[str, Any] = {
+            "targeted": [],
+            "terminated": 0,
+            "refused": False,
+            "closed_unverified": False,
+            "left_running": [],
+        }
         manager = self._containment.get(session_id)
         if manager is None:
-            return 0
+            return outcome
 
-        verified = set(manager.member_pids())
+        verified = sorted(manager.member_pids())
         if not verified:
-            return 0
+            return outcome
+        outcome["targeted"] = verified
 
         # The manager refuses (and leaves the provider open) if the daemon's
-        # own pid tree is inside the unit — see ContainmentManager.release.
-        if not manager.release(kill=True):
+        # own pid tree is inside the unit — see
+        # ContainmentManager.release_with_verdict. A closed-unverified unit
+        # (kernel refused the kill) is disclosed as such: members are
+        # expected to die via kill-on-close, which is expectation, not proof.
+        verdict = manager.release_with_verdict(kill=True)
+        if verdict["refused"]:
+            outcome["refused"] = True
+            outcome["left_running"] = verified
             logger.critical(
                 "Refused to terminate containment for session %s "
-                "(daemon pid tree detected inside the unit)",
+                "(daemon pid tree detected inside the unit); %d process(es) "
+                "LEFT RUNNING inside the open unit",
+                session_id,
+                len(verified),
+            )
+            return outcome
+        if verdict["kill_verified"]:
+            outcome["terminated"] = len(verified)
+            logger.info(
+                "Terminated %d kernel-verified contained process(es) for session %s",
+                len(verified),
                 session_id,
             )
-            return 0
-        logger.info(
-            "Terminated %d kernel-verified contained process(es) for session %s",
-            len(verified),
-            session_id,
-        )
-        return len(verified)
+        else:
+            outcome["closed_unverified"] = True
+            outcome["left_running"] = verified
+            logger.warning(
+                "Kill signal FAILED for session %s; unit closed relying on "
+                "KILL_ON_JOB_CLOSE for %d process(es) — outcome unverified",
+                session_id,
+                len(verified),
+            )
+        return outcome
 
     async def _apply_incident_response(self, incident: IncidentEvent) -> None:
         """Response ladder (R2): critical incidents freeze the session.
@@ -1140,8 +1338,10 @@ class AgentTraceDaemon:
                 except Exception:
                     logger.warning("Could not revoke approval %s", approval.finding_id)
 
-        # Terminate only kernel-verified Job Object members (P1.19).
-        terminated_pids = self._terminate_contained(sid)
+        # Terminate only kernel-verified Job Object members (P1.19); the
+        # verdict — including any refusal and every left-running pid — is
+        # recorded below, never claimed as success it did not earn (P1.7).
+        kill = self._terminate_contained(sid)
 
         for observer in self._observers.get(sid, []):
             try:
@@ -1162,19 +1362,45 @@ class AgentTraceDaemon:
         # the planes going blind here rather than imply they saw everything.
         self._coverage.blind_from(datetime.now(timezone.utc), sid)
 
+        if kill["refused"]:
+            verdict = (
+                f"TERMINATION REFUSED (daemon pid tree detected inside the "
+                f"containment unit — containment is compromised). "
+                f"{len(kill['left_running'])} process(es) LEFT RUNNING inside "
+                f"the still-open unit: {kill['left_running']}. Operator "
+                f"decision required: inspect these pids before closing or "
+                f"killing the unit."
+            )
+            severity = "critical"
+        elif kill["closed_unverified"]:
+            verdict = (
+                f"Kill signal FAILED; unit closed relying on "
+                f"KILL_ON_JOB_CLOSE. {len(kill['left_running'])} process(es) "
+                f"expected to terminate but UNVERIFIED: "
+                f"{kill['left_running']}. Verify these pids."
+            )
+            severity = "critical"
+        else:
+            verdict = (
+                f"{kill['terminated']} kernel-verified process(es) terminated "
+                f"(targeted: {kill['targeted']}); none left running."
+            )
+            severity = "high"
+
         containment = PolicyFindingEvent(
             session_id=sid,
             actor_id="daemon",
             source_adapter="incident_response",
             confidence=ConfidenceLevel.HIGH,
             finding_type="session_frozen",
-            severity="high",
+            severity=severity,
             description=(
                 f"Critical {incident.incident_type} incident ({incident.title}) — "
-                f"session frozen, {terminated_pids} process(es) terminated, "
+                f"session frozen, {verdict} "
                 f"{revoked} approval(s) revoked."
             ),
             evidence_refs=[str(incident.event_id)],
+            payload={"kill": kill},
         )
         try:
             self._ledger.append_event(containment)
@@ -1192,6 +1418,19 @@ class AgentTraceDaemon:
         if last is not None and now - last < 5.0:
             return
         self._collusion_last_scan[session_id] = now
+        # Growth gate: candidates() re-reads, decrypts and verifies every
+        # session in the workspace. It must only run when the ledger has
+        # actually grown since the last pass — in particular so re-entrant
+        # scans inside one event's projection cascade (derived findings nest
+        # ingest_event -> project_event -> _scan_collusion) never re-scan a
+        # ledger whose state provably has not changed.
+        try:
+            count = self._ledger.event_count()
+        except LedgerError:
+            return
+        if count == self._collusion_last_count:
+            return
+        self._collusion_last_count = count
         try:
             for candidate in self._collusion.for_session(session_id):
                 key = (
@@ -1368,7 +1607,14 @@ class AgentTraceDaemon:
             source_adapter=event.source_adapter,
             confidence=event.confidence,
             session_id=event.session_id,
-            data=self._redactor.redact_any(event.canonical_dict()),
+            data={
+                # Chain-of-custody class (plan2 #4): agent_claimed narrative
+                # vs os_observed ground truth vs derived, from the
+                # hash-committed source_adapter — the graph layer's answer
+                # to "what did the agent SAY vs what did the MACHINE do".
+                "evidence_class": event_evidence_class(event).value,
+                **self._redactor.redact_any(event.canonical_dict()),
+            },
         )
         graph.add_node(node)
 
@@ -1394,7 +1640,11 @@ class AgentTraceDaemon:
         def link_edge(
             source_id: UUID, edge_type: EdgeType, confidence: ConfidenceLevel = ConfidenceLevel.HIGH
         ) -> GraphEdge:
-            """Helper: edge from a cause node to the just-added node."""
+            """Helper: edge from a cause node to the just-added node.
+
+            Every edge carries the event that produced it as its evidence
+            input — the P1.4 rule that an inference edge is a claim and a
+            claim must name what it was derived from."""
             return GraphEdge(
                 source_node_id=source_id,
                 target_node_id=node.node_id,
@@ -1402,6 +1652,7 @@ class AgentTraceDaemon:
                 actor_id=event.actor_id,
                 source_adapter=event.source_adapter,
                 confidence=confidence,
+                data={"inputs": [str(event.event_id)]},
             )
 
         # 1. Invocations connect to root task_intent
@@ -1477,6 +1728,7 @@ class AgentTraceDaemon:
                     actor_id=event.actor_id,
                     source_adapter=event.source_adapter,
                     confidence=ConfidenceLevel.MEDIUM,
+                    data={"inputs": [str(prev.node_id), str(event.event_id)]},
                 ))
 
         # 6. Network connections connect to the most recent spawning process
@@ -1530,9 +1782,12 @@ class AgentTraceDaemon:
                         confidence=ConfidenceLevel.HIGH,
                     ))
 
-        # Add and persist all edges
+        # Add and persist all edges (an evidence-rule rejection never
+        # reaches the ledger either — the graph and its stored projection
+        # stay identical).
         for new_edge in new_edges:
-            graph.add_edge(new_edge)
+            if not graph.add_edge(new_edge):
+                continue
             self._ledger.store_graph_edge(
                 edge_id=new_edge.edge_id,
                 session_id=event.session_id,
@@ -1727,7 +1982,9 @@ class AgentTraceDaemon:
         if policy_blocked:
             desc = policy_hits[0][1] if policy_hits else "action is not permitted by policy"
             rule_id = policy_hits[0][0] if policy_hits else "shield_blocked_threat"
-            # Record the pre-execution blocked attack to the cryptographic ledger
+            # Record the pre-execution blocked attack to the cryptographic ledger.
+            # The rule id travels in payload: PolicyFindingEvent has no
+            # policy_rule field, and pydantic silently dropped it before.
             blocked_event = PolicyFindingEvent(
                 session_id=session_id,
                 actor_id="shield_gate",
@@ -1736,7 +1993,9 @@ class AgentTraceDaemon:
                 finding_type="shield_blocked_threat",
                 severity="critical",
                 description=f"Shield blocked execution: {desc}",
-                policy_rule=rule_id,
+                payload={"policy_rule": rule_id, "policy_hits": [
+                    {"rule": rid, "detail": d} for rid, d in policy_hits
+                ]},
             )
             with contextlib.suppress(Exception):
                 self._ledger.append_event(blocked_event)
@@ -1876,6 +2135,14 @@ class AgentTraceDaemon:
             # those capabilities.
             KernelObserver(session.session_id, workspace, callback),
         ]
+
+        # Kernel-grade Linux process plane (P1.2): auditd records EVERY
+        # execve — including processes too short-lived for any poll to see.
+        # The observer records its own honest gap when auditd is absent.
+        if sys.platform.startswith("linux"):
+            observers.append(
+                AuditdObserver(session.session_id, workspace, callback)
+            )
 
         # Reconcile hash sources: seed the observer's hash cache from the
         # baseline graph's SOURCE_FILE content hashes so the first mutation

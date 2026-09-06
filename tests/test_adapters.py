@@ -14,6 +14,7 @@ import pytest
 
 from agenttrace.adapters.claude import ClaudeAdapter
 from agenttrace.adapters.codex import CodexAdapter
+from agenttrace.adapters.composite import CompositeAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.models.events import (
@@ -746,3 +747,130 @@ class TestUniversalAgentAdapter:
 
         adapter.commit_cursor()
         assert len(adapter.cursor_state()["seen_entries"]) == 1
+
+
+# -- Sprint-1 fixes: composite command drop + codex cross-project isolation ------
+
+
+class TestCompositeSupportedTypes:
+    """The composite validates events against its own supported types, so a
+    type any sub-adapter emits must be included or the daemon drops it
+    silently (shell commands were lost in the default auto config)."""
+
+    def test_union_includes_every_sub_adapter_type(self) -> None:
+        adapter = CompositeAdapter(uuid4(), "/ws")
+        union: set[EventType] = set()
+        for sub in adapter._sub_adapters:
+            union.update(sub.supported_event_types)
+        assert set(adapter.supported_event_types) == union
+
+    def test_command_events_pass_validation(self) -> None:
+        adapter = CompositeAdapter(uuid4(), "/ws")
+        event = CommandEvent(
+            session_id=adapter.session_id,
+            actor_id="agent",
+            source_adapter="claude_code",
+            command="pytest tests/",
+        )
+        assert adapter.validate_event(event)
+
+
+class TestCodexCrossProjectFilter:
+    """Codex stores every project's rollouts under one home directory; this
+    adapter must not ingest other projects' transcripts under this
+    workspace's provenance."""
+
+    def _write_rollout(
+        self, sessions: Path, name: str, cwd: str, command: str
+    ) -> Path:
+        rollout = sessions / name
+        lines = [
+            {"payload": {"type": "session_meta", "cwd": cwd}},
+            {"payload": {"type": "user_message", "message": "go"}},
+            {
+                "payload": {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": json.dumps({"command": command}),
+                    },
+                }
+            },
+        ]
+        rollout.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8"
+        )
+        return rollout
+
+    @pytest.mark.asyncio
+    async def test_foreign_project_rollout_skipped(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        other = tmp_path / "other-project"
+        other.mkdir()
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        self._write_rollout(
+            sessions, "rollout-1.jsonl", str(other), "cat secrets.txt"
+        )
+        adapter = CodexAdapter(uuid4(), str(workspace), sessions_dir=sessions)
+        await adapter.start()
+        events = await adapter.poll()
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_workspace_rollout_ingested_with_real_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        self._write_rollout(
+            sessions, "rollout-2.jsonl", str(workspace), "pytest tests/"
+        )
+        adapter = CodexAdapter(uuid4(), str(workspace), sessions_dir=sessions)
+        await adapter.start()
+        events = await adapter.poll()
+        commands = [e for e in events if isinstance(e, CommandEvent)]
+        assert len(commands) == 1
+        assert commands[0].working_dir == str(workspace)
+
+    @pytest.mark.asyncio
+    async def test_cwd_survives_cursor_roundtrip(self, tmp_path: Path) -> None:
+        """The restart case: positions are past session_meta, so the cwd map
+        must persist in the cursor state or a NEW adapter (post-restart)
+        resumes translating a foreign rollout with no cwd to filter by."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        rollout = self._write_rollout(
+            sessions, "rollout-3.jsonl", str(other), "cat secrets.txt"
+        )
+        adapter = CodexAdapter(uuid4(), str(workspace), sessions_dir=sessions)
+        await adapter.start()
+        await adapter.poll()  # consume through session_meta
+        cursor = adapter.cursor_state()
+
+        fresh = CodexAdapter(uuid4(), str(workspace), sessions_dir=sessions)
+        await fresh.start()
+        fresh.restore_cursor(cursor)
+        # A foreign command arriving after the restart must still be filtered
+        # by the persisted cwd — without rollout_cwd in the cursor it would
+        # be ingested under this workspace's provenance.
+        with open(rollout, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "payload": {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "cat /etc/shadow"}),
+                    },
+                }
+            }) + "\n")
+        assert await fresh.poll() == []

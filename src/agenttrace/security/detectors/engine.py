@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import TYPE_CHECKING
 
 from agenttrace.models.events import ConfidenceLevel
@@ -39,7 +40,9 @@ class DetectionEngine:
             internet_allowed=internet_allowed,
         )
         self._detectors: list[Detector] = list(detectors or DEFAULT_DETECTORS)
-        self._error_findings: list[DetectorFinding] = []
+        # Detector-error census, bounded: this only ever grows (one entry per
+        # failing evaluation) and nothing prunes it.
+        self._error_findings: deque[DetectorFinding] = deque(maxlen=100)
 
     def evaluate(self, event: EventBase) -> list[DetectorFinding]:
         """Evaluate one event against all active detectors."""

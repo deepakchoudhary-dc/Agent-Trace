@@ -1,7 +1,10 @@
 ﻿"""S5-4: multi-agent collusion correlation - observable half only."""
 
+import asyncio
 from pathlib import Path
 from uuid import UUID, uuid4
+
+import pytest
 
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.models.events import (
@@ -269,3 +272,46 @@ class TestRotatedIdentity:
 
         candidates = CollusionCorrelationEngine(ledger).candidates()
         assert not any(c.signal == "rotated_identity" for c in candidates)
+
+
+class TestScanGrowthGate:
+    """Sprint-1 fix: candidates() re-reads, decrypts and verifies the entire
+    ledger of every workspace session; the scan must only run when the
+    ledger actually grew, not on every 5s throttle tick of an idle daemon."""
+
+    def test_event_count_tracks_appends(self, tmp_path: Path) -> None:
+        ledger = _ledger(tmp_path)
+        sid = _session(ledger, "/ws/a", "count test")
+        assert ledger.event_count() == 0
+        ledger.append_event(FileMutationEvent(
+            session_id=sid,
+            actor_id="actor-1",
+            source_adapter="filesystem_observer",
+            file_path="/ws/a/f1.py",
+            mutation_type="modify",
+        ))
+        assert ledger.event_count() == 1
+
+    def test_scan_skipped_when_ledger_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agenttrace.daemon as daemon_mod
+
+        daemon = daemon_mod.AgentTraceDaemon(tmp_path / ".agenttrace")
+        scans: list[UUID] = []
+        monkeypatch.setattr(
+            daemon._collusion,
+            "for_session",
+            lambda sid: scans.append(sid) or [],
+        )
+        sid = uuid4()
+        daemon._collusion_last_count = -1  # unscanned: the first pass must run
+        import time as _time
+
+        daemon._collusion_last_scan[sid] = _time.monotonic() - 10.0
+        asyncio.run(daemon._scan_collusion(sid))
+        assert scans == [sid]
+        # Ledger unchanged -> second pass must not rescan.
+        daemon._collusion_last_scan[sid] = _time.monotonic() - 10.0
+        asyncio.run(daemon._scan_collusion(sid))
+        assert scans == [sid]

@@ -16,6 +16,7 @@ import networkx as nx  # type: ignore[import-untyped]
 if TYPE_CHECKING:
     from datetime import datetime
 
+from agenttrace.models.events import ConfidenceLevel
 from agenttrace.models.graph import (
     EdgeType,
     GraphEdge,
@@ -90,14 +91,30 @@ class ContextGraph:
 
     # -- Edge operations --
 
-    def add_edge(self, edge: GraphEdge) -> None:
-        """Add a directed edge between two nodes."""
+    def add_edge(self, edge: GraphEdge) -> bool:
+        """Add a directed edge; returns False when the edge is refused.
+
+        Evidence rule (plan2 P1.4): an edge with confidence below HIGH is an
+        INFERENCE — a claim about the graph — and every claim must carry the
+        inputs it was derived from (``data["inputs"]``). Without this check
+        the graph quietly grows assertions that look like observations.
+        """
         if edge.source_node_id not in self._nodes:
             logger.warning("Source node %s not found for edge", edge.source_node_id)
-            return
+            return False
         if edge.target_node_id not in self._nodes:
             logger.warning("Target node %s not found for edge", edge.target_node_id)
-            return
+            return False
+        # Limit, stated honestly: HIGH confidence is self-certified — a
+        # producer that mislabels an inference HIGH passes this check. The
+        # rule catches unanchored inference claims, not mislabeled ones.
+        if edge.confidence is not ConfidenceLevel.HIGH and not edge.data.get("inputs"):
+            logger.warning(
+                "Rejected inference edge %s (%s): no evidence inputs",
+                edge.edge_id,
+                edge.edge_type.value,
+            )
+            return False
 
         self._edges[edge.edge_id] = edge
         self._graph.add_edge(
@@ -108,6 +125,20 @@ class ContextGraph:
             confidence=edge.confidence,
             timestamp=edge.timestamp.isoformat(),
         )
+        return True
+
+    def audit_evidence(self) -> list[UUID]:
+        """Edge ids that violate the evidence rule.
+
+        Defense in depth for edges that entered the graph outside
+        :meth:`add_edge` (imports, snapshots mutated in place) — a live graph
+        with violations is a graph whose inference claims are unanchored.
+        """
+        return [
+            edge.edge_id
+            for edge in self._edges.values()
+            if edge.confidence is not ConfidenceLevel.HIGH and not edge.data.get("inputs")
+        ]
 
     def get_edge(self, edge_id: UUID) -> GraphEdge | None:
         """Retrieve an edge by ID."""

@@ -209,3 +209,24 @@ def test_incident_events_ignored() -> None:
         description="d",
     )
     assert registry.observe(incident) == []
+
+
+# -- Sprint-1 fix: close summaries are session-scoped and never consumed early ----
+
+
+def test_two_sessions_closing_close_together_both_emit_summaries() -> None:
+    """The close-summary cooldown used to be a single global key: the second
+    session closing inside the window lost its persistence summary
+    permanently (artifacts already popped) — data loss in the exact
+    multi-session scenario this registry exists for."""
+    registry = PostExitRegistry()
+    registry.observe(_cmd("systemctl enable watch.service", sid=_SID_A))
+    registry.observe(_cmd("crontab -", sid=_SID_B))
+    first = registry.close_session(_SID_A, _T0)
+    second = registry.close_session(_SID_B, _T0 + timedelta(minutes=1))
+    assert len(first) == 1
+    assert len(second) == 1
+    assert first[0].session_id == _SID_A
+    assert second[0].session_id == _SID_B
+
+

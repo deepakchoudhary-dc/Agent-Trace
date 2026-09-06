@@ -48,8 +48,17 @@ class ApiTokenManager:
         return self._expiry_path
 
     def token(self) -> str:
-        """Return the current token, creating it on first use."""
+        """Return the current token, minting or rotating it as needed.
+
+        Creates on first use; rotates when the stored token has passed its
+        TTL. Without rotation an expired token would fail closed forever —
+        the only recovery being a manual command — while the daemon keeps
+        refusing every request.
+        """
         if not self._path.exists():
+            self._create()
+        elif self.is_expired():
+            logger.warning("API token expired after TTL; rotating automatically")
             self._create()
         return self._path.read_text(encoding="utf-8").strip()
 

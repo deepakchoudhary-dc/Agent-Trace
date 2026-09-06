@@ -167,12 +167,19 @@ class PostExitRegistry:
     def close_session(self, session_id: UUID, now: datetime) -> list[IncidentEvent]:
         """Called when a session stops; emits its persistence summary."""
         self._closed[session_id] = now
-        artifacts = self._persistence.pop(session_id, {})
+        artifacts = self._persistence.get(session_id, {})
         if not artifacts:
             return []
-        summary = "; ".join(f"{k}:{v}" for k, v in sorted(artifacts.items()))
-        if not self._can_emit("close-summary", now):
+        # Session-scoped cooldown, checked BEFORE the artifacts are consumed:
+        # the cooldown key used to be global, and the pop ran first, so a
+        # second session closing inside the window lost its close summary
+        # permanently — data loss in exactly the multi-session scenario this
+        # registry exists for. Artifacts are consumed only when the summary
+        # will actually be emitted.
+        if not self._can_emit(f"close-summary:{session_id}", now):
             return []
+        self._persistence.pop(session_id, None)
+        summary = "; ".join(f"{k}:{v}" for k, v in sorted(artifacts.items()))
         logger.warning(
             "POST-EXIT: session %s closed with %d persistence artifact(s)",
             session_id,

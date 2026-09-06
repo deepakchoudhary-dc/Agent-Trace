@@ -1034,7 +1034,7 @@ async def get_causal_chain(session_id: UUID, target_node_id: UUID) -> dict[str, 
                 continue
         for e in edges_data:
             try:
-                graph.add_edge(GraphEdge(
+                edge = GraphEdge(
                     edge_id=UUID(e["edge_id"]),
                     source_node_id=UUID(e["source_node_id"]),
                     target_node_id=UUID(e["target_node_id"]),
@@ -1044,7 +1044,14 @@ async def get_causal_chain(session_id: UUID, target_node_id: UUID) -> dict[str, 
                     source_adapter=e.get("source_adapter", ""),
                     confidence=ConfidenceLevel(e.get("confidence", "high")),
                     data=e.get("data", {}),
-                ))
+                )
+                if not graph.add_edge(edge):
+                    # Pre-rule inference edges carry no evidence inputs; the
+                    # rebuilt view drops them, and that loss is disclosed.
+                    logger.warning(
+                        "Causal rebuild dropped edge %s (evidence-rule rejection)",
+                        e["edge_id"],
+                    )
             except Exception:
                 continue
 
@@ -1096,7 +1103,7 @@ async def get_blast_radius(session_id: UUID, node_id: UUID) -> dict[str, Any]:
                 continue
         for e in edges_data:
             try:
-                graph.add_edge(GraphEdge(
+                edge = GraphEdge(
                     edge_id=UUID(e["edge_id"]),
                     source_node_id=UUID(e["source_node_id"]),
                     target_node_id=UUID(e["target_node_id"]),
@@ -1106,7 +1113,14 @@ async def get_blast_radius(session_id: UUID, node_id: UUID) -> dict[str, Any]:
                     source_adapter=e.get("source_adapter", ""),
                     confidence=ConfidenceLevel(e.get("confidence", "high")),
                     data=e.get("data", {}),
-                ))
+                )
+                if not graph.add_edge(edge):
+                    # Pre-rule inference edges carry no evidence inputs; the
+                    # rebuilt view drops them, and that loss is disclosed.
+                    logger.warning(
+                        "Causal rebuild dropped edge %s (evidence-rule rejection)",
+                        e["edge_id"],
+                    )
             except Exception:
                 continue
 

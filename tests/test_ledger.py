@@ -11,7 +11,7 @@ from agenttrace.models.events import (
     FileMutationEvent,
     ToolRequestEvent,
 )
-from agenttrace.storage.ledger import EventLedger
+from agenttrace.storage.ledger import EventLedger, LedgerError
 
 
 @pytest.fixture
@@ -673,3 +673,95 @@ class TestIntegritySurfacing:
         assert ledger.get_session(sid) is not None
         ledger.list_sessions()
         assert ledger.integrity_failure_count == 0
+
+
+# -- AAD row binding (plan2 P1.1): payload replay is structurally impossible -----
+
+
+def test_payload_ciphertext_cannot_be_moved_to_another_event(tmp_path: Path) -> None:
+    """The P1.1 attack: take a ciphertext and re-attach it to a different
+    row so the event claims a payload it never had. With AAD binding the GCM
+    tag fails and the row is surfaced as tampered, never returned."""
+    ledger = EventLedger(tmp_path / "ledger.db")
+    sid = uuid4()
+    ledger.create_session(sid, "{}", "aad test", "2026-01-01T00:00:00Z")
+
+    ev_a = CommandEvent(
+        session_id=sid, actor_id="agent", source_adapter="terminal",
+        command="echo benign", payload={"marker": "A"},
+    )
+    ev_b = CommandEvent(
+        session_id=sid, actor_id="agent", source_adapter="terminal",
+        command="echo other", payload={"marker": "B"},
+    )
+    ledger.append_event(ev_a)
+    ledger.append_event(ev_b)
+
+    # Move A's payload ciphertext onto B's row, raw.
+    payload_a = ledger._conn.execute(
+        "SELECT payload_enc FROM events WHERE event_id = ?", (str(ev_a.event_id),)
+    ).fetchone()[0]
+    ledger._conn.execute(
+        "UPDATE events SET payload_enc = ? WHERE event_id = ?",
+        (payload_a, str(ev_b.event_id)),
+    )
+    ledger._conn.commit()
+
+    with pytest.raises(LedgerError, match="integrity verification|Payload"):
+        ledger.get_event(ev_b.event_id)
+
+
+def test_payload_cannot_move_across_sessions(tmp_path: Path) -> None:
+    """Same attack across the session boundary — the stronger replay."""
+    ledger = EventLedger(tmp_path / "ledger.db")
+    sid_a, sid_b = uuid4(), uuid4()
+    ledger.create_session(sid_a, "{}", "aad a", "2026-01-01T00:00:00Z")
+    ledger.create_session(sid_b, "{}", "aad b", "2026-01-01T00:00:00Z")
+
+    ev_a = CommandEvent(
+        session_id=sid_a, actor_id="agent", source_adapter="terminal",
+        command="git push origin main", payload={"branch": "main"},
+    )
+    ledger.append_event(ev_a)
+    payload_a = ledger._conn.execute(
+        "SELECT payload_enc FROM events WHERE event_id = ?", (str(ev_a.event_id),)
+    ).fetchone()[0]
+
+    ev_b = CommandEvent(
+        session_id=sid_b, actor_id="agent", source_adapter="terminal",
+        command="git push origin evil", payload={},
+    )
+    ledger.append_event(ev_b)
+    ledger._conn.execute(
+        "UPDATE events SET payload_enc = ? WHERE event_id = ?",
+        (payload_a, str(ev_b.event_id)),
+    )
+    ledger._conn.commit()
+
+    with pytest.raises(LedgerError):
+        ledger.get_event(ev_b.event_id)
+
+
+def test_legacy_unbound_payload_still_readable(tmp_path: Path) -> None:
+    """Rows written before AAD binding stay readable (they remain protected
+    by the four-layer row integrity check); new rows are always bound."""
+    ledger = EventLedger(tmp_path / "ledger.db")
+    sid = uuid4()
+    ledger.create_session(sid, "{}", "legacy", "2026-01-01T00:00:00Z")
+
+    event = CommandEvent(
+        session_id=sid, actor_id="agent", source_adapter="terminal",
+        command="echo legacy", payload={"marker": "legacy"},
+    )
+    ledger.append_event(event)
+    # Simulate a legacy row: re-encrypt the plaintext without any binding.
+    legacy_cipher = ledger._encryption.encrypt_json({"marker": "legacy"})
+    ledger._conn.execute(
+        "UPDATE events SET payload_enc = ? WHERE event_id = ?",
+        (legacy_cipher, str(event.event_id)),
+    )
+    ledger._conn.commit()
+
+    restored = ledger.get_event(event.event_id)
+    assert restored is not None
+    assert restored.payload == {"marker": "legacy"}

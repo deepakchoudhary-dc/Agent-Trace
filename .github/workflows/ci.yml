@@ -7,14 +7,31 @@ on:
 
 jobs:
   backend:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.10 is the minimum supported version; 3.11/3.12 catch semantic
+          # drift (a 3.10-vs-3.11 break is already in gotchas.md).
+          - os: ubuntu-latest
+            python-version: '3.10'
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: ubuntu-latest
+            python-version: '3.12'
+          # Windows is the primary development platform and the source of
+          # the platform-specific bug classes in gotchas.md; it must be
+          # tested, not assumed.
+          - os: windows-latest
+            python-version: '3.10'
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: |

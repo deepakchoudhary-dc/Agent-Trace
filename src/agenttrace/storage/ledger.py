@@ -23,7 +23,7 @@ from agenttrace.models.events import (
     EventType,
     event_from_dict,
 )
-from agenttrace.security.encryption import EncryptionManager
+from agenttrace.security.encryption import EncryptionError, EncryptionManager
 from agenttrace.security.redaction import SecretRedactor
 
 if TYPE_CHECKING:
@@ -331,7 +331,9 @@ class EventLedger:
         envelope_payload = envelope_fields.get("payload") or {}
         if row["payload_enc"]:
             try:
-                stored_payload = self._encryption.decrypt_json(row["payload_enc"])
+                stored_payload = json.loads(
+                    self._decrypt_event_value(row, row["payload_enc"], "payload")
+                )
             except Exception as e:
                 return (
                     f"Payload decryption failed at seq={stored_seq} "
@@ -616,10 +618,15 @@ class EventLedger:
             event.event_hash = clean_event.event_hash
             event.seq = clean_event.seq
 
-            # Encrypt the payload
+            # Encrypt the payload, bound to this row's identity (P1.1)
             payload_enc: bytes | None = None
             if clean_event.payload:
-                payload_enc = self._encryption.encrypt_json(clean_event.payload)
+                payload_enc = self._encryption.encrypt_json(
+                    clean_event.payload,
+                    associated_data=self._event_aad(
+                        str(clean_event.session_id), str(clean_event.event_id), "payload"
+                    ),
+                )
 
             # The canonical envelope is the full event content (commands, prompts,
             # tool args, diffs). It is AES-256-GCM encrypted at rest; its SHA-256 is
@@ -630,7 +637,12 @@ class EventLedger:
                 separators=(",", ":"),
                 ensure_ascii=False,
             )
-            canonical_json_enc = self._encryption.encrypt_str(canonical_json)
+            canonical_json_enc = self._encryption.encrypt_str(
+                canonical_json,
+                associated_data=self._event_aad(
+                    str(clean_event.session_id), str(clean_event.event_id), "canonical"
+                ),
+            )
             canonical_json_hash = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
             index_binding_hash = self._compute_index_binding_hash(
@@ -694,6 +706,29 @@ class EventLedger:
             raise
         return clean_event.event_hash
 
+    # -- AAD binding (plan2 P1.1): event ciphertexts are authenticated
+    # against their row identity, so a payload encrypted for one event fails
+    # GCM verification if moved to any other row, column, or session. The
+    # payload-replay that P1.1 named is structurally impossible for bound rows.
+
+    _EVENT_COLUMN_AAD = {"payload_enc": "payload", "canonical_json_enc": "canonical"}
+
+    @staticmethod
+    def _event_aad(session_id: str, event_id: str, column: str) -> bytes:
+        return f"agenttrace/event:{session_id}:{event_id}:{column}".encode()
+
+    def _decrypt_event_value(self, row: Any, encrypted: bytes, column: str) -> bytes:
+        """Decrypt an event ciphertext with its row binding.
+
+        Legacy rows written before binding are still covered by the
+        four-layer row integrity check; new rows are always bound, and key
+        rotation upgrades legacy rows in place."""
+        aad = self._event_aad(row["session_id"], row["event_id"], column)
+        try:
+            return self._encryption.decrypt(encrypted, associated_data=aad)
+        except EncryptionError:
+            return self._encryption.decrypt(encrypted)
+
     @_locked
     def get_event(self, event_id: UUID) -> EventBase | None:
         """Retrieve a single event by ID, deserializing to its concrete Event class.
@@ -720,9 +755,22 @@ class EventLedger:
 
         # Decrypt payload if stored separately (integrity already verified)
         if row["payload_enc"]:
-            event.payload = self._encryption.decrypt_json(row["payload_enc"])
+            event.payload = json.loads(
+                self._decrypt_event_value(row, row["payload_enc"], "payload")
+            )
 
         return event
+
+    @_locked
+    def event_count(self) -> int:
+        """Total events across all sessions, without decrypting anything.
+
+        Cheap gate for periodic full-ledger scans: a scan that decrypts and
+        verifies every event must only run when the ledger has actually
+        grown since the last pass.
+        """
+        row = self._conn.execute("SELECT COUNT(*) FROM events").fetchone()
+        return int(row[0])
 
     @_locked
     def query_events(
@@ -781,7 +829,9 @@ class EventLedger:
             event_data["event_hash"] = r["event_hash"]
             evt = event_from_dict(event_data)
             if r["payload_enc"]:
-                evt.payload = self._encryption.decrypt_json(r["payload_enc"])
+                evt.payload = json.loads(
+                    self._decrypt_event_value(r, r["payload_enc"], "payload")
+                )
             events.append(evt)
 
         return events
@@ -793,7 +843,9 @@ class EventLedger:
         store the plaintext envelope in the pre-v0.3 `canonical_json` column.
         """
         if row["canonical_json_enc"]:
-            return self._encryption.decrypt_str(row["canonical_json_enc"])
+            return self._decrypt_event_value(
+                row, row["canonical_json_enc"], "canonical"
+            ).decode("utf-8")
         return str(row["canonical_json"])
 
     # -- Complete cryptographic chain verification --
@@ -1410,13 +1462,35 @@ class EventLedger:
 
     @_locked
     def _reencrypt_column(self, table: str, column: str, new_key: bytes) -> None:
-        """Re-encrypt one column: decrypt with the current key, encrypt with the new one."""
-        rows = self._conn.execute(
-            f"SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
-        ).fetchall()
+        """Re-encrypt one column: decrypt with the current key, encrypt with the new one.
+
+        Bound event columns (P1.1) keep their row binding across rotation and
+        legacy rows are upgraded to bound in place."""
+        aad_column = (
+            self._EVENT_COLUMN_AAD.get(column) if table == "events" else None
+        )
+        if aad_column:
+            rows = self._conn.execute(
+                f"SELECT rowid, {column}, session_id, event_id FROM {table} "
+                f"WHERE {column} IS NOT NULL"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
+            ).fetchall()
         for r in rows:
-            plaintext = self._encryption.decrypt(r[column])
-            new_cipher = self._encryption.encrypt_with(new_key, plaintext)
+            if aad_column:
+                aad = self._event_aad(r["session_id"], r["event_id"], aad_column)
+                try:
+                    plaintext = self._encryption.decrypt(r[column], associated_data=aad)
+                except EncryptionError:
+                    plaintext = self._encryption.decrypt(r[column])
+            else:
+                aad = None
+                plaintext = self._encryption.decrypt(r[column])
+            new_cipher = self._encryption.encrypt_with(
+                new_key, plaintext, associated_data=aad
+            )
             self._conn.execute(
                 f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
                 (new_cipher, r["rowid"]),

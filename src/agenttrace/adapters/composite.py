@@ -15,16 +15,44 @@ from agenttrace.adapters.codex import CodexAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.generic import GenericAdapter
 from agenttrace.adapters.sdk import SDK_VERSION, AdapterBase
-from agenttrace.models.events import EventBase, EventType
 
 if TYPE_CHECKING:
     from uuid import UUID
+
+    from agenttrace.models.events import EventBase, EventType
 
 logger = logging.getLogger(__name__)
 
 
 class CompositeAdapter(AdapterBase):
     """Aggregates multiple AI coding assistant adapters simultaneously."""
+
+    def __init__(self, session_id: UUID, workspace_path: str) -> None:
+        self._supported_types_cache: list[EventType] | None = None
+        super().__init__(session_id, workspace_path)
+        self._sub_adapters: list[AdapterBase] = [
+            CodexAdapter(session_id, workspace_path),
+            CopilotAdapter(session_id, workspace_path),
+            ClaudeAdapter(session_id, workspace_path),
+            GenericAdapter(session_id, workspace_path),
+        ]
+
+    @property
+    def supported_event_types(self) -> list[EventType]:
+        """Union of every event type any sub-adapter can emit.
+
+        The daemon validates events against *this* adapter's supported types
+        (the composite has no per-sub-adapter validation), so a type present
+        in a sub-adapter but missing here is silently dropped at ingest —
+        that is exactly how shell commands from agent transcripts were being
+        lost in the default ``auto`` configuration.
+        """
+        if self._supported_types_cache is None:
+            union: set[EventType] = set()
+            for adapter in self._sub_adapters:
+                union.update(adapter.supported_event_types)
+            self._supported_types_cache = sorted(union, key=lambda t: t.value)
+        return list(self._supported_types_cache)
 
     @property
     def adapter_name(self) -> str:
@@ -37,24 +65,6 @@ class CompositeAdapter(AdapterBase):
     @property
     def sdk_version(self) -> str:
         return SDK_VERSION
-
-    @property
-    def supported_event_types(self) -> list[EventType]:
-        return [
-            EventType.INVOCATION,
-            EventType.TOOL_REQUEST,
-            EventType.TOOL_RESULT,
-            EventType.CONTEXT_BOUNDARY,
-        ]
-
-    def __init__(self, session_id: UUID, workspace_path: str) -> None:
-        super().__init__(session_id, workspace_path)
-        self._sub_adapters: list[AdapterBase] = [
-            CodexAdapter(session_id, workspace_path),
-            CopilotAdapter(session_id, workspace_path),
-            ClaudeAdapter(session_id, workspace_path),
-            GenericAdapter(session_id, workspace_path),
-        ]
 
     async def start(self) -> None:
         self._running = True

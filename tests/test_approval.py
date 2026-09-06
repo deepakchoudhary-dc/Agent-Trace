@@ -165,3 +165,36 @@ class TestApprovalManager:
         restored = fresh.reload_from_storage()
         assert restored == 0  # requests are not grants
         assert fresh.check_approval(finding_id="finding-1") is False
+
+
+class TestApprovalScopeHardening:
+    """Sprint-1 fixes: a live denial retires a cached grant, and a `..`
+    traversal can never satisfy a path scope."""
+
+    def test_denial_retires_cached_grant(self, tmp_path: Path) -> None:
+        _, mgr, _ = _make_manager(tmp_path)
+        mgr.record_approval("finding-1", True, "ok", affected_paths=["/workspace"])
+        assert mgr.check_approval(path="/workspace/src/a.py") is True
+        mgr.record_approval("finding-1", False, "operator changed their mind")
+        assert mgr.check_approval(path="/workspace/src/a.py") is False
+        assert mgr.check_approval(finding_id="finding-1") is False
+
+    def test_path_traversal_cannot_escape_scope(self, tmp_path: Path) -> None:
+        _, mgr, _ = _make_manager(tmp_path)
+        mgr.record_approval("finding-1", True, "ok", affected_paths=["/workspace"])
+        assert mgr.check_approval(path="/workspace/../../home/u/.ssh") is False
+        assert mgr.check_approval(path="/workspace/..") is False
+        assert mgr.check_approval(path="/workspace/src/main.py") is True
+
+
+    def test_denial_survives_restart(self, tmp_path: Path) -> None:
+        """The persisted 'granted' row must not resurrect after a restart:
+        store_approval only upserts 'requested' rows, so a denial has to
+        revoke the stored grant explicitly."""
+        ledger, mgr, sid = _make_manager(tmp_path)
+        mgr.record_approval("finding-1", True, "ok", affected_paths=["/workspace"])
+        mgr.record_approval("finding-1", False, "operator reversed the decision")
+
+        fresh = ApprovalManager(sid, ledger)
+        fresh.reload_from_storage()
+        assert fresh.check_approval(path="/workspace/src/a.py") is False

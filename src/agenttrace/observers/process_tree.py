@@ -79,6 +79,13 @@ _SHELL_NAMES = {"bash", "sh", "zsh", "fish", "cmd.exe", "powershell", "pwsh"}
 # is re-evaluated.
 _MAX_IRRELEVANT = 8192
 
+# GUI editor hosts. Agents run inside them as child processes, so they are
+# tracked for observation, but they must never be captured into the session's
+# containment unit: assigning the user's own editor puts it in the kill set
+# that session stop / incident response terminates. Heuristic presence is
+# never a kill criterion.
+_GUI_HOST_NAMES = ("code.exe", "cursor", "windsurf", "antigravity")
+
 
 def _is_shell(name: str) -> bool:
     """True for shell interpreters whose argv carries the real command."""
@@ -201,7 +208,9 @@ class ProcessTreeObserver(BaseObserver):
                     cwd = self._safe_cwd(proc)
 
                 current_pids.add(pid)
-                if self._job_object and pid not in job_pids:
+                if self._job_object and pid not in job_pids and self._containment_eligible(
+                    is_descendant, name, cwd
+                ):
                     self._job_object.assign_pid(pid)
 
                 if pid in self._tracked_pids:
@@ -368,6 +377,39 @@ class ProcessTreeObserver(BaseObserver):
         if idx + 1 < len(cmdline):
             return cmdline[idx + 1].strip()
         return ""
+
+    def _containment_eligible(self, is_descendant: bool, name: str, cwd: str) -> bool:
+        """Whether a discovered process may be captured into the containment unit.
+
+        The containment unit is a kill set: session stop and incident response
+        terminate its members. Only the agent's own execution tree qualifies:
+
+        - descendants of already-tracked session processes / job members (the
+          agent's spawn tree, including children that escaped the workspace
+          cwd — VULN-04), and
+        - agent-harness CLIs running inside this session's workspace.
+
+        GUI editor hosts are observed but never captured, and cwd-only
+        relevance (the user's own shells, editors, dev servers, toolchains)
+        is observation, not containment: heuristic presence must never be a
+        kill criterion.
+        """
+        if is_descendant:
+            return True
+        if any(host in name for host in _GUI_HOST_NAMES):
+            return False
+        if not any(sig in name for sig in _UNIVERSAL_AGENT_SIGNATURES):
+            return False
+        if not cwd:
+            return False
+        try:
+            proc_cwd = Path(cwd).resolve()
+        except (ValueError, TypeError, OSError):
+            return False
+        return (
+            proc_cwd == self._workspace_resolved
+            or self._workspace_resolved in proc_cwd.parents
+        )
 
     def _is_relevant(self, name: str, cmdline: list[str], cwd: str) -> bool:
         """Determine if a process is relevant to track strictly within the workspace."""

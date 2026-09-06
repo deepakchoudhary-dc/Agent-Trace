@@ -213,3 +213,18 @@ def test_observability_event_not_scanned() -> None:
         )
     )
     assert tracker.observe(_cmd(f"use {_HF}", sid=_SID_B)) == []
+
+
+# -- Sprint-1 fix: eviction must not crash on an empty new entry -----------------
+
+
+def test_eviction_at_capacity_does_not_crash() -> None:
+    """Once the tracker holds max_tracked fingerprints, each NEW fingerprint
+    must evict cleanly. The bug: the empty dict for the incoming fingerprint
+    was inserted before eviction, and min() over its sightings raised
+    ValueError — a daemon-wide poison-pill on the ingest path."""
+    tracker = CredentialLoopTracker(max_tracked=4)
+    for i in range(10):
+        secret = "hf_" + f"{i:032x}"
+        tracker.observe(_cmd(f"export HF_TOKEN={secret}"))
+    assert len(tracker._sightings) <= 5  # max_tracked + the live entry
