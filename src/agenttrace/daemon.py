@@ -23,6 +23,7 @@ from agenttrace.adapters.composite import CompositeAdapter
 from agenttrace.adapters.copilot import CopilotAdapter
 from agenttrace.adapters.universal import UniversalAgentAdapter
 from agenttrace.graph.actor_identity import ActorIdentityGraph
+from agenttrace.graph.attestation import ProcessAttestationEngine
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.graph.context_graph import ContextGraph
@@ -238,6 +239,9 @@ class AgentTraceDaemon:
         # Persistent actor-identity memory (METR #2 deeper half):
         # daemon-wide, rebuilt silently from the ledger on restart.
         self._actor_graph: ActorIdentityGraph = ActorIdentityGraph()
+        # Kernel-bound process attribution (P1.2 residual): pid ownership
+        # from containment truth vs the narrative's claims.
+        self._attestation: ProcessAttestationEngine = ProcessAttestationEngine()
         # Total ledger event count at the last collusion scan: a cheap O(1)
         # gate so the scan runs only when the ledger actually grew.
         self._collusion_last_count: int = -1
@@ -442,6 +446,7 @@ class AgentTraceDaemon:
                         # pre-restart history are already in the ledger.
                         for actor_event in actor_events:
                             self._actor_graph.seed_event(actor_event)
+                            self._attestation.seed_event(actor_event)
                     except Exception:
                         logger.warning(
                             "Could not seed incident correlation state",
@@ -849,6 +854,9 @@ class AgentTraceDaemon:
         manager = self._containment.pop(session_id, None)
         if manager is not None:
             manager.release(kill=True)
+        # The containment unit is gone: its kernel bindings must not outlive
+        # it and manufacture contradictions against a recycled pid.
+        self._attestation.drop_session(session_id)
 
         session.status = SessionStatus.STOPPED
         session.stopped_at = datetime.now(timezone.utc)
@@ -887,6 +895,11 @@ class AgentTraceDaemon:
         """
         manager = self._containment.get(session_id)
         assigned = manager.assign_pid(pid) if manager is not None else False
+        if assigned:
+            # Kernel-verified ownership: the attestation engine treats this
+            # binding as ground truth every narrative claim is checked
+            # against.
+            self._attestation.bind_kernel_root(session_id, pid)
         for obs in self._observers.get(session_id, []):
             if isinstance(obs, ProcessTreeObserver):
                 obs.boost_polling(2.0)
@@ -1153,6 +1166,21 @@ class AgentTraceDaemon:
             ):
                 await self.ingest_event(incident)
 
+        # 5b-9. Process attestation (P1.2 residual): kernel-bound pid
+        # ownership vs the narrative. Membership is synced (throttled inside
+        # the engine) so sweep-assigned pids are bound without passing
+        # through register_session_pid.
+        if not isinstance(event, IncidentEvent):
+            session_manager = self._containment.get(event.session_id)
+            if session_manager is not None:
+                self._attestation.sync_kernel_bindings(
+                    event.session_id, session_manager.member_pids
+                )
+            for incident in await self._safe_observe(
+                "process_attestation", event, lambda: self._attestation.observe(event)
+            ):
+                await self.ingest_event(incident)
+
         # R2: response ladder — any critical incident reaching the pipeline
         # (created live, restored, or injected) freezes the session.
         if isinstance(event, IncidentEvent) and event.severity == "critical":
@@ -1281,6 +1309,8 @@ class AgentTraceDaemon:
         # expected to die via kill-on-close, which is expectation, not proof.
         verdict = manager.release_with_verdict(kill=True)
         if verdict["refused"]:
+            # The unit is still OPEN: its kernel bindings stay live, because
+            # the pids are still genuinely that session's.
             outcome["refused"] = True
             outcome["left_running"] = verified
             logger.critical(
@@ -1291,6 +1321,10 @@ class AgentTraceDaemon:
                 len(verified),
             )
             return outcome
+        # The unit actually closed: its kernel bindings must not outlive it
+        # and manufacture contradictions against a recycled pid (same rule
+        # as stop_session).
+        self._attestation.drop_session(session_id)
         if verdict["kill_verified"]:
             outcome["terminated"] = len(verified)
             logger.info(

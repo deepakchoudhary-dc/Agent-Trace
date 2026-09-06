@@ -1156,6 +1156,23 @@ async def test_pipeline_wiring_cross_session_and_close_families(tmp_path: Path) 
     ))
     assert _sid_events(daemon._ledger, sid_b, "actor_reincarnated")
 
+    # 5b-9: process attestation — kernel-bound pid ownership vs the
+    # narrative. Root pid 100 is kernel-bound to A; B narrates its child and
+    # that child's egress: the contradiction must land in the ledger.
+    daemon._attestation.bind_kernel_root(sid_a, 100, now)
+    await daemon.ingest_event(ProcessEvent(
+        session_id=sid_b, actor_id="auditd:200", source_adapter="auditd",
+        confidence=ConfidenceLevel.HIGH, pid=200, ppid=100,
+        command_line="python worker.py", timestamp=now + timedelta(seconds=2),
+    ))
+    await daemon.ingest_event(NetworkEvent(
+        session_id=sid_b, actor_id="process:200", source_adapter="network_observer",
+        confidence=ConfidenceLevel.HIGH, destination_ip="93.184.216.34",
+        destination_port=443, protocol="tcp", direction="outbound",
+        process_pid=200, timestamp=now + timedelta(seconds=3),
+    ))
+    assert _sid_events(daemon._ledger, sid_b, "egress_attribution_contradiction")
+
     # 5b-5b: meta-detection over uniform sibling artifacts.
     for i in range(1, 9):
         await daemon.ingest_event(FileMutationEvent(
