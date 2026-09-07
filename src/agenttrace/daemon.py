@@ -343,6 +343,7 @@ class AgentTraceDaemon:
                             if contract is not None
                             else False
                         ),
+                        task_goal=(contract.goal if contract is not None else ""),
                     )
 
                     # Threat-detection rule engine
@@ -452,6 +453,19 @@ class AgentTraceDaemon:
                             "Could not seed incident correlation state",
                             exc_info=True,
                         )
+
+                    # Restart honesty (kill-daemon silence closed): a session
+                    # still mid-flight at daemon exit has an unobserved window
+                    # between its last pre-restart event and this restore.
+                    # State the gap — never paper over it.
+                    if session.status != SessionStatus.STOPPED:
+                        try:
+                            await self._emit_restore_gap_finding(sid)
+                        except Exception:
+                            logger.warning(
+                                "Could not record restore-gap finding",
+                                exc_info=True,
+                            )
 
                     # Identity memory: a restored STOPPED session must be
                     # marked closed, or its pre-restart late writes can
@@ -635,6 +649,7 @@ class AgentTraceDaemon:
             safety_flavored=task_is_safety_flavored(
                 contract.goal, contract.risk_level.value
             ),
+            task_goal=contract.goal,
         )
 
         # Threat-detection rule engine
@@ -912,6 +927,49 @@ class AgentTraceDaemon:
         return list(self._sessions.values())
 
     # -- Event ingestion & Causal Graph pipeline --
+
+    async def _emit_restore_gap_finding(self, sid: UUID) -> None:
+        """Record the observation gap a mid-flight daemon restart caused.
+
+        For sessions restored in a non-STOPPED status, the window between
+        the last pre-restart event and this restore was unobserved: any
+        action the agent took while no daemon was running is absent from
+        the ledger by construction. The finding states that boundary —
+        it never invents what happened inside the gap (invariant #3).
+        """
+        last_event = self._ledger.query_events(sid, limit=1)
+        now = datetime.now(timezone.utc)
+        if last_event:
+            gap_start = last_event[0].timestamp
+            if gap_start.tzinfo is None:
+                gap_start = gap_start.replace(tzinfo=timezone.utc)
+            gap_minutes = int((now - gap_start).total_seconds() // 60)
+            gap_text = (
+                f"Last pre-restart event was {gap_start.isoformat()} "
+                f"(~{gap_minutes} min before this restore); the window "
+                "in between is unobserved."
+            )
+        else:
+            gap_text = (
+                "No pre-restart events were recorded; everything this "
+                "session did before the restart is unobserved."
+            )
+        gap_finding = PolicyFindingEvent(
+            session_id=sid,
+            actor_id="daemon",
+            source_adapter="daemon_restore",
+            confidence=ConfidenceLevel.HIGH,
+            finding_type="restore_observation_gap",
+            severity="low",
+            description=(
+                "Session was restored mid-flight after a daemon restart "
+                f"(status {self._sessions[sid].status.value}). {gap_text} "
+                "Agent actions inside the gap may exist but are not in "
+                "the ledger; the record for this session is incomplete "
+                "across that window."
+            ),
+        )
+        self._ledger.append_event(gap_finding)
 
     async def ingest_event(self, event: EventBase, raw_payload: bytes | None = None) -> str:
         """Process event: Redact → Encrypt → Hash-Chain → Store → Graph Projection → Policy."""

@@ -226,3 +226,86 @@ def test_incident_events_ignored() -> None:
 def test_os_success_alone_is_silent() -> None:
     detector = SandbaggingDetector(_SID)
     assert detector.observe(_os_success(_T0)) == []
+
+
+# -- Scope pivot (ticking-clock => spec-gaming pivot) ---------------------------------
+
+
+def _pivot_detector(goal: str) -> SandbaggingDetector:
+    return SandbaggingDetector(_SID, task_goal=goal, stall_minutes=45)
+
+
+def test_scope_pivot_fires_on_off_goal_eval_dive() -> None:
+    detector = _pivot_detector("optimize the customer dashboard load time")
+    first = detector.observe(_cmd("pytest tests/", at=_T0))
+    incidents = detector.observe(
+        _cmd(
+            "python run_benchmark.py --suite swe-bench --leaderboard",
+            at=_T0 + timedelta(minutes=2),
+        )
+    )
+    assert first == []
+    assert [i.incident_type for i in incidents] == ["scope_pivot_suspected"]
+    assert incidents[0].severity == "medium"
+    assert incidents[0].source_adapter == "eval_integrity"
+
+
+def test_scope_pivot_silent_when_command_matches_goal() -> None:
+    detector = _pivot_detector(
+        "run the benchmark suite and report accuracy metrics"
+    )
+    incidents = detector.observe(
+        _cmd(
+            "python run_benchmark.py --suite primary",
+            at=_T0 + timedelta(minutes=2),
+        )
+    )
+    assert incidents == []
+
+
+def test_scope_pivot_never_fires_without_goal_context() -> None:
+    # Without a contracted goal, divergence is undefined: stay silent.
+    detector = SandbaggingDetector(_SID, stall_minutes=45)
+    incidents = detector.observe(
+        _cmd("python run_benchmark.py --suite swe-bench --leaderboard", at=_T0)
+    )
+    assert incidents == []
+
+
+def test_scope_pivot_known_eval_vocabulary_not_divergent() -> None:
+    detector = _pivot_detector(
+        "evaluate abstention behavior on the holdout metric"
+    )
+    incidents = detector.observe(
+        _cmd(
+            "python scripts/evaluate.py --split holdout",
+            at=_T0 + timedelta(minutes=3),
+        )
+    )
+    assert incidents == []
+
+
+def test_scope_pivot_emits_once_per_session() -> None:
+    detector = _pivot_detector("optimize the customer dashboard load time")
+    first = detector.observe(
+        _cmd(
+            "python run_benchmark.py --suite swe-bench --leaderboard",
+            at=_T0,
+        )
+    )
+    second = detector.observe(
+        _cmd(
+            "grep leaderboard results/holdout.json",
+            at=_T0 + timedelta(minutes=4),
+        )
+    )
+    assert len(first) == 1
+    assert second == []
+
+
+def test_scope_pivot_unrelated_work_is_silent() -> None:
+    detector = _pivot_detector("optimize the customer dashboard load time")
+    incidents = detector.observe(
+        _cmd("pytest tests/ && git status", at=_T0 + timedelta(minutes=1))
+    )
+    assert incidents == []

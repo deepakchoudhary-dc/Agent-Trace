@@ -1202,3 +1202,88 @@ async def test_pipeline_wiring_cross_session_and_close_families(tmp_path: Path) 
     assert coverage
 
     await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_restart_records_observation_gap_for_midflight_session(
+    tmp_path: Path,
+) -> None:
+    """A session still mid-flight at daemon death must carry a finding
+    that states its unobserved window (last pre-restart event -> restore).
+    Kill-daemon silence is closed: the gap is disclosed, not implied."""
+    data_dir = tmp_path / ".agenttrace"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    daemon1 = AgentTraceDaemon(data_dir)
+    await daemon1.start()
+    session = await daemon1.create_session(
+        workspace_path=str(workspace),
+        task_description="Mid-flight restart gap test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+    await daemon1.ingest_event(CommandEvent(
+        session_id=sid,
+        actor_id="agent",
+        source_adapter="terminal",
+        command="pytest tests/ -q",
+    ))
+
+    # Simulate a daemon crash: no stop_session, no cursor persistence —
+    # the session stays ACTIVE in storage with nothing watching it.
+    for task in daemon1._adapter_tasks.values():
+        task.cancel()
+    daemon1._ledger.close()
+
+    daemon2 = AgentTraceDaemon(data_dir)
+    await daemon2.start()
+    try:
+        assert daemon2.get_session(sid) is not None
+        gaps = _sid_findings(daemon2._ledger, sid, "restore_observation_gap")
+        assert len(gaps) == 1
+        gap = gaps[0]
+        assert gap.source_adapter == "daemon_restore"
+        assert gap.actor_id == "daemon"
+        assert gap.severity == "low"
+        assert "Last pre-restart event" in gap.description
+        assert "unobserved" in gap.description
+    finally:
+        await daemon2.stop()
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_restart_records_no_observation_gap(
+    tmp_path: Path,
+) -> None:
+    """A session cleanly STOPPED before the restart has no unobserved
+    window: stop_session closed it deliberately, so no gap finding."""
+    data_dir = tmp_path / ".agenttrace"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    daemon1 = AgentTraceDaemon(data_dir)
+    await daemon1.start()
+    session = await daemon1.create_session(
+        workspace_path=str(workspace),
+        task_description="Clean stop gap test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+    await daemon1.ingest_event(CommandEvent(
+        session_id=sid,
+        actor_id="agent",
+        source_adapter="terminal",
+        command="pytest tests/ -q",
+    ))
+    await daemon1.stop()  # marks the session STOPPED
+
+    daemon2 = AgentTraceDaemon(data_dir)
+    await daemon2.start()
+    try:
+        restored = daemon2.get_session(sid)
+        assert restored is not None
+        assert restored.status == SessionStatus.STOPPED
+        assert _sid_findings(
+            daemon2._ledger, sid, "restore_observation_gap"
+        ) == []
+    finally:
+        await daemon2.stop()

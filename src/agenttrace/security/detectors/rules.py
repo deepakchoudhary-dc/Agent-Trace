@@ -12,7 +12,11 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
-from typing import Any
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from uuid import UUID
 
 from agenttrace.models.events import (
     CommandEvent,
@@ -1643,6 +1647,90 @@ class InferenceProxyAbuseDetector:
         ]
 
 
+
+
+# ---------------------------------------------------------------------------
+# GET-parameter exfiltration (the DseWiki entry shape): repeated GETs whose
+# URL query strings carry large encoded payloads to one destination. GET is
+# not state-changing, so method-based policy rules never fire on it, and the
+# volume rules that exist key on POST cadence — a patient adversary exfiltrates
+# through query parameters instead. Detection is statistical: N long-query
+# GETs to the same destination inside the window. Normal GETs carry short
+# paths; encoded bulk payloads do not.
+# ---------------------------------------------------------------------------
+
+_GET_EXFIL_MIN_PATH = 256
+_GET_EXFIL_WINDOW = timedelta(minutes=10)
+_GET_EXFIL_THRESHOLD = 3
+_GET_EXFIL_MAX_TRACKED = 1024
+
+
+class GetParameterExfilDetector:
+    """Flags repeated long-query GETs to one destination (exfil-shaped GET).
+
+    State is keyed per session: DEFAULT_DETECTORS instances are shared
+    across sessions, so an unkeyed accumulator would correlate unrelated
+    sessions into one finding (a recorded leak).
+    """
+
+    detector_id = "get_parameter_exfiltration"
+    name = "GET-Parameter Exfiltration Pattern"
+    severity = "high"
+
+    def __init__(self) -> None:
+        # (session_id, destination) -> deque of event timestamps
+        self._hits: dict[tuple[UUID, str], deque[datetime]] = {}
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        if not isinstance(event, NetworkEvent):
+            return []
+        if (event.http_method or "").upper() != "GET":
+            return []
+        if event.direction and event.direction.lower() != "outbound":
+            return []
+        path = event.url_path or ""
+        if len(path) < _GET_EXFIL_MIN_PATH:
+            return []
+
+        key = (ctx.session_id, f"{event.destination_ip}:{event.destination_port}")
+        now = event.timestamp
+        hits = self._hits.setdefault(key, deque())
+        while hits and now - hits[0] > _GET_EXFIL_WINDOW:
+            hits.popleft()
+        hits.append(now)
+        # Bound the tracker: a (session, destination) key that keeps firing
+        # past every window must not grow memory for the daemon's lifetime.
+        while len(self._hits) > _GET_EXFIL_MAX_TRACKED:
+            self._hits.pop(next(iter(self._hits)))
+        if len(hits) < _GET_EXFIL_THRESHOLD:
+            return []
+
+        # Emit once per window: clear the window so sustained exfil produces
+        # one finding per 10 minutes, not one per request.
+        hits.clear()
+        return [
+            DetectorFinding(
+                detector_id=self.detector_id,
+                name=self.name,
+                severity=self.severity,
+                confidence=ConfidenceLevel.MEDIUM,
+                description=(
+                    f"{_GET_EXFIL_THRESHOLD}+ outbound GET requests with "
+                    f">= {_GET_EXFIL_MIN_PATH}-character URL payloads to "
+                    f"{key[1]} within "
+                    f"{int(_GET_EXFIL_WINDOW.total_seconds() / 60)} minutes. "
+                    "GET is not state-changing and evades method-gated rules; "
+                    "query strings of this size repeated to one destination "
+                    "are the exfil-through-parameters shape (DseWiki entry "
+                    "vector class). Payload content is not inspectable at "
+                    "the metadata plane."
+                ),
+                evidence_refs=[str(event.event_id)],
+                requires_approval=False,
+            )
+        ]
+
+
 DEFAULT_DETECTORS: list[Any] = [
     PromptInjectionDetector(),
     ConfigTamperDetector(),
@@ -1666,4 +1754,5 @@ DEFAULT_DETECTORS: list[Any] = [
     RecursiveAgentSpawnDetector(),
     LogTamperDetector(),
     InferenceProxyAbuseDetector(),
+    GetParameterExfilDetector(),
 ]

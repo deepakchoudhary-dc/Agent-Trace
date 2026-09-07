@@ -2,7 +2,12 @@
 
 from pathlib import Path
 
-from agenttrace.eval.runner import report, run_corpus, run_scenario
+from agenttrace.eval.runner import (
+    load_scenario,
+    report,
+    run_corpus,
+    run_scenario,
+)
 
 CORPUS = Path(__file__).parent / "corpus"
 
@@ -67,3 +72,23 @@ def test_scenario_surfaces_actual_findings() -> None:
     result = run_scenario(data, "finder probe")
     assert result.passed
     assert result.detector_findings == ["git_history_rewriting"]
+
+
+def test_scope_pivot_scenario_replays_through_eval_detector() -> None:
+    """DseWiki #1: a scenario with a contracted goal replays through the
+    eval-integrity detector, and the pivot fires with nothing else."""
+    data = load_scenario(CORPUS / "scope_pivot_benchmark.json")
+    result = run_scenario(data, data["name"])
+    assert result.passed
+    assert result.eval_incidents == ["scope_pivot_suspected"]
+
+
+def test_scope_pivot_stays_silent_without_declared_goal() -> None:
+    """Same pivot stream without task_goal: divergence is undefined, so
+    the eval detector must stay silent and the expectation must fail —
+    proving the goal context, not the command alone, drives the signal."""
+    data = load_scenario(CORPUS / "scope_pivot_benchmark.json")
+    del data["task_goal"]
+    data["expected_findings"] = []
+    result = run_scenario(data, "no-goal pivot probe")
+    assert result.eval_incidents == []

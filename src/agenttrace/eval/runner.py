@@ -3,7 +3,10 @@
 Regression-test policies and detectors in CI on recorded session corpora
 (Opik/DeepEval pattern): every scenario replays a fixed event stream through
 the PolicyEngine and DetectionEngine and compares the emitted findings to
-the scenario's expectations. A regression in detection surfaces as a failed
+the scenario's expectations. When a scenario declares ``task_goal``, the
+stream is additionally replayed through the eval-integrity detector —
+scope-pivot goal divergence needs the contracted goal as its baseline.
+A regression in detection surfaces as a failed
 scenario, and the harness writes a machine-readable report that the review
 loop can consume as real evidence artifacts.
 
@@ -15,9 +18,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from agenttrace.graph.eval_integrity import SandbaggingDetector
 from agenttrace.models.events import event_from_dict
 from agenttrace.security.detectors import DetectionEngine
 from agenttrace.security.policy import PolicyEngine
@@ -32,6 +37,7 @@ class ScenarioResult:
     name: str
     policy_findings: list[str] = field(default_factory=list)
     detector_findings: list[str] = field(default_factory=list)
+    eval_incidents: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
     unexpected: list[str] = field(default_factory=list)
     passed: bool = False
@@ -73,11 +79,30 @@ def run_scenario(data: dict[str, Any], name: str) -> ScenarioResult:
         for finding in detectors.evaluate(event):
             detector_findings.add(finding.detector_id)
 
-    actual = policy_findings | detector_findings
+    # DseWiki #1: replay through the eval-integrity detector when the
+    # scenario declares a contracted goal (scope-pivot divergence is
+    # undefined without one — the detector stays silent, by design).
+    eval_incidents: set[str] = set()
+    task_goal = data.get("task_goal")
+    if task_goal:
+        eval_detector = SandbaggingDetector(
+            session_id,
+            task_goal=str(task_goal),
+        )
+        for offset, event in enumerate(events):
+            # Replay constructs every event from static JSON, so all
+            # timestamps are identical; stagger them to give the detector
+            # the monotonic stream its time-based machinery assumes.
+            event.timestamp = event.timestamp + timedelta(seconds=offset)
+            for incident in eval_detector.observe(event):
+                eval_incidents.add(incident.incident_type)
+
+    actual = policy_findings | detector_findings | eval_incidents
     result = ScenarioResult(
         name=name,
         policy_findings=sorted(policy_findings),
         detector_findings=sorted(detector_findings),
+        eval_incidents=sorted(eval_incidents),
     )
     result.missing = [e for e in expected if e not in actual]
     result.unexpected = [a for a in actual if a not in expected]
@@ -108,6 +133,7 @@ def report(results: list[ScenarioResult]) -> dict[str, Any]:
                 "passed": r.passed,
                 "policy_findings": r.policy_findings,
                 "detector_findings": r.detector_findings,
+                "eval_incidents": r.eval_incidents,
                 "missing": r.missing,
                 "unexpected": r.unexpected,
             }

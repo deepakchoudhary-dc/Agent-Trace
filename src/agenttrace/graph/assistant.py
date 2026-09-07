@@ -57,6 +57,9 @@ RECOMMENDED_ACTIONS: dict[str, str] = {
     "credential_read_heuristic":
         "Identify which secret was read and rotate it; check subsequent "
         "egress for the value.",
+    "get_parameter_exfiltration":
+        "Review the full request URL for encoded secrets or workspace "
+        "data in query parameters; block egress and rotate anything leaked.",
     "obfuscation_tool":
         "Decode the payload out-of-band and review it; obfuscation in a "
         "coding task is rarely legitimate.",

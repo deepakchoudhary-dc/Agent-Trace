@@ -25,79 +25,112 @@ _DESTRUCTIVE_SQL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Fail-closed sanity cap: a single wire message claiming more than this is a
+# protocol violation (no legitimate agent SQL needs a 1 MB statement), not a
+# buffer to wait on — unbounded retention would be its own DoS.
+_MAX_MESSAGE_BYTES = 1_000_000
+
+
+class WireProtocolViolationError(Exception):
+    """The byte stream violates the database wire protocol.
+
+    Raised by the parsers instead of silently discarding state: once a
+    stream is uninspectable, the mediator must close the connection rather
+    than forward bytes it can no longer vouch for.
+    """
+
+
+def _postgres_query_from_message(msg_type: str, payload: bytes) -> str:
+    """Extract the SQL text from one complete Postgres message payload."""
+    if msg_type == "Q":
+        # Null-terminated query string
+        query = payload.rstrip(b"\x00").decode("utf-8", errors="replace")
+        return query.strip()
+    if msg_type == "P":
+        # Statement name (null-terminated) followed by query string (null-terminated)
+        parts = payload.split(b"\x00")
+        if len(parts) >= 2:
+            return parts[1].decode("utf-8", errors="replace").strip()
+    return ""
+
 
 class DatabaseWireParser:
-    """Decodes SQL query statements from raw database wire protocol packets."""
+    """Decodes SQL query statements from database wire protocol byte streams.
+
+    Both parsers are **streaming and buffer-carrying**: they consume any
+    chunk of a TCP stream and return the extracted queries plus the
+    unparsed remainder, so a message straddling a TCP boundary is held
+    back and inspected once complete — never forwarded uninspected.
+    """
 
     @staticmethod
-    def parse_postgres(data: bytes) -> list[str]:
-        """Extract SQL queries from PostgreSQL frontend wire protocol bytes.
+    def parse_postgres(data: bytes, buffer: bytes = b"") -> tuple[list[str], bytes]:
+        """Extract SQL queries from a PostgreSQL frontend byte stream.
 
         Postgres Message Format:
           [1 byte type] [4 bytes Int32 length] [payload]
           - 'Q' (0x51): Simple query string (null-terminated)
           - 'P' (0x50): Parse statement string
+
+        Returns ``(queries, remainder)``; ``remainder`` holds an incomplete
+        trailing message for the next call. A message whose declared length
+        exceeds the fail-closed sanity cap is treated as a protocol
+        violation: the connection buffer is discarded (fail-closed — the
+        stream becomes uninspectable, so it must not pass through).
         """
+        buf = buffer + data
         queries: list[str] = []
-        offset = 0
-        total_len = len(data)
-
-        while offset + 5 <= total_len:
-            msg_type = chr(data[offset])
-            try:
-                msg_len = struct.unpack("!I", data[offset + 1 : offset + 5])[0]
-            except Exception:
-                break
-
-            if msg_len < 4 or offset + 1 + msg_len > total_len:
-                break
-
-            payload = data[offset + 5 : offset + 1 + msg_len]
-
-            if msg_type == "Q":
-                # Null-terminated query string
-                query = payload.rstrip(b"\x00").decode("utf-8", errors="replace")
-                if query.strip():
-                    queries.append(query.strip())
-            elif msg_type == "P":
-                # Statement name (null-terminated) followed by query string (null-terminated)
-                parts = payload.split(b"\x00")
-                if len(parts) >= 2:
-                    query = parts[1].decode("utf-8", errors="replace")
-                    if query.strip():
-                        queries.append(query.strip())
-
-            offset += 1 + msg_len
-
-        return queries
+        while len(buf) >= 5:
+            msg_type = chr(buf[0])
+            msg_len = struct.unpack("!I", buf[1:5])[0]
+            if msg_len < 4 or msg_len - 4 > _MAX_MESSAGE_BYTES:
+                raise WireProtocolViolationError(
+                    f"postgres message length {msg_len} violates protocol bounds"
+                )
+            if 1 + msg_len > len(buf):
+                break  # incomplete message — hold it in the remainder
+            payload = buf[5 : 1 + msg_len]
+            query = _postgres_query_from_message(msg_type, payload)
+            if query:
+                queries.append(query)
+            buf = buf[1 + msg_len :]
+        return queries, buf
 
     @staticmethod
-    def parse_mysql(data: bytes) -> list[str]:
-        """Extract SQL queries from MySQL client wire protocol bytes.
+    def parse_mysql(data: bytes, buffer: bytes = b"") -> tuple[list[str], bytes]:
+        """Extract SQL queries from a MySQL client byte stream.
 
         MySQL Packet Format:
           [3 bytes length] [1 byte sequence id] [1 byte command] [payload]
           - 0x03 (COM_QUERY): query string
           - 0x16 (COM_STMT_PREPARE): prepare string
+
+        Streams every packet in the chunk (the previous implementation
+        inspected only the first), returning ``(queries, remainder)`` for
+        the incomplete trailing packet. Header/packet-length violations
+        discard the buffer: fail-closed.
         """
+        buf = buffer + data
         queries: list[str] = []
-        if len(data) < 5:
-            return queries
-
-        try:
-            # 3-byte little endian packet length
-            pkt_len = data[0] | (data[1] << 8) | (data[2] << 16)
-            cmd = data[4]
-
+        while True:
+            if len(buf) < 5:
+                break  # incomplete header — hold it
+            # 3-byte little endian packet length (+1 for the command byte)
+            pkt_len = buf[0] | (buf[1] << 8) | (buf[2] << 16)
+            if pkt_len < 1 or pkt_len - 1 > _MAX_MESSAGE_BYTES:
+                raise WireProtocolViolationError(
+                    f"mysql packet length {pkt_len} violates protocol bounds"
+                )
+            if 4 + pkt_len > len(buf):
+                break  # incomplete packet — hold it
+            cmd = buf[4]
             if cmd in (0x03, 0x16):  # COM_QUERY or COM_STMT_PREPARE
-                query_bytes = data[5 : 4 + pkt_len]
+                query_bytes = buf[5 : 4 + pkt_len]
                 query = query_bytes.decode("utf-8", errors="replace").strip()
                 if query:
                     queries.append(query)
-        except Exception as e:
-            logger.debug("MySQL packet parse error: %s", e)
-
-        return queries
+            buf = buf[4 + pkt_len :]
+        return queries, buf
 
     @classmethod
     def is_destructive(cls, query: str) -> tuple[bool, str]:
@@ -120,6 +153,7 @@ class DatabaseProtocolMediator:
         target_port: int = 5432,
         db_type: str = "postgres",
         on_destructive_query: Callable[[str, str], None] | None = None,
+        on_protocol_violation: Callable[[str, str], None] | None = None,
     ) -> None:
         self.session_id = session_id
         self.listen_host = listen_host
@@ -128,6 +162,7 @@ class DatabaseProtocolMediator:
         self.target_port = target_port
         self.db_type = db_type.lower()
         self.on_destructive_query = on_destructive_query
+        self.on_protocol_violation = on_protocol_violation
         self._server: asyncio.Server | None = None
         self._running = False
 
@@ -170,20 +205,41 @@ class DatabaseProtocolMediator:
             client_writer.close()
             return
 
+        # Per-connection parser buffer: a message straddling a TCP chunk is
+        # held here and inspected once complete — never forwarded uninspected.
+        upstream_buf = b""
+
         async def forward_upstream() -> None:
+            nonlocal upstream_buf
             try:
                 while self._running:
                     data = await client_reader.read(4096)
                     if not data:
                         break
 
-                    # Inspect queries
+                    # Inspect queries (streaming, buffer-carrying, fail-closed)
                     if self.db_type == "postgres":
-                        queries = DatabaseWireParser.parse_postgres(data)
+                        queries, upstream_buf = DatabaseWireParser.parse_postgres(
+                            data, upstream_buf
+                        )
                     elif self.db_type == "mysql":
-                        queries = DatabaseWireParser.parse_mysql(data)
+                        queries, upstream_buf = DatabaseWireParser.parse_mysql(
+                            data, upstream_buf
+                        )
                     else:
-                        queries = []
+                        # No parser for this protocol: we cannot vouch for the
+                        # bytes, so they must not pass through (fail-closed).
+                        logger.error(
+                            "Database mediator has no parser for db_type %r; "
+                            "closing connection (fail-closed)",
+                            self.db_type,
+                        )
+                        if self.on_protocol_violation:
+                            self.on_protocol_violation(
+                                "unknown_protocol", f"db_type={self.db_type}"
+                            )
+                        client_writer.close()
+                        return
 
                     for query in queries:
                         destructive, matched_term = DatabaseWireParser.is_destructive(query)
@@ -210,8 +266,18 @@ class DatabaseProtocolMediator:
 
                     target_writer.write(data)
                     await target_writer.drain()
+            except WireProtocolViolationError as e:
+                logger.error(
+                    "Database mediator wire-protocol violation (%s): %s — closing "
+                    "connection (fail-closed)",
+                    self.db_type,
+                    e,
+                )
+                if self.on_protocol_violation:
+                    self.on_protocol_violation("wire_violation", str(e))
+                client_writer.close()
             except Exception:
-                pass
+                logger.debug("Database mediator upstream stream ended", exc_info=True)
             finally:
                 if target_writer:
                     target_writer.close()
