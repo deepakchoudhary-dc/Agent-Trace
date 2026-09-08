@@ -291,7 +291,8 @@ class AgentTraceDaemon:
                         event_count=s_dict.get("event_count", 0),
                         last_event_hash=s_dict.get("last_event_hash", ""),
                     )
-                    self._sessions[sid] = session
+                    # Registry write happens at the commit point below: a
+                    # session is published only when fully reconstructed.
 
                     # Restore task contract. May be absent (sessions can run
                     # without one); the variable must stay bound so the
@@ -312,12 +313,17 @@ class AgentTraceDaemon:
                         )
                         self._contracts[sid] = contract
                         self._boundaries[sid] = TaskBoundaryEngine(contract)
-                        self._policies[sid] = PolicyEngine(
-                            sid,
-                            contract,
-                            internet_allowed=config.internet_access_allowed,
-                            allowed_destinations=config.allowed_destinations,
-                        )
+                    # The policy engine exists for EVERY session —
+                    # create_session never runs without one; the contract
+                    # only enriches it. Keying construction to the contract
+                    # block made contract-less restores crash on the
+                    # egress-baseline seeding below.
+                    self._policies[sid] = PolicyEngine(
+                        sid,
+                        contract,
+                        internet_allowed=config.internet_access_allowed,
+                        allowed_destinations=config.allowed_destinations,
+                    )
 
                     # Restore approval manager and its active (non-expired) cache
                     approvals = ApprovalManager(sid, self._ledger)
@@ -454,19 +460,6 @@ class AgentTraceDaemon:
                             exc_info=True,
                         )
 
-                    # Restart honesty (kill-daemon silence closed): a session
-                    # still mid-flight at daemon exit has an unobserved window
-                    # between its last pre-restart event and this restore.
-                    # State the gap — never paper over it.
-                    if session.status != SessionStatus.STOPPED:
-                        try:
-                            await self._emit_restore_gap_finding(sid)
-                        except Exception:
-                            logger.warning(
-                                "Could not record restore-gap finding",
-                                exc_info=True,
-                            )
-
                     # Identity memory: a restored STOPPED session must be
                     # marked closed, or its pre-restart late writes can
                     # never pair with post-restart activity (dossier half).
@@ -483,20 +476,46 @@ class AgentTraceDaemon:
                                     sid,
                                 )
 
-                    # Zombie sessions: a restored ACTIVE session has live
-                    # state but nothing observing it. Resume observers and
-                    # the adapter (with its persisted cursor) so `status`
-                    # truthfully reflects a watched session.
+                    # -- Commit point (restart durability): observation
+                    # resumes FIRST; only a successfully resumed (or
+                    # deliberately stopped) session is adopted into the
+                    # live registry. A failure anywhere above — or in the
+                    # resume itself — leaves the session unregistered and
+                    # unobserved rather than half-restored (no zombie
+                    # observers watching a session the daemon does not
+                    # track). Ledger rows stay untouched either way.
                     if session.status == SessionStatus.ACTIVE:
                         await self._resume_session(session)
+                    self._sessions[sid] = session
+                    if session.status != SessionStatus.STOPPED:
+                        # Restart honesty (kill-daemon silence closed): a
+                        # session still mid-flight at daemon exit has an
+                        # unobserved window. State the gap — never paper
+                        # over it.
+                        try:
+                            await self._emit_restore_gap_finding(sid)
+                        except Exception:
+                            logger.warning(
+                                "Could not record restore-gap finding",
+                                exc_info=True,
+                            )
                 except Exception as e:
                     logger.warning("Could not restore session record: %s", e)
         except Exception as e:
             logger.warning("Error during daemon storage recovery: %s", e)
 
     async def _resume_session(self, session: AuditSession) -> None:
-        """Resume observers/adapters for a restored ACTIVE session."""
+        """Resume observers/adapters for a restored ACTIVE session.
+
+        Atomic: any failure unwinds everything this call started (adapter,
+        observers, containment) and re-raises, so the restore commit point
+        never adopts a half-observed session.
+        """
         sid = session.session_id
+        observers: list[BaseObserver] = []
+        adapter: AdapterBase | None = None
+        adapter_started = False
+        poll_task: asyncio.Task[None] | None = None
         try:
             observers = await self._start_observers(session)
             self._observers[sid] = observers
@@ -519,6 +538,7 @@ class AgentTraceDaemon:
                 adapter.restore_cursor(cursor_state.get("cursor", {}))
             self._adapters[sid] = adapter
             await adapter.start()
+            adapter_started = True
 
             poll_task = asyncio.create_task(
                 self._adapter_poll_loop(sid, adapter)
@@ -530,9 +550,31 @@ class AgentTraceDaemon:
                 adapter.adapter_name,
             )
         except Exception as e:
+            # Atomic unwind: a resume that cannot complete leaves nothing
+            # half-started behind — the session stays unobserved and the
+            # restore commit point will refuse to adopt it.
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
+            with contextlib.suppress(Exception):
+                if adapter is not None and adapter_started:
+                    await adapter.stop()
+            for obs in reversed(observers):
+                with contextlib.suppress(Exception):
+                    await obs.stop()
+            self._adapter_tasks.pop(sid, None)
+            self._adapters.pop(sid, None)
+            self._observers.pop(sid, None)
+            stale_manager = self._containment.pop(sid, None)
+            if stale_manager is not None:
+                with contextlib.suppress(Exception):
+                    stale_manager.release(kill=False)
             logger.warning(
-                "Could not resume observation for session %s: %s", sid, e
+                "Could not resume observation for session %s: %s — restore "
+                "abandoned (no partial observation)",
+                sid,
+                e,
             )
+            raise
 
     # -- Session management --
 
@@ -1078,6 +1120,14 @@ class AgentTraceDaemon:
         graph = self._graphs.get(event.session_id)
         if graph:
             self._update_graph(graph, event)
+            # P0.4 residual: commit a keyed MAC over the projection after
+            # every mutation, so a graph exported (or replayed) later can be
+            # authenticated against this ledger's anchor — a forged or
+            # post-hoc-edited projection fails verification, and a MAC
+            # minted anywhere but this host fails for lack of the key.
+            self._ledger.store_projection_snapshot(
+                event.session_id, graph.to_snapshot_json()
+            )
 
         # 4. Scope Drift & Task Boundary Check
         boundary = self._boundaries.get(event.session_id)
@@ -2270,6 +2320,25 @@ class AgentTraceDaemon:
             else:
                 plane = "terminal_plane"
             self._coverage.watch(plane, session.session_id)
+            # Loss-ratio accounting (architectural item 6): sensors that can
+            # self-report how many sources they observe declare it, so the
+            # close report can state expected-vs-delivered per plane. Best
+            # effort — a sensor without this capability simply stays absent
+            # from the loss line.
+            try:
+                expected = getattr(observer, "expected_sources", None)
+                if callable(expected):
+                    count = int(expected())
+                    if count > 0:
+                        self._coverage.expect_sources(
+                            plane, session.session_id, count
+                        )
+            except Exception:
+                logger.debug(
+                    "Sensor %s did not report expected_sources",
+                    type(observer).__name__,
+                    exc_info=True,
+                )
 
         return observers
 

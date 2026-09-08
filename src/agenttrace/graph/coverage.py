@@ -88,9 +88,11 @@ class CoverageMonitor:
 
     Watches the sensors the daemon actually started, attributes event
     volume per plane through the #4 evidence boundary, silence is never
-    upgraded to health, and at session close emits the ``sensor_coverage``
+    upgraded to health, at session close emits the ``sensor_coverage``
     finding the METR completeness methodology demands — observations
-    only, no inferred completeness percentage.
+    only, no inferred completeness percentage — and reports per-plane
+    loss ratios (expected vs. delivered source events) when sensors
+    declare what they could see.
     """
 
     def __init__(
@@ -108,6 +110,25 @@ class CoverageMonitor:
         # session -> plane -> event count
         self._events_by_plane: dict[UUID, dict[str, int]] = {}
         self._unattributed: dict[UUID, int] = {}
+        # session -> {plane -> expected source count} — for the loss ratio
+        # (architectural item 6): what a plane could have seen vs. what it
+        # did. Expected sources are declared per plane at session start.
+        self._expected_by_plane: dict[UUID, dict[str, int]] = {}
+
+    def expect_sources(
+        self, sensor: str, session: UUID, expected: int
+    ) -> None:
+        """Declare a sensor's expected source count for loss-ratio accounting.
+
+        The number is the instrument's own claim about what it could observe
+        (e.g. observed processes for the process plane). It is an upper
+        bound for the loss ratio, never a completeness percentage.
+        """
+        if expected < 0:
+            expected = 0
+        counts = self._expected_by_plane.setdefault(session, {})
+        plane = sensor.replace("_plane", "")
+        counts[plane] = counts.get(plane, 0) + expected
 
     # -- Watching (daemon calls at session start) -------------------------------
 
@@ -153,10 +174,16 @@ class CoverageMonitor:
         watched = self._watched.pop(session, {})
         events_by_plane = self._events_by_plane.pop(session, {})
         unattributed = self._unattributed.pop(session, 0)
+        expected_by_plane = self._expected_by_plane.pop(session, {})
         # A session the monitor never saw (no watch, no events) has no
         # account to give — fabricating DOWN rows for it would itself be
         # dishonest reporting.
-        if not watched and not events_by_plane and not unattributed:
+        if (
+            not watched
+            and not events_by_plane
+            and not unattributed
+            and not expected_by_plane
+        ):
             return []
         parts: list[str] = []
         blind_reason: str | None = None
@@ -169,22 +196,51 @@ class CoverageMonitor:
             if blind is not None:
                 blind_reason = blind
             count = events_by_plane.get(plane, 0)
+            loss = self._loss_ratio_text(
+                expected_by_plane.get(plane), count, is_watched
+            )
+            suffix = f"; {loss}" if loss else ""
             if count > 0:
-                parts.append(f"{plane}: {count} event(s)")
+                parts.append(f"{plane}: {count} event(s){suffix}")
             elif is_watched and total_sensor_events >= self._min_active:
                 parts.append(
                     f"{plane}: DEGRADED — watched but silent while the "
                     "session was otherwise active (silence is not health)"
+                    f"{suffix}"
                 )
             elif is_watched:
-                parts.append(f"{plane}: watched, no events")
+                parts.append(f"{plane}: watched, no events{suffix}")
             else:
-                parts.append(f"{plane}: DOWN from session start (never watched)")
+                parts.append(
+                    f"{plane}: DOWN from session start (never watched){suffix}"
+                )
 
         if unattributed:
             parts.append(f"unattributed_events: {unattributed}")
 
         return [self._coverage_finding(session, parts, blind_reason, now)]
+
+    @staticmethod
+    def _loss_ratio_text(
+        expected: int | None, observed: int, is_watched: bool
+    ) -> str | None:
+        """One sentence of per-plane loss accounting, or None when unknown.
+
+        The ratio is attributed to the instrument, never the audited agent:
+        a low ratio means events existed that this plane did not deliver,
+        which is a statement about sensor fidelity, not about what happened.
+        """
+        if expected is None or not is_watched:
+            return None
+        if expected <= 0:
+            return None
+        lost = max(expected - observed, 0)
+        ratio = lost / expected
+        return (
+            f"loss ratio: {lost}/{expected} expected source event(s) not "
+            f"observed by this plane ({ratio:.0%}) — instrument fidelity, "
+            "not a completeness measure"
+        )
 
     @staticmethod
     def _blind_reason_from(
@@ -206,8 +262,11 @@ class CoverageMonitor:
             + ". Coverage is stated as observations, not a completeness "
             "percentage — a silent plane is correlated silence, not proven "
             "absence (polling-only attribution remains the documented "
-            "ceiling). This finding is about the observation instrument, "
-            "not the audited agent."
+            "ceiling). Loss ratios, where present, compare a sensor's own "
+            "declared expected volume against what it delivered; they are "
+            "attributed to the instrument, not the audited agent. This "
+            "finding is about the observation instrument, not the audited "
+            "agent."
         )
         if blind_reason is not None:
             description += f" Known blind interval: {blind_reason}."

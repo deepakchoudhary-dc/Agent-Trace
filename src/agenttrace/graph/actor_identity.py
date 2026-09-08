@@ -14,6 +14,10 @@ This module is the memory:
   CLI); as accumulated memory it is the identity-rotation baseline the
   other engines lack, and it is the hook that turns per-run correlation
   into an adversary history.
+- **workstream_shift_suspected** (medium) — an actor's command stream
+  starts working in a directory tree its recent stream never touched,
+  while its own established tree went quiet — the lane-switching half of
+  the specialized-collective shape (statistics, never motive).
 - **handoff_dossier_suspected** (high) — a session installs a large file
   shortly before it closes, and a DIFFERENT session's actor later writes
   into the same directory: the observable half of a run-to-run handoff.
@@ -33,6 +37,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from agenttrace.models.events import (
+    CommandEvent,
     ConfidenceLevel,
     EventBase,
     FileMutationEvent,
@@ -50,6 +55,14 @@ _DOSSIER_DIR_DECAY = timedelta(hours=24)
 
 _DOSSIER_COOLDOWN = timedelta(minutes=10)
 _REINCARNATION_COOLDOWN = timedelta(hours=1)
+
+# Workstream clustering (architectural item 7): an actor's recent working
+# directories form its behavioral fingerprint; a pivot into a tree it has
+# never touched — while its own tree went quiet — is the observable half
+# of lane-switching.
+_WORKSTREAM_MIN_EVENTS = 3
+_WORKSTREAM_RECENT = timedelta(minutes=30)
+_WORKSTREAM_COOLDOWN = timedelta(hours=1)
 
 
 class ActorIdentityGraph:
@@ -72,6 +85,9 @@ class ActorIdentityGraph:
         self._closed: dict[UUID, datetime] = {}
         # session_id -> {directory -> (bytes, timestamp)} recent large writes
         self._dossier_writes: dict[UUID, dict[str, tuple[int, datetime]]] = {}
+        # actor_id -> {session_id -> {directory -> last seen}} — the
+        # workstream fingerprint (command working directories).
+        self._workstreams: dict[str, dict[UUID, dict[str, datetime]]] = {}
         self._last_emitted: dict[str, datetime] = {}
 
     # -- State ------------------------------------------------------------------
@@ -102,6 +118,10 @@ class ActorIdentityGraph:
             writes = self._dossier_writes.setdefault(event.session_id, {})
             if directory not in writes or event.timestamp > writes[directory][1]:
                 writes[directory] = (event.size_delta, event.timestamp)
+        if isinstance(event, CommandEvent) and event.working_dir:
+            directory = str(event.working_dir).replace("\\", "/").rstrip("/")
+            per_session = self._workstreams.setdefault(event.actor_id, {})
+            per_session.setdefault(event.session_id, {})[directory] = event.timestamp
 
     def seed_event(self, event: EventBase) -> None:
         """Silent state build from ledger history (restart memory)."""
@@ -114,7 +134,48 @@ class ActorIdentityGraph:
         self._absorb(event)
         incidents = self._reincarnation(event) or []
         incidents.extend(self._handoff(event))
+        incidents.extend(self._workstream_shift(event))
         return incidents
+
+    def _workstream_shift(self, event: EventBase) -> list[IncidentEvent]:
+        """A command outside the actor's established working tree while its
+        own tree went quiet — the observable half of lane-switching."""
+        if not isinstance(event, CommandEvent) or not event.working_dir:
+            return []
+        directory = str(event.working_dir).replace("\\", "/").rstrip("/")
+        window_start = event.timestamp - _WORKSTREAM_RECENT
+        known: set[str] = set()
+        recent_in_owned = False
+        for session_dirs in self._workstreams.get(event.actor_id, {}).values():
+            for seen_dir, seen_at in session_dirs.items():
+                if seen_at < window_start:
+                    continue
+                known.add(seen_dir)
+                if seen_dir == directory and seen_at < event.timestamp:
+                    recent_in_owned = True
+        if directory in known or recent_in_owned:
+            return []
+        if len(known) < _WORKSTREAM_MIN_EVENTS:
+            return []
+        if not self._can_emit(
+            f"workstream:{event.actor_id}", event.timestamp, _WORKSTREAM_COOLDOWN
+        ):
+            return []
+        plural = "y" if len(known) == 1 else "ies"
+        return [self._incident(
+            event,
+            "workstream_shift_suspected",
+            "medium",
+            "Actor working outside its established tree",
+            (
+                f"Actor '{event.actor_id}' ran a command in '{directory}', "
+                "a directory its recent command stream never touched "
+                f"({len(known)} established working director{plural} in "
+                f"the last {int(_WORKSTREAM_RECENT.total_seconds() / 60)} "
+                "minutes). The lane-switching shape of a specialized "
+                "collective — statistics, not a motive claim."
+            ),
+        )]
 
     # -- Detectors ----------------------------------------------------------------
 

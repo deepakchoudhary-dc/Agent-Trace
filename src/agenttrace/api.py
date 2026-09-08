@@ -34,6 +34,10 @@ from agenttrace.models.events import ConfidenceLevel, EventType, FileMutationEve
 from agenttrace.models.session import AgentType
 from agenttrace.review_loop.loop import ReviewLoop
 from agenttrace.review_loop.serialization import loop_result_to_dict
+from agenttrace.security.approval import (
+    OPERATOR_CHALLENGE_TTL_SECONDS,
+    ApprovalError,
+)
 from agenttrace.security.broker import BrokerError, ExecutionBroker
 from agenttrace.security.isolation import IsolationRunner
 from agenttrace.security.policy import PolicyEngine
@@ -130,6 +134,7 @@ class ApprovalRequest(BaseModel):
     expiry_minutes: int = 60
     affected_paths: list[str] = Field(default_factory=list)
     affected_commands: list[str] = Field(default_factory=list)
+    operator_challenge: str = ""
 
 
 class FindingDTO(BaseModel):
@@ -611,6 +616,19 @@ async def get_findings(session_id: UUID) -> list[FindingDTO]:
     return results
 
 
+# A grant minted without an operator challenge (bearer-only) is capped to
+# this lifetime: a stolen dashboard token can never mint a day-long grant.
+# The operator-challenge path (item 4) unlocks the full requested window.
+UNAUTHENTICATED_EXPIRY_MINUTES = 5
+
+
+class ApprovalChallengeRequest(BaseModel):
+    """Request an operator challenge for one finding + decision."""
+
+    finding_id: str
+    decision: str  # approved | denied
+
+
 @app.post("/sessions/{session_id}/approvals")
 async def record_approval(session_id: UUID, req: ApprovalRequest) -> dict[str, Any]:
     """Record an authentic user approval/denial in the ledger and update policy state.
@@ -620,6 +638,12 @@ async def record_approval(session_id: UUID, req: ApprovalRequest) -> dict[str, A
     context graph once. Approval scope (paths/commands) is derived from the
     finding when the client did not supply it, so later pre-execution gates on
     the same path/command are honored.
+
+    Operator-channel tiered (item 4): a grant carrying a fresh single-use
+    ``operator_challenge`` (bound to this finding and decision) gets its full
+    requested expiry; a bearer-only grant is capped to a short window — a
+    stolen dashboard token can still act, but never mint a long-lived
+    unattended approval.
     """
     session = daemon.get_session(session_id)
     if not session and not daemon._ledger.get_session(session_id):
@@ -668,15 +692,40 @@ async def record_approval(session_id: UUID, req: ApprovalRequest) -> dict[str, A
         if command:
             affected_commands.append(command)
 
-    event = mgr.record_approval(
-        finding_id=req.finding_id,
-        approved=req.approved,
-        reason=req.reason,
-        scope=req.scope,
-        expiry_minutes=req.expiry_minutes,
-        affected_paths=affected_paths,
-        affected_commands=affected_commands,
-    )
+    # Operator-channel enforcement (item 4): a grant minted WITH a valid
+    # operator challenge gets its full requested expiry; a bearer-only
+    # grant (no challenge) is capped hard — a stolen dashboard token can
+    # still act, but never mint a day-long silent approval.
+    effective_expiry = req.expiry_minutes
+    if req.operator_challenge:
+        try:
+            event = mgr.record_authenticated_approval(
+                finding_id=req.finding_id,
+                approved=req.approved,
+                reason=req.reason,
+                operator_challenge=req.operator_challenge,
+                scope=req.scope,
+                expiry_minutes=req.expiry_minutes,
+                affected_paths=affected_paths,
+                affected_commands=affected_commands,
+            )
+        except ApprovalError as exc:
+            code = str(exc).split(":", 1)[0]
+            raise HTTPException(
+                status_code=403,
+                detail={"error": code, "detail": str(exc)},
+            ) from exc
+    else:
+        effective_expiry = min(req.expiry_minutes, UNAUTHENTICATED_EXPIRY_MINUTES)
+        event = mgr.record_approval(
+            finding_id=req.finding_id,
+            approved=req.approved,
+            reason=req.reason,
+            scope=req.scope,
+            expiry_minutes=effective_expiry,
+            affected_paths=affected_paths,
+            affected_commands=affected_commands,
+        )
 
     # Project the approval into the graph/session state exactly once
     await daemon.project_event(event)
@@ -686,7 +735,55 @@ async def record_approval(session_id: UUID, req: ApprovalRequest) -> dict[str, A
         "approval_id": str(event.event_id),
         "event_hash": event.event_hash,
         "approved": req.approved,
+        "effective_expiry_minutes": effective_expiry,
     }
+
+
+@app.post("/sessions/{session_id}/approvals/challenge")
+async def issue_approval_challenge(
+    session_id: UUID, req: ApprovalChallengeRequest
+) -> dict[str, Any]:
+    """Issue an operator challenge for one finding + decision (item 4).
+
+    The dashboard obtains this BEFORE the record call and presents it back
+    as ``operator_challenge``. A grant minted with the challenge is fully
+    trusted human authentication; without it, the grant is capped to a
+    five-minute bearer window. Challenges are single-use, bound to exactly
+    this finding and decision, and expire in two minutes.
+    """
+    session = daemon.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    mgr = daemon.get_approval_manager(session_id)
+    if not mgr:
+        raise HTTPException(
+            status_code=409, detail="No active approval manager for this session"
+        )
+    try:
+        nonce = mgr.issue_operator_challenge(req.finding_id, req.decision)
+    except ApprovalError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"operator_challenge": nonce, "ttl_seconds": OPERATOR_CHALLENGE_TTL_SECONDS}
+
+
+@app.delete("/sessions/{session_id}/approvals/{finding_id}")
+async def revoke_session_approval(session_id: UUID, finding_id: str) -> dict[str, Any]:
+    """Revoke every live grant for a finding, durably (item 4).
+
+    The approval row flips to status='revoked' (survives restarts — the
+    reload path refuses revoked rows) and the in-memory grant is dropped
+    immediately, so this session stops honoring it at once.
+    """
+    session = daemon.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    mgr = daemon.get_approval_manager(session_id)
+    if not mgr:
+        raise HTTPException(
+            status_code=409, detail="No active approval manager for this session"
+        )
+    mgr.revoke(finding_id)
+    return {"status": "revoked", "finding_id": finding_id}
 
 
 # -- Brokered execution (plan2.md P0.2) ---------------------------------------
@@ -707,6 +804,29 @@ def _get_broker(session_id: UUID, workspace_path: str, approvals: Any) -> Execut
         )
         _brokers[session_id] = broker
     return broker
+
+
+@app.get("/sessions/{session_id}/projection/verify")
+async def verify_projection(session_id: UUID) -> dict[str, Any]:
+    """Authenticate the live projection against its keyed MAC (P0.4 residual).
+
+    Serializes the daemon's current graph and verifies its HMAC (keyed under
+    the ledger's private key) against the digest committed at projection
+    time. A projection tampered with after export — or minted anywhere other
+    than this host — fails. ``checked: false`` means no MAC was ever
+    committed for this session; it is 'not checked', never a pass.
+    """
+    graph = daemon.get_graph(session_id)
+    if graph is None:
+        raise HTTPException(status_code=404, detail="No projection for session")
+    verdict = daemon._ledger.verify_projection_snapshot(
+        session_id, graph.to_snapshot_json()
+    )
+    return {
+        "checked": verdict is not None,
+        "authenticated": verdict is True,
+        "stored_digest": daemon._ledger.get_projection_digest(session_id),
+    }
 
 
 @app.post("/sessions/{session_id}/broker/challenge")
@@ -766,6 +886,52 @@ async def broker_execute(
         "duration_ms": result.duration_ms,
         "error": result.error,
         "isolated": result.metadata is not None,
+    }
+
+
+@app.post("/sessions/{session_id}/broker/execute-contained")
+async def broker_execute_contained(
+    session_id: UUID, req: BrokerExecuteRequest
+) -> dict[str, Any]:
+    """Execute via the broker on the contained spawn path (P0.3 residual).
+
+    Same challenge -> approval -> decision discipline as ``broker/execute``,
+    but the child is placed inside the session's kernel containment unit
+    before its first instruction executes — containment verified at process
+    creation rather than attached post-hoc. Falls back to the container
+    path only when the session has no live containment unit, and says which
+    path was taken in the response.
+    """
+    session = daemon.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    approvals = daemon._approvals.get(session_id)
+    if approvals is None:
+        raise HTTPException(status_code=409, detail="Session has no approval manager")
+    broker = _get_broker(session_id, session.config.workspace_path, approvals)
+    containment = daemon._containment.get(session_id)
+    try:
+        result = broker.execute(
+            req.argv,
+            finding_id=req.finding_id,
+            nonce=req.nonce,
+            path=req.path,
+            containment=containment,
+        )
+    except BrokerError as exc:
+        code = str(exc).split(":", 1)[0]
+        status = 403 if code in ("approval_required", "path_outside_scope") else 400
+        raise HTTPException(
+            status_code=status, detail={"error": code, "detail": str(exc)}
+        ) from exc
+    return {
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "duration_ms": result.duration_ms,
+        "error": result.error,
+        "isolated": result.metadata is not None,
+        "spawn_path": "contained" if containment is not None else "container",
     }
 
 

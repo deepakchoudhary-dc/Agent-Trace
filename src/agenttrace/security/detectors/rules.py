@@ -360,6 +360,77 @@ class EgressAnomalyDetector:
 
 
 # ---------------------------------------------------------------------------
+# 5b. Counter-detection channels (DseWiki incident 5 residual): anti-forensic
+#     cleanup, evasion plotting, and anonymization tooling on the command
+#     stream. Tor *ports* are EgressAnomaly's network plane; this covers the
+#     command-stream shape of the same behavior.
+# ---------------------------------------------------------------------------
+
+_COUNTER_FORENSICS_RE = re.compile(
+    r"\bbleachbit\b|\bsdelete\b|\bcipher\s+/w\b|\bshred\b|\bzerofree\b|"
+    r"\bhistory\s+-c\b|\blogger\s+-p\s+auth\b|"
+    r"\bdel\s+/[fqs]\b|"
+    r"\brm\s+-\w*f\w*\s+[^;|]*\b(?:/var/log|\.bash_history|\.zsh_history)\b|"
+    r"\b(?:clear|unset)\s+(?:;?\s*)?history\b",
+    re.IGNORECASE,
+)
+_EVASION_PLOT_RE = re.compile(
+    r"\b(?:evade|bypass|avoid|detection?|undetect(?:ed|able)?|"
+    r"flag(?:ged)?|audit|telemetry|trace|attribution)\b",
+    re.IGNORECASE,
+)
+_EVASION_MEANS_RE = re.compile(
+    r"\b(?:torsocks|obfs4|bridge\b|socks5?h?|proxychains|v2ray|"
+    r"shadowsocks|rotat\w*\s+(?:exit|proxy|ip|identity)|"
+    r"\bspoof\w*\s+mac\b|macchanger|"
+    r"randomiz\w*\s+(?:user-agent|ua|fingerprint)|deviation)\b",
+    re.IGNORECASE,
+)
+
+
+class CounterDetectionDetector:
+    """Flags counter-detection behavior on the command stream.
+
+    Three shapes: anti-forensic cleanup (log/history tampering, secure
+    deletion), evasion plotting (anonymization or identity-rotation
+    tooling combined with detection-avoidance language), and cover-up
+    framing. Vocabulary is a correlated signal, not proof (invariant #3);
+    Tor network ports stay with EgressAnomalyDetector.
+    """
+
+    detector_id = "counter_detection"
+    name = "Counter-Detection / Anti-Forensics"
+    severity = "high"
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        cmd = _command(event)
+        if not cmd:
+            return []
+        reason = ""
+        if _COUNTER_FORENSICS_RE.search(cmd):
+            reason = "anti-forensic cleanup or log tampering"
+        elif (
+            _EVASION_MEANS_RE.search(cmd)
+            and _EVASION_PLOT_RE.search(cmd)
+        ):
+            reason = "anonymization/identity-rotation tooling with evasion intent"
+        if not reason:
+            return []
+        return [
+            DetectorFinding(
+                detector_id=self.detector_id,
+                name=self.name,
+                severity=self.severity,
+                confidence=ConfidenceLevel.MEDIUM,
+                description=f"Counter-detection signal — {reason}: {cmd[:120]}",
+                evidence_refs=[str(event.event_id)],
+                affected_command=cmd[:200],
+                requires_approval=False,
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
 # 6. Git history rewriting.
 # ---------------------------------------------------------------------------
 
@@ -1731,6 +1802,123 @@ class GetParameterExfilDetector:
         ]
 
 
+# ---------------------------------------------------------------------------
+# 23. Counter-detection / anti-forensics tooling (DseWiki incident 5
+#     residual): anonymizing egress, defense degradation, and TLS trust
+#     manipulation. Log/ledger wipes are LogTamperDetector's surface; this
+#     covers the evade-the-auditor perimeter around them.
+# ---------------------------------------------------------------------------
+
+# Anonymizing egress: Tor and wrapper tooling, explicit socks proxy hops.
+_ANON_EGRESS_RE = re.compile(
+    r"\b(?:torsocks|obfs4proxy|proxychains[34]?)\b"
+    r"|\btor\b\s+--?(?:address|socksport|controlport)"
+    r"|--proxy(?:\s+|=)\S*socks5"
+    r"|socks5h?://",
+    re.IGNORECASE,
+)
+# Defense degradation: AV/EDR reconfiguration, exclusion stamps, firewall or
+# audit disengagement, tracer hardening disabled.
+_DEFENSE_DEGRADE_RE = re.compile(
+    r"\bSet-MpPreference\b"
+    r"|\bAdd-MpPreference\b"
+    r"|\bSet-MpComputerStatus\b"
+    r"|-DisableRealtimeMonitoring\b"
+    r"|-ExclusionPath\b"
+    r"|\bauditctl\s+-D\b"
+    r"|\bnetsh\s+advfirewall\s+set\s+allprofiles\s+state\s+off\b"
+    r"|\bsysctl\s+-w\s+kernel\.yama\.ptrace_scope\s*=\s*0\b",
+    re.IGNORECASE,
+)
+# TLS trust manipulation: root-CA installation or verification bypass —
+# the enablement for invisible interception.
+_TLS_TRUST_RE = re.compile(
+    r"\bupdate-ca-certificates\b"
+    r"|\bupdate-ca-trust\b"
+    r"|\bsecurity\s+add-trusted-cert\b"
+    r"|\bcertutil\s+-addstore\b"
+    r"|REQUESTS_CA_BUNDLE\s*="
+    r"|SSL_CERT_FILE\s*="
+    r"|--insecure\b",
+    re.IGNORECASE,
+)
+
+# Same surface is emitted at most once per window: the observation is the
+# tooling's presence, not a per-invocation metric.
+_EVASION_EMIT_WINDOW = timedelta(minutes=5)
+
+
+class NetworkCounterDetectionDetector:
+    """Flags anonymizing egress, defense degradation, and TLS trust edits.
+
+    DseWiki incident 5's partial gap: counter-detection is the plot that
+    surrounds every other incident — route around the network sensor,
+    degrade the host's defense tooling, rewire certificate trust so
+    interception leaves no trace. Each surface is host-observable command
+    text; none of it is a claim about intent (invariant #3). Session-keyed,
+    bounded (≤3 surfaces per session), emit-once-per-surface-per-window.
+    """
+
+    detector_id = "network_counter_detection"
+    name = "Network Counter-Detection (egress route / defense degradation)"
+    severity = "high"
+
+    def __init__(self) -> None:
+        # session_id -> surface -> last emission timestamp
+        self._last_emit: dict[str, dict[str, datetime]] = {}
+
+    def evaluate(self, event: EventBase, ctx: DetectionContext) -> list[DetectorFinding]:
+        cmd = _command(event)
+        if not cmd:
+            return []
+        surface = ""
+        if _ANON_EGRESS_RE.search(cmd):
+            surface = "anonymizing_egress"
+        elif _DEFENSE_DEGRADE_RE.search(cmd):
+            surface = "defense_degradation"
+        elif _TLS_TRUST_RE.search(cmd):
+            surface = "tls_trust_manipulation"
+        if not surface:
+            return []
+
+        key = str(ctx.session_id)
+        now = event.timestamp
+        emitted = self._last_emit.setdefault(key, {})
+        last = emitted.get(surface)
+        if last is not None and now - last <= _EVASION_EMIT_WINDOW:
+            return []
+        emitted[surface] = now
+
+        descriptions = {
+            "anonymizing_egress": (
+                "Anonymizing egress route in use — network-plane "
+                "attribution degrades for this traffic"
+            ),
+            "defense_degradation": (
+                "Host defense tooling reconfigured or disabled — "
+                "host-observable detection surface shrinks"
+            ),
+            "tls_trust_manipulation": (
+                "TLS trust store or verification touched — interceptable "
+                "or unattributable channels become available"
+            ),
+        }
+        return [
+            DetectorFinding(
+                detector_id=self.detector_id,
+                name=self.name,
+                severity=self.severity,
+                confidence=ConfidenceLevel.MEDIUM,
+                description=(
+                    f"{descriptions[surface]} ({surface}): {cmd[:120]}"
+                ),
+                evidence_refs=[str(event.event_id)],
+                affected_command=cmd[:200],
+                requires_approval=False,
+            )
+        ]
+
+
 DEFAULT_DETECTORS: list[Any] = [
     PromptInjectionDetector(),
     ConfigTamperDetector(),
@@ -1755,4 +1943,6 @@ DEFAULT_DETECTORS: list[Any] = [
     LogTamperDetector(),
     InferenceProxyAbuseDetector(),
     GetParameterExfilDetector(),
+    CounterDetectionDetector(),
+    NetworkCounterDetectionDetector(),
 ]

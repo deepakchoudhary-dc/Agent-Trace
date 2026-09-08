@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from agenttrace.security.approval import ApprovalManager
+    from agenttrace.security.containment import ContainmentManager
     from agenttrace.storage.ledger import EventLedger
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ class ExecutionBroker:
         path: str = "",
         env: dict[str, str] | None = None,
         scratch_dir: Path | None = None,
+        containment: ContainmentManager | None = None,
     ) -> IsolationResult:
         """Validate challenge + approval, then run inside containment."""
         self._validate_argv(argv)
@@ -127,12 +129,25 @@ class ExecutionBroker:
                 raise BrokerError(f"path_outside_scope: {path}")
 
         try:
-            result = self._isolation.run(
-                argv,
-                workspace_path=self._workspace,
-                scratch_dir=scratch_dir,
-                env=env,
-            )
+            if containment is not None:
+                # Production spawn path: the child enters the session's
+                # kernel containment unit before its first instruction —
+                # containment verified at process creation, not post-hoc.
+                result = self._isolation.run_contained(
+                    argv,
+                    containment=containment,
+                    workspace_path=self._workspace,
+                    env=env,
+                )
+            else:
+                # Verification-only path: untrusted workspace code runs in
+                # a network-less container, never on the host.
+                result = self._isolation.run(
+                    argv,
+                    workspace_path=self._workspace,
+                    scratch_dir=scratch_dir,
+                    env=env,
+                )
         except IsolationError as exc:
             raise BrokerError(str(exc)) from exc
 

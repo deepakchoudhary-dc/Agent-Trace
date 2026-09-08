@@ -188,7 +188,12 @@ class ContainedProcess:
         return self.provider.terminate()
 
     def wait(self, timeout: float | None = None) -> int | None:
-        """Wait for the spawned root; returns its exit code if known."""
+        """Wait for the spawned root; returns its exit code if known.
+
+        Returns ``None`` while the root is still running or its exit code
+        cannot be determined (``timeout`` elapsed, ``STILL_ACTIVE``), so
+        callers can poll: ``wait(0.5)`` returning None means "not yet".
+        """
         if self._proc is not None:
             try:
                 return self._proc.wait(timeout)
@@ -197,10 +202,14 @@ class ContainedProcess:
         handle = self._win.get("process_handle")
         if handle is not None and sys.platform == "win32":
             kernel32 = _kernel32()
-            kernel32.WaitForSingleObject(handle, int((timeout or 60) * 1000))
+            timeout_ms = 0xFFFFFFFF if timeout is None else int(timeout * 1000)
+            result = kernel32.WaitForSingleObject(handle, timeout_ms)
+            if result == 0x00000102:  # WAIT_TIMEOUT — still running
+                return None
             code = ctypes.c_ulong(0)
             kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-            return int(code.value)
+            exit_code = int(code.value)
+            return None if exit_code == 259 else exit_code  # STILL_ACTIVE
         return None
 
     def close(self) -> None:

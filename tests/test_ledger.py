@@ -765,3 +765,57 @@ def test_legacy_unbound_payload_still_readable(tmp_path: Path) -> None:
     restored = ledger.get_event(event.event_id)
     assert restored is not None
     assert restored.payload == {"marker": "legacy"}
+
+
+
+def test_projection_snapshot_mac_roundtrip(
+    ledger: EventLedger, session_id: object
+) -> None:
+    """A stored snapshot verifies True; its body is not kept — only the MAC."""
+    digest = ledger.store_projection_snapshot(session_id, '{"nodes": [1, 2, 3]}')
+    assert digest
+    assert ledger.get_projection_digest(session_id) == digest
+    assert ledger.verify_projection_snapshot(session_id, '{"nodes": [1, 2, 3]}') is True
+
+
+def test_projection_snapshot_forgery_detected(
+    ledger: EventLedger, session_id: object
+) -> None:
+    """A modified snapshot fails verification — forged projections are not
+    silently accepted (architectural residual #7)."""
+    ledger.store_projection_snapshot(session_id, '{"nodes": [1, 2, 3]}')
+    assert ledger.verify_projection_snapshot(session_id, '{"nodes": [9, 9, 9]}') is False
+
+
+def test_projection_snapshot_unverified_not_passed(
+    ledger: EventLedger, session_id: object
+) -> None:
+    """No snapshot ever stored -> None ('not checked'), never conflated
+    with a verification pass."""
+    assert ledger.verify_projection_snapshot(session_id, "{}") is None
+    assert ledger.get_projection_digest(session_id) is None
+
+
+def test_projection_mac_is_session_bound(ledger: EventLedger) -> None:
+    """The same body under two sessions yields different MACs (row-bound
+    AAD): a snapshot cannot be transplanted across sessions."""
+    sid_a, sid_b = uuid4(), uuid4()
+    ledger.create_session(sid_a, "{}", "mac a", "2024-01-01T00:00:00Z")
+    ledger.create_session(sid_b, "{}", "mac b", "2024-01-01T00:00:00Z")
+    d_a = ledger.store_projection_snapshot(sid_a, '{"same": true}')
+    d_b = ledger.store_projection_snapshot(sid_b, '{"same": true}')
+    assert d_a != d_b
+
+
+def test_key_rotation_orphans_mac_fail_safe(
+    ledger: EventLedger, session_id: object
+) -> None:
+    """Rotation clears stored MACs rather than leaving digests that can
+    never validate: verification reports 'not checked', the next
+    projection write re-anchors under the new key."""
+    ledger.store_projection_snapshot(session_id, '{"v": 1}')
+    ledger.rotate_encryption(bytes(range(32)))
+    assert ledger.get_projection_digest(session_id) is None
+    assert ledger.verify_projection_snapshot(session_id, '{"v": 1}') is None
+    ledger.store_projection_snapshot(session_id, '{"v": 1}')
+    assert ledger.verify_projection_snapshot(session_id, '{"v": 1}') is True

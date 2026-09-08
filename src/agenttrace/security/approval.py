@@ -6,8 +6,11 @@ expiry, and affected commands/paths/destinations.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import posixpath
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -25,6 +28,18 @@ logger = logging.getLogger(__name__)
 MAX_EXPIRY_MINUTES = 24 * 60
 
 
+class ApprovalError(Exception):
+    """An approval operation failed closed (invalid challenge, bad decision)."""
+
+
+# Operator-challenge parameters (item 4: approval residual stack). A grant
+# minted through the API must carry the challenge issued moments before,
+# bound to its finding and decision — a stolen dashboard bearer token alone
+# cannot mint approvals.
+OPERATOR_CHALLENGE_TTL_SECONDS = 120
+_MAX_ACTIVE_CHALLENGES = 16
+
+
 class ApprovalManager:
     """Manages approval lifecycle for policy-gated actions.
 
@@ -36,8 +51,117 @@ class ApprovalManager:
     def __init__(self, session_id: UUID, ledger: EventLedger) -> None:
         self.session_id = session_id
         self._ledger = ledger
+        # Operator-challenge state: nonce -> (expiry, binding digest).
+        # Single-use, bounded, binding-checked at record time.
+        self._operator_challenges: dict[str, tuple[datetime, str]] = {}
         # In-memory cache of active approvals for fast lookup
         self._active_approvals: dict[str, ApprovalEvent] = {}
+
+    # -- Operator-channel authentication (item 4: approval residual) --------
+
+    def issue_operator_challenge(self, finding_id: str, decision: str) -> str:
+        """Issue a single-use challenge bound to a specific finding+decision.
+
+        The API hands it to the operator before the grant is minted; the
+        subsequent authenticated record call must present it. A compromised
+        dashboard cannot mint grants on its own: every decision needs a
+        fresh challenge, and each is bound to one finding and one decision
+        and dies in minutes.
+        """
+        if decision not in ("approved", "denied"):
+            raise ApprovalError("invalid decision: must be approved or denied")
+        self._prune_operator_challenges()
+        if len(self._operator_challenges) >= _MAX_ACTIVE_CHALLENGES:
+            raise ApprovalError(
+                "operator_challenge_exhausted: too many outstanding challenges"
+            )
+        nonce = secrets.token_hex(16)
+        material = f"{self.session_id}:{finding_id}:{decision}:{nonce}"
+        digest = hmac.new(nonce.encode(), material.encode(), hashlib.sha256).hexdigest()
+        expiry = datetime.now(timezone.utc) + timedelta(
+            seconds=OPERATOR_CHALLENGE_TTL_SECONDS
+        )
+        self._operator_challenges[nonce] = (expiry, digest)
+        return nonce
+
+    def record_authenticated_approval(
+        self,
+        finding_id: str,
+        approved: bool,
+        reason: str,
+        *,
+        operator_challenge: str,
+        scope: str = "",
+        expiry_minutes: int = 60,
+        affected_paths: list[str] | None = None,
+        affected_commands: list[str] | None = None,
+    ) -> ApprovalEvent:
+        """Record a decision only when it carries a valid operator challenge.
+
+        The challenge must be unexpired, unconsumed, and bound to exactly
+        this finding and decision — replaying an old challenge, or swapping
+        the decision after the challenge was issued, both fail closed.
+        """
+        self._check_operator_challenge(
+            operator_challenge, finding_id, "approved" if approved else "denied"
+        )
+        return self.record_approval(
+            finding_id,
+            approved,
+            reason,
+            scope=scope,
+            expiry_minutes=expiry_minutes,
+            affected_paths=affected_paths,
+            affected_commands=affected_commands,
+            operator_authenticated=True,
+        )
+
+    def _check_operator_challenge(
+        self, nonce: str, finding_id: str, decision: str
+    ) -> None:
+        """Consume a challenge or fail closed with a specific reason."""
+        entry = self._operator_challenges.pop(nonce, None)
+        if entry is None:
+            raise ApprovalError(
+                "operator_challenge_invalid: unknown or already consumed"
+            )
+        expiry, digest = entry
+        if datetime.now(timezone.utc) > expiry:
+            raise ApprovalError("operator_challenge_expired: issue a new challenge")
+        material = f"{self.session_id}:{finding_id}:{decision}:{nonce}"
+        expected = hmac.new(
+            nonce.encode(), material.encode(), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(digest, expected):
+            raise ApprovalError(
+                "operator_challenge_mismatch: challenge is bound to a "
+                "different finding or decision"
+            )
+
+    def _prune_operator_challenges(self) -> None:
+        now = datetime.now(timezone.utc)
+        expired = [
+            key
+            for key, (exp, _) in self._operator_challenges.items()
+            if now > exp
+        ]
+        for key in expired:
+            del self._operator_challenges[key]
+
+    def revoke(self, finding_id: str) -> None:
+        """Revoke every live grant for a finding, durably and immediately.
+
+        The approval row flips to status='revoked' (durable across restarts,
+        checked on reload) and the in-memory grant is dropped so this
+        session stops honoring it at once.
+        """
+        self._ledger.revoke_approval(self.session_id, finding_id)
+        dropped = self._active_approvals.pop(finding_id, None)
+        logger.info(
+            "Approval revoked: finding %s (live grant present: %s)",
+            finding_id,
+            dropped is not None,
+        )
 
     def request_approval(
         self,
@@ -92,12 +216,16 @@ class ApprovalManager:
         expiry_minutes: int = 60,
         affected_paths: list[str] | None = None,
         affected_commands: list[str] | None = None,
+        operator_authenticated: bool = False,
     ) -> ApprovalEvent:
         """Record a user's approval or denial.
 
         The approval is stored as a ledger event (hash-chained) and
         as a queryable approval record — resolving any pending request
-        for the same finding in place.
+        for the same finding in place. ``operator_authenticated`` marks
+        decisions that passed the operator-challenge gate (P1.4) and is
+        sealed into the event BEFORE it is appended, so the ledger copy
+        and the returned event can never disagree.
         """
         # Cap only the upper bound: negative/past expiries stay in the past
         # (an already-expired grant is never active).
@@ -117,6 +245,7 @@ class ApprovalManager:
             expiry=expiry,
             affected_paths=affected_paths or [],
             affected_commands=affected_commands or [],
+            operator_authenticated=operator_authenticated,
         )
 
         # Append to the hash-chained ledger

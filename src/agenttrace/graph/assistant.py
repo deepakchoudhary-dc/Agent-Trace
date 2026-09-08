@@ -60,9 +60,20 @@ RECOMMENDED_ACTIONS: dict[str, str] = {
     "get_parameter_exfiltration":
         "Review the full request URL for encoded secrets or workspace "
         "data in query parameters; block egress and rotate anything leaked.",
+    "counter_detection_tooling":
+        "Treat as anti-forensics until disproven: preserve the current "
+        "records, snapshot logs off-host, and audit what was cleaned or "
+        "routed through anonymizers.",
+    "network_counter_detection":
+        "Treat as containment-relevant: identify which sensor the tooling "
+        "evades, verify the ledger chain, and re-verify host defense state.",
     "obfuscation_tool":
         "Decode the payload out-of-band and review it; obfuscation in a "
         "coding task is rarely legitimate.",
+    "counter_detection":
+        "Treat as anti-forensics until disproven: preserve the current "
+        "records, snapshot logs off-host, and audit what was cleaned or "
+        "routed through anonymizers.",
     "egress_anomaly":
         "Compare the destination with known baselines; block while "
         "unidentified.",

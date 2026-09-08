@@ -3,7 +3,9 @@
 from pathlib import Path
 from uuid import uuid4
 
-from agenttrace.security.approval import ApprovalManager
+import pytest
+
+from agenttrace.security.approval import ApprovalError, ApprovalManager
 from agenttrace.storage.ledger import EventLedger
 
 
@@ -198,3 +200,59 @@ class TestApprovalScopeHardening:
         fresh = ApprovalManager(sid, ledger)
         fresh.reload_from_storage()
         assert fresh.check_approval(path="/workspace/src/a.py") is False
+
+
+
+def test_operator_challenge_gate_mints_authenticated_grant(
+    tmp_path: Path,
+) -> None:
+    """P1 residual: a grant exists only behind a single-use, decision-bound
+    operator challenge — a compromised dashboard cannot mint approvals."""
+    from agenttrace.models.events import ApprovalEvent
+
+    _, mgr, _ = _make_manager(tmp_path)
+    challenge = mgr.issue_operator_challenge("finding-1", "approved")
+    event = mgr.record_authenticated_approval(
+        "finding-1",
+        True,
+        "operator confirmed",
+        operator_challenge=challenge,
+    )
+    assert isinstance(event, ApprovalEvent)
+    assert getattr(event, "operator_authenticated", False) is True
+    assert mgr.check_approval(finding_id="finding-1") is True
+
+
+def test_operator_challenge_is_decision_bound(tmp_path: Path) -> None:
+    """A challenge issued for 'denied' cannot authorize an approval."""
+    _, mgr, _ = _make_manager(tmp_path)
+    challenge = mgr.issue_operator_challenge("finding-1", "denied")
+    with pytest.raises(ApprovalError):
+        mgr.record_authenticated_approval(
+            "finding-1",
+            True,
+            "attempted flip",
+            operator_challenge=challenge,
+        )
+    assert mgr.check_approval(finding_id="finding-1") is False
+
+
+def test_operator_challenge_is_single_use(tmp_path: Path) -> None:
+    _, mgr, _ = _make_manager(tmp_path)
+    challenge = mgr.issue_operator_challenge("finding-1", "approved")
+    mgr.record_authenticated_approval(
+        "finding-1", True, "first use", operator_challenge=challenge
+    )
+    with pytest.raises(ApprovalError):
+        mgr.record_authenticated_approval(
+            "finding-2", True, "replay", operator_challenge=challenge
+        )
+
+
+def test_garbage_or_missing_challenge_rejected(tmp_path: Path) -> None:
+    _, mgr, _ = _make_manager(tmp_path)
+    for bad in ("", "forged-challenge"):
+        with pytest.raises(ApprovalError):
+            mgr.record_authenticated_approval(
+                "finding-1", True, "no", operator_challenge=bad
+            )

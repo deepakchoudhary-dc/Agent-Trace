@@ -1287,3 +1287,53 @@ async def test_clean_stop_restart_records_no_observation_gap(
         ) == []
     finally:
         await daemon2.stop()
+
+
+
+@pytest.mark.asyncio
+async def test_failed_resume_leaves_session_unadopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restore atomicity (P1 residual): a resume that fails mid-way must
+    not leave a half-observed adopted session. The unwind releases every
+    partially-started resource, the commit point never registers the
+    session, and the ledger row keeps its pre-restart status."""
+    data_dir = tmp_path / ".agenttrace"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    daemon1 = AgentTraceDaemon(data_dir)
+    await daemon1.start()
+    session = await daemon1.create_session(
+        workspace_path=str(workspace),
+        task_description="Atomic restore test",
+        agent_type=AgentType.GENERIC,
+    )
+    sid = session.session_id
+
+    # Simulate a daemon crash: the session stays ACTIVE in storage.
+    for task in daemon1._adapter_tasks.values():
+        task.cancel()
+    daemon1._ledger.close()
+
+    daemon2 = AgentTraceDaemon(data_dir)
+
+    # Break observation startup so the resume fails mid-way.
+    async def _boom(_session: object) -> list[object]:
+        raise RuntimeError("observer start failed")
+
+    monkeypatch.setattr(daemon2, "_start_observers", _boom)
+    try:
+        await daemon2.start()  # restore failure is logged, not fatal
+        # The commit point was never reached: nothing half-adopted.
+        assert daemon2.get_session(sid) is None
+        assert sid not in daemon2._observers
+        assert sid not in daemon2._adapters
+        assert sid not in daemon2._adapter_tasks
+        assert sid not in daemon2._containment
+        # The ledger row is untouched — still ACTIVE, retried next start.
+        rows = daemon2._ledger.list_sessions()
+        assert any(
+            r["session_id"] == str(sid) and r["status"] == "active" for r in rows
+        )
+    finally:
+        await daemon2.stop()

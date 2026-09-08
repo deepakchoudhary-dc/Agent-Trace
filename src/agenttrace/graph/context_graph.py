@@ -7,6 +7,7 @@ labeled edges. Every node and edge carries provenance metadata.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -268,6 +269,15 @@ class ContextGraph:
         """Serialize graph to a JSON-compatible dict."""
         snapshot = self.to_snapshot()
         return snapshot.model_dump(mode="json")
+
+    def to_snapshot_json(self) -> str:
+        """Deterministic canonical JSON of the full snapshot.
+
+        Sorted keys and stable separators make the byte-level form
+        reproducible, so the keyed MAC over this string authenticates the
+        same projection regardless of dict insertion order.
+        """
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
 
     @classmethod
     def from_snapshot(cls, snapshot: GraphSnapshot) -> ContextGraph:

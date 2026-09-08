@@ -146,8 +146,9 @@ export const api = {
     reason: string,
     scope: string,
     affectedPaths: string[] = [],
-    affectedCommands: string[] = []
-  ): Promise<{ status: string; approval_id: string; event_hash: string; approved: boolean }> {
+    affectedCommands: string[] = [],
+    operatorChallenge: string = ''
+  ): Promise<{ status: string; approval_id: string; event_hash: string; approved: boolean; effective_expiry_minutes?: number }> {
     return request(`/sessions/${sessionId}/approvals`, {
       method: 'POST',
       body: JSON.stringify({
@@ -157,6 +158,21 @@ export const api = {
         scope,
         affected_paths: affectedPaths,
         affected_commands: affectedCommands,
+        operator_challenge: operatorChallenge,
+      }),
+    });
+  },
+
+  async issueApprovalChallenge(
+    sessionId: string,
+    findingId: string,
+    decision: 'approved' | 'denied'
+  ): Promise<{ operator_challenge: string; ttl_seconds: number }> {
+    return request(`/sessions/${sessionId}/approvals/challenge`, {
+      method: 'POST',
+      body: JSON.stringify({
+        finding_id: findingId,
+        decision,
       }),
     });
   },

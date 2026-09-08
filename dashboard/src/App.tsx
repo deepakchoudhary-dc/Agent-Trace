@@ -201,7 +201,24 @@ export const App: React.FC = () => {
   ) => {
     if (!currentSession) return;
     try {
-      const res = await api.recordApproval(currentSession.session_id, findingId, approved, reason, scope);
+      // Operator-channel authentication (item 4): fetch a fresh single-use
+      // challenge bound to this finding+decision and present it with the
+      // grant — a bearer token alone only yields a short-lived approval.
+      const challenge = await api.issueApprovalChallenge(
+        currentSession.session_id,
+        findingId,
+        approved ? 'approved' : 'denied'
+      );
+      const res = await api.recordApproval(
+        currentSession.session_id,
+        findingId,
+        approved,
+        reason,
+        scope,
+        [],
+        [],
+        challenge.operator_challenge
+      );
       if (res && res.event_hash) {
         setFindings((prev) => prev.filter((f) => f.finding_id !== findingId));
         loadSessionData(currentSession.session_id, true);

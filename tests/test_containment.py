@@ -8,9 +8,14 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 import pytest
 
@@ -265,3 +270,97 @@ def test_windows_limits_fail_closed_when_query_fails(
             memory_limit_mb=1024,
             max_active_processes=64,
         )
+
+
+# -- Contained spawn + wait semantics (P0.3 residual: run_contained) --------
+
+
+def test_contained_wait_returns_none_while_running() -> None:
+    """wait() must report "still running" as None. The pre-fix code returned
+    STILL_ACTIVE (259) as if it were an exit code, so any polling caller
+    (isolation.run_contained) treated a live process as finished."""
+    proc = containment.ContainedProcess(
+        pid=0,
+        provider=SimpleNamespace(),  # type: ignore[arg-type]
+        contained=True,
+        _proc=subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        ),
+    )
+    try:
+        assert proc.wait(timeout=0.5) is None
+    finally:
+        proc._proc.kill()  # type: ignore[union-attr]
+        proc._proc.wait(timeout=10)  # type: ignore[union-attr]
+    assert proc.wait(timeout=10) is not None
+
+
+def test_contained_wait_reports_exit_code() -> None:
+    proc = containment.ContainedProcess(
+        pid=0,
+        provider=SimpleNamespace(),  # type: ignore[arg-type]
+        contained=True,
+        _proc=subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"]),
+    )
+    assert proc.wait(timeout=15) == 3
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows raw-handle path")
+def test_windows_handle_wait_masks_still_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The raw-handle path must mask WAIT_TIMEOUT and STILL_ACTIVE (259)
+    as None instead of reporting them as exit codes."""
+    still_active = 259
+
+    def WaitForSingleObject(handle: int, ms: int) -> int:  # noqa: N802
+        assert ms == 500
+        return 0  # signaled
+
+    def GetExitCodeProcess(handle: int, code: Any) -> int:  # noqa: N802
+        ctypes.cast(code, ctypes.POINTER(ctypes.c_ulong)).contents.value = (
+            still_active
+        )
+        return 1
+
+    fake = SimpleNamespace(
+        WaitForSingleObject=WaitForSingleObject,
+        GetExitCodeProcess=GetExitCodeProcess,
+    )
+    monkeypatch.setattr(containment, "_kernel32", lambda: fake, raising=False)
+    proc = containment.ContainedProcess(
+        pid=0,
+        provider=SimpleNamespace(),  # type: ignore[arg-type]
+        contained=True,
+        _win={"process_handle": 4321},
+    )
+    assert proc.wait(timeout=0.5) is None
+
+
+def test_real_spawn_is_contained_before_first_instruction(tmp_path: Path) -> None:
+    """End-to-end: the spawned child is a kernel-verified member of the
+    containment unit — contained at creation, pid enumerated, terminate
+    kills it. Skips honestly where the host cannot provide containment."""
+    manager = containment.ContainmentManager(uuid4())
+    ensure_error: str | None = None
+    try:
+        manager.ensure()
+    except containment.ContainmentError as exc:
+        ensure_error = str(exc)
+    if ensure_error is not None:
+        # Skip must raise OUTSIDE the except block: a skip IS a
+        # ContainmentError subclass, so one raised inside this handler is
+        # caught by it and reported as a failure — exactly what CI hit.
+        pytest.skip(f"host cannot provide kernel containment: {ensure_error}")
+    try:
+        proc = manager.spawn(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=str(tmp_path),
+        )
+        assert proc.contained is True
+        assert proc.pid in manager.member_pids()
+        assert proc.wait(timeout=0.5) is None
+        proc.terminate()
+        assert proc.wait(timeout=15) is not None
+    finally:
+        manager.release(kill=True)

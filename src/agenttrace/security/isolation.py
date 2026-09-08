@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from agenttrace.security.containment import ContainmentManager
+
 logger = logging.getLogger(__name__)
 
 _ALLOWED_ENGINES = ("docker", "podman")
@@ -217,6 +219,65 @@ class IsolationRunner:
             exit_code=proc.returncode,
             stdout=self._truncate(proc.stdout),
             stderr=self._truncate(proc.stderr),
+            duration_ms=int((time.monotonic() - start) * 1000),
+            metadata=meta,
+        )
+
+
+    # -- Contained spawn (P0.3 residual: verified at process creation) ------
+
+    def run_contained(
+        self,
+        argv: list[str],
+        *,
+        containment: ContainmentManager,
+        workspace_path: Path,
+        env: dict[str, str] | None = None,
+    ) -> IsolationResult:
+        """Run argv through the session's kernel containment unit.
+
+        This is the production agent-execution path: the child is placed
+        inside the kernel-owned unit (Windows Job Object / Linux cgroup)
+        *before its first instruction executes* — kernel-verified membership
+        at process creation, closing the post-hoc attach race that
+        ``register_session_pid`` can never close. No host fallback: a
+        containment failure propagates and the command never runs.
+
+        The container path (:meth:`run`) stays for verification-only
+        review/replay commands, where untrusted workspace code must not
+        touch the host at all. The two paths are deliberately distinct:
+        containment proves WHERE a process ran; the container proves it
+        never ran on the host.
+        """
+        for arg in argv:
+            if not isinstance(arg, str) or not arg or "\x00" in arg:
+                raise IsolationError("invalid argv: empty or non-string element")
+        meta = self.preflight()
+
+        start = time.monotonic()
+        proc = containment.spawn(argv, cwd=str(workspace_path))
+        deadline = start + self.timeout_seconds
+        exit_code: int | None = None
+        while time.monotonic() < deadline:
+            exit_code = proc.wait(timeout=0.5)
+            if exit_code is not None:
+                break
+        if exit_code is None:
+            # Wall clock expired: terminate kernel-verified unit members.
+            proc.terminate()
+            return IsolationResult(
+                exit_code=None,
+                stdout="",
+                stderr="",
+                duration_ms=int((time.monotonic() - start) * 1000),
+                metadata=meta,
+                error=f"isolation_timeout: exceeded {self.timeout_seconds}s",
+            )
+        proc.close()
+        return IsolationResult(
+            exit_code=exit_code,
+            stdout="",
+            stderr="",
             duration_ms=int((time.monotonic() - start) * 1000),
             metadata=meta,
         )

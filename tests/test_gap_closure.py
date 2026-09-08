@@ -1,4 +1,4 @@
-﻿"""Tests for the Â§11 gap-closure batch: N1â€“N14, R2, R3, R6, R7.
+"""Tests for the Â§11 gap-closure batch: N1â€“N14, R2, R3, R6, R7.
 
 Covers write-boundary redaction, port consistency, observability gaps,
 detector/observer error surfacing, token expiry/rotation, incident-window
@@ -109,7 +109,8 @@ def test_store_review_run_redacts_internal(tmp_path: Path) -> None:
         "SELECT payload_enc FROM review_runs WHERE session_id = ?", (str(sid),)
     ).fetchone()
     assert row is not None
-    stored = ledger._encryption.decrypt_str(row[0])
+    aad = ledger._row_aad("review_runs", str(sid), str(loop_id))
+    stored = ledger._encryption.decrypt_str(row[0], associated_data=aad)
     assert SK not in stored
     assert "[REDACTED]" in stored
 

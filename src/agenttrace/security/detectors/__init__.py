@@ -19,9 +19,11 @@ from agenttrace.security.detectors.engine import DetectionEngine
 from agenttrace.security.detectors.rules import (
     DEFAULT_DETECTORS,
     ConfigTamperDetector,
+    CounterDetectionDetector,
     CredentialReadDetector,
     EgressAnomalyDetector,
     GitHistoryRewritingDetector,
+    NetworkCounterDetectionDetector,
     ObfuscationDetector,
     PathTrickDetector,
     PrivilegeChangeDetector,
@@ -32,6 +34,7 @@ from agenttrace.security.detectors.rules import (
 __all__ = [
     "DEFAULT_DETECTORS",
     "ConfigTamperDetector",
+    "CounterDetectionDetector",
     "CredentialReadDetector",
     "DetectionContext",
     "DetectionEngine",
@@ -39,6 +42,7 @@ __all__ = [
     "DetectorFinding",
     "EgressAnomalyDetector",
     "GitHistoryRewritingDetector",
+    "NetworkCounterDetectionDetector",
     "ObfuscationDetector",
     "PathTrickDetector",
     "PrivilegeChangeDetector",

@@ -136,6 +136,7 @@ class ApprovalEvent(EventBase):
     expiry: datetime | None = None
     affected_paths: list[str] = Field(default_factory=list)
     affected_commands: list[str] = Field(default_factory=list)
+    operator_authenticated: bool = False  # operator-channel proof (P1.4)
 
 
 class FileMutationEvent(EventBase):

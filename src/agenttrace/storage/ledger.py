@@ -8,6 +8,7 @@ Sensitive columns and payloads are encrypted at rest using AES-256-GCM.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import sqlite3
@@ -112,6 +113,14 @@ class EventLedger:
             "CREATE TABLE IF NOT EXISTS evidence_state ("
             "session_id TEXT PRIMARY KEY, state TEXT NOT NULL, "
             "reason TEXT NOT NULL, recorded_at TEXT NOT NULL)"
+        )
+        # P0.4 residual: keyed MACs over graph projection snapshots — a
+        # forged projection is detected against the key, not merely
+        # different from the ledger.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS projection_mac ("
+            "session_id TEXT PRIMARY KEY, digest TEXT NOT NULL, "
+            "stored_at TEXT NOT NULL)"
         )
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(events)")}
         if "canonical_json_enc" not in cols:
@@ -371,9 +380,10 @@ class EventLedger:
     ) -> None:
         """Create a new audit session record with encrypted metadata."""
         redacted_task = self._redactor.redact(task_desc)
-        config_enc = self._encryption.encrypt_str(config_json)
-        task_desc_enc = self._encryption.encrypt_str(redacted_task)
-        metadata_enc = self._encryption.encrypt_json(metadata or {})
+        aad = self._row_aad("sessions", str(session_id), str(session_id))
+        config_enc = self._encryption.encrypt_str(config_json, associated_data=aad)
+        task_desc_enc = self._encryption.encrypt_str(redacted_task, associated_data=aad)
+        metadata_enc = self._encryption.encrypt_json(metadata or {}, associated_data=aad)
 
         self._conn.execute(
             """INSERT INTO sessions
@@ -419,20 +429,36 @@ class EventLedger:
             return None
 
         row_dict = dict(row)
+        sess_aad = self._row_aad("sessions", str(session_id), str(session_id))
         try:
-            row_dict["config_json"] = self._encryption.decrypt_str(row_dict["config_enc"])
+            row_dict["config_json"] = self._decrypt_bound_or_legacy(
+                lambda associated_data: self._encryption.decrypt_str(
+                    row_dict["config_enc"], associated_data=associated_data
+                ),
+                sess_aad,
+            )
         except Exception:
             self._record_integrity_failure(f"session {session_id} config")
             row_dict["config_json"] = "{}"
 
         try:
-            row_dict["task_desc"] = self._encryption.decrypt_str(row_dict["task_desc_enc"])
+            row_dict["task_desc"] = self._decrypt_bound_or_legacy(
+                lambda associated_data: self._encryption.decrypt_str(
+                    row_dict["task_desc_enc"], associated_data=associated_data
+                ),
+                sess_aad,
+            )
         except Exception:
             self._record_integrity_failure(f"session {session_id} task_desc")
             row_dict["task_desc"] = ""
 
         try:
-            row_dict["metadata"] = self._encryption.decrypt_json(row_dict["metadata_enc"])
+            row_dict["metadata"] = self._decrypt_bound_or_legacy(
+                lambda associated_data: self._encryption.decrypt_json(
+                    row_dict["metadata_enc"], associated_data=associated_data
+                ),
+                sess_aad,
+            )
         except Exception:
             self._record_integrity_failure(f"session {session_id} metadata")
             row_dict["metadata"] = {}
@@ -453,13 +479,26 @@ class EventLedger:
         for r in rows:
             d = dict(r)
             degraded: list[str] = []
+            row_aad = self._row_aad("sessions", str(d.get("session_id")), str(d.get("session_id")))
             try:
-                d["task_desc"] = self._encryption.decrypt_str(d["task_desc_enc"])
+                d["task_desc"] = self._decrypt_bound_or_legacy(
+                    lambda associated_data, d=d: self._encryption.decrypt_str(
+                        d["task_desc_enc"], associated_data=associated_data
+                    ),
+                    row_aad,
+                )
             except Exception:
                 degraded.append("task_desc")
                 d["task_desc"] = ""
             try:
-                d["config"] = json.loads(self._encryption.decrypt_str(d["config_enc"]))
+                d["config"] = json.loads(
+                    self._decrypt_bound_or_legacy(
+                        lambda associated_data, d=d: self._encryption.decrypt_str(
+                            d["config_enc"], associated_data=associated_data
+                        ),
+                        row_aad,
+                    )
+                )
             except Exception:
                 degraded.append("config")
                 d["config"] = {}
@@ -478,7 +517,12 @@ class EventLedger:
         self, session_id: UUID, adapter_name: str, cursor: dict[str, Any]
     ) -> None:
         """Persist an adapter's resume state (file offsets, seen records)."""
-        cursor_enc = self._encryption.encrypt_json(cursor or {})
+        cursor_enc = self._encryption.encrypt_json(
+            cursor or {},
+            associated_data=self._row_aad(
+                "adapter_cursors", str(session_id), str(session_id)
+            ),
+        )
         self._conn.execute(
             """INSERT INTO adapter_cursors (session_id, adapter_name, cursor_enc, updated_at)
                VALUES (?, ?, ?, ?)
@@ -505,7 +549,12 @@ class EventLedger:
         if not row:
             return None
         try:
-            cursor = self._encryption.decrypt_json(row["cursor_enc"])
+            cursor = self._decrypt_bound_or_legacy(
+                lambda associated_data: self._encryption.decrypt_json(
+                    row["cursor_enc"], associated_data=associated_data
+                ),
+                self._row_aad("adapter_cursors", str(session_id), str(session_id)),
+            )
         except Exception:
             self._record_integrity_failure(
                 f"adapter cursor {row['adapter_name']} for session {session_id}"
@@ -712,6 +761,39 @@ class EventLedger:
     # payload-replay that P1.1 named is structurally impossible for bound rows.
 
     _EVENT_COLUMN_AAD = {"payload_enc": "payload", "canonical_json_enc": "canonical"}
+
+    # P1 residual: AAD binding for non-event encrypted columns. Each
+    # row's ciphertexts are bound to (table, session_id, row identity) so a
+    # ciphertext cannot be moved between rows or sessions without failing
+    # authentication. Rows written before this binding decrypt without AAD
+    # (legacy fallback); rotation upgrades them in place.
+    _ROW_ID_COLUMN: dict[str, str] = {
+        "sessions": "session_id",
+        "adapter_cursors": "session_id",
+        "graph_nodes": "node_id",
+        "graph_edges": "edge_id",
+        "approvals": "approval_id",
+        "task_contracts": "contract_id",
+        "review_runs": "loop_id",
+    }
+
+    @staticmethod
+    def _row_aad(table: str, session_id: str, row_id: str) -> bytes:
+        """The associated data a row's encrypted columns are bound to."""
+        return f"agenttrace:v1:row:{table}:{session_id}:{row_id}".encode()
+
+    def _decrypt_bound_or_legacy(self, decrypt: Any, aad: bytes) -> Any:
+        """Decrypt a bound column, tolerating pre-binding legacy rows.
+
+        ``decrypt`` is a callable receiving the keyword ``associated_data``;
+        it is called first with the row AAD, then without (legacy row). Any
+        failure propagates so the caller's integrity handling applies — a
+        ciphertext that matches neither binding is never silently accepted.
+        """
+        try:
+            return decrypt(associated_data=aad)
+        except EncryptionError:
+            return decrypt(associated_data=None)
 
     @staticmethod
     def _event_aad(session_id: str, event_id: str, column: str) -> bytes:
@@ -940,8 +1022,13 @@ class EventLedger:
     ) -> None:
         """Store a Context Graph node with encrypted label and data."""
         redacted_label = self._redactor.redact(label)
-        label_enc = self._encryption.encrypt_str(redacted_label)
-        data_enc = self._encryption.encrypt_json(self._redactor.redact_any(data or {}))
+        node_aad = self._row_aad("graph_nodes", str(session_id), str(node_id))
+        label_enc = self._encryption.encrypt_str(
+            redacted_label, associated_data=node_aad
+        )
+        data_enc = self._encryption.encrypt_json(
+            self._redactor.redact_any(data or {}), associated_data=node_aad
+        )
 
         self._conn.execute(
             """INSERT OR REPLACE INTO graph_nodes
@@ -981,8 +1068,10 @@ class EventLedger:
         data: dict[str, Any] | None = None,
     ) -> None:
         """Store a Context Graph edge with full session isolation."""
-        data_enc = self._encryption.encrypt_json(self._redactor.redact_any(data or {}))
-
+        edge_aad = self._row_aad("graph_edges", str(session_id), str(edge_id))
+        data_enc = self._encryption.encrypt_json(
+            self._redactor.redact_any(data or {}), associated_data=edge_aad
+        )
         self._conn.execute(
             """INSERT OR REPLACE INTO graph_edges
                (edge_id, session_id, source_node_id, target_node_id, edge_type,
@@ -1026,15 +1115,32 @@ class EventLedger:
         nodes: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
+            node_aad = self._row_aad(
+                "graph_nodes", str(session_id), str(d.get("node_id"))
+            )
             try:
-                d["label"] = self._encryption.decrypt_str(d["label_enc"])
+                d["label"] = self._decrypt_bound_or_legacy(
+                    lambda associated_data, d=d: self._encryption.decrypt_str(
+                        d["label_enc"], associated_data=associated_data
+                    ),
+                    node_aad,
+                )
             except Exception:
-                self._record_integrity_failure(f"graph node {d.get('node_id')} label")
+                self._record_integrity_failure(
+                    f"graph node {d.get('node_id')} label"
+                )
                 d["label"] = ""
             try:
-                d["data"] = self._encryption.decrypt_json(d["data_enc"])
+                d["data"] = self._decrypt_bound_or_legacy(
+                    lambda associated_data, d=d: self._encryption.decrypt_json(
+                        d["data_enc"], associated_data=associated_data
+                    ),
+                    node_aad,
+                )
             except Exception:
-                self._record_integrity_failure(f"graph node {d.get('node_id')} data")
+                self._record_integrity_failure(
+                    f"graph node {d.get('node_id')} data"
+                )
                 d["data"] = {}
             nodes.append(d)
         return nodes
@@ -1070,10 +1176,20 @@ class EventLedger:
         edges: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
+            edge_aad = self._row_aad(
+                "graph_edges", str(session_id), str(d.get("edge_id"))
+            )
             try:
-                d["data"] = self._encryption.decrypt_json(d["data_enc"])
+                d["data"] = self._decrypt_bound_or_legacy(
+                    lambda associated_data, d=d: self._encryption.decrypt_json(
+                        d["data_enc"], associated_data=associated_data
+                    ),
+                    edge_aad,
+                )
             except Exception:
-                self._record_integrity_failure(f"graph edge {d.get('edge_id')} data")
+                self._record_integrity_failure(
+                    f"graph edge {d.get('edge_id')} data"
+                )
                 d["data"] = {}
             edges.append(d)
         return edges
@@ -1102,13 +1218,23 @@ class EventLedger:
         (session_id, finding_id), the decision updates it in place instead of
         creating a duplicate — a request followed by its verdict is one record.
         """
+        approval_aad = self._row_aad(
+            "approvals", str(session_id), str(approval_id)
+        )
         redacted_reason = self._redactor.redact(reason)
-        reason_enc = self._encryption.encrypt_str(redacted_reason)
-        scope_enc = self._encryption.encrypt_str(scope)
-        affected_enc = self._encryption.encrypt_json({
-            "paths": affected_paths or [],
-            "commands": affected_commands or [],
-        })
+        reason_enc = self._encryption.encrypt_str(
+            redacted_reason, associated_data=approval_aad
+        )
+        scope_enc = self._encryption.encrypt_str(
+            scope, associated_data=approval_aad
+        )
+        affected_enc = self._encryption.encrypt_json(
+            {
+                "paths": affected_paths or [],
+                "commands": affected_commands or [],
+            },
+            associated_data=approval_aad,
+        )
 
         pending = self._conn.execute(
             "SELECT approval_id FROM approvals "
@@ -1193,20 +1319,38 @@ class EventLedger:
         approvals: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
+            row_aad = self._row_aad(
+                "approvals", str(session_id), str(d.get("approval_id"))
+            )
             try:
-                d["reason"] = self._encryption.decrypt_str(d["reason_enc"])
+                d["reason"] = self._decrypt_bound_or_legacy(
+                    lambda associated_data, d=d: self._encryption.decrypt_str(
+                        d["reason_enc"], associated_data=associated_data
+                    ),
+                    row_aad,
+                )
             except Exception:
                 self._record_integrity_failure(
                     f"approval {d.get('finding_id')} reason"
                 )
                 d["reason"] = ""
             try:
-                d["scope"] = self._encryption.decrypt_str(d["scope_enc"])
+                d["scope"] = self._decrypt_bound_or_legacy(
+                    lambda associated_data, d=d: self._encryption.decrypt_str(
+                        d["scope_enc"], associated_data=associated_data
+                    ),
+                    row_aad,
+                )
             except Exception:
                 self._record_integrity_failure(f"approval {d.get('finding_id')} scope")
                 d["scope"] = ""
             try:
-                affected = self._encryption.decrypt_json(d["affected_enc"])
+                affected = self._decrypt_bound_or_legacy(
+                    lambda associated_data, d=d: self._encryption.decrypt_json(
+                        d["affected_enc"], associated_data=associated_data
+                    ),
+                    row_aad,
+                )
                 if isinstance(affected, dict):
                     d["affected"] = affected
                     d["affected_paths"] = affected.get("paths", [])
@@ -1243,14 +1387,29 @@ class EventLedger:
         updated_at: str = "",
         notes: str = "",
     ) -> None:
-        """Store or update an encrypted task contract."""
+        """Store or update an encrypted task contract (row-bound ciphertext)."""
         redacted_goal = self._redactor.redact(goal)
-        goal_enc = self._encryption.encrypt_str(redacted_goal)
-        allowed_enc = self._encryption.encrypt_json(allowed_paths or [])
-        prohibited_enc = self._encryption.encrypt_json(prohibited_paths or [])
-        tests_enc = self._encryption.encrypt_json(expected_tests or [])
-        tools_enc = self._encryption.encrypt_json(allowed_tools or [])
-        notes_enc = self._encryption.encrypt_str(self._redactor.redact(notes))
+        contract_aad = self._row_aad(
+            "task_contracts", str(session_id), str(contract_id)
+        )
+        goal_enc = self._encryption.encrypt_str(
+            redacted_goal, associated_data=contract_aad
+        )
+        allowed_enc = self._encryption.encrypt_json(
+            allowed_paths or [], associated_data=contract_aad
+        )
+        prohibited_enc = self._encryption.encrypt_json(
+            prohibited_paths or [], associated_data=contract_aad
+        )
+        tests_enc = self._encryption.encrypt_json(
+            expected_tests or [], associated_data=contract_aad
+        )
+        tools_enc = self._encryption.encrypt_json(
+            allowed_tools or [], associated_data=contract_aad
+        )
+        notes_enc = self._encryption.encrypt_str(
+            self._redactor.redact(notes), associated_data=contract_aad
+        )
 
         self._conn.execute(
             """INSERT OR REPLACE INTO task_contracts
@@ -1285,6 +1444,9 @@ class EventLedger:
             return None
 
         d = dict(row)
+        contract_aad = self._row_aad(
+            "task_contracts", str(session_id), str(d.get("contract_id", ""))
+        )
         for field, key, default in (
             ("goal", "goal_enc", ""),
             ("allowed_paths", "allowed_enc", []),
@@ -1294,14 +1456,32 @@ class EventLedger:
         ):
             try:
                 if field == "goal":
-                    d[field] = self._encryption.decrypt_str(d[key])
+                    d[field] = self._decrypt_bound_or_legacy(
+                        lambda associated_data, k=key: self._encryption.decrypt_str(
+                            d[k], associated_data=associated_data
+                        ),
+                        contract_aad,
+                    )
                 else:
-                    d[field] = self._encryption.decrypt_json(d[key])
+                    d[field] = self._decrypt_bound_or_legacy(
+                        lambda associated_data, k=key: self._encryption.decrypt_json(
+                            d[k], associated_data=associated_data
+                        ),
+                        contract_aad,
+                    )
             except Exception:
                 self._record_integrity_failure(f"task contract {field}")
                 d[field] = default
         try:
-            d["notes"] = self._encryption.decrypt_str(d["notes_enc"]) if d.get("notes_enc") else ""
+            if d.get("notes_enc"):
+                d["notes"] = self._decrypt_bound_or_legacy(
+                    lambda associated_data: self._encryption.decrypt_str(
+                        d["notes_enc"], associated_data=associated_data
+                    ),
+                    contract_aad,
+                )
+            else:
+                d["notes"] = ""
         except Exception:
             self._record_integrity_failure("task contract notes")
             d["notes"] = ""
@@ -1326,7 +1506,10 @@ class EventLedger:
         review evidence (agent reasoning, tool output) directly.
         """
         redacted_payload = SecretRedactor().redact(payload_json)
-        payload = self._encryption.encrypt_str(redacted_payload)
+        run_aad = self._row_aad("review_runs", str(session_id), str(loop_id))
+        payload = self._encryption.encrypt_str(
+            redacted_payload, associated_data=run_aad
+        )
         self._conn.execute(
             """INSERT OR REPLACE INTO review_runs
                (loop_id, session_id, passed, iterations, payload_enc, created_at)
@@ -1352,8 +1535,18 @@ class EventLedger:
         ).fetchall()
         runs: list[dict[str, Any]] = []
         for r in rows:
+            run_aad = self._row_aad(
+                "review_runs", str(r["session_id"]), r["loop_id"]
+            )
             try:
-                payload = json.loads(self._encryption.decrypt_str(r["payload_enc"]))
+                payload = json.loads(
+                    self._decrypt_bound_or_legacy(
+                        lambda associated_data, row=r: self._encryption.decrypt_str(
+                            row["payload_enc"], associated_data=associated_data
+                        ),
+                        run_aad,
+                    )
+                )
             except Exception as e:  # noqa: BLE001 — corrupt rows must not crash reads
                 logger.warning("Failed to decrypt review run %s: %s", r["loop_id"], e)
                 continue
@@ -1409,6 +1602,100 @@ class EventLedger:
         ).fetchall()
         return {row[0] for row in rows}
 
+    # -- Keyed projection snapshots (plan2.md P0.4 residual) ----------------
+
+    @staticmethod
+    def _projection_key(encryption: EncryptionManager) -> bytes:
+        """Derive the projection-MAC subkey from the master key.
+
+        A fixed context string plus HKDF (RFC 5869, SHA-256) keeps this key
+        purpose-bound: the projection MAC key is never the master key itself,
+        so leaking one does not expose the other, and a projection digest
+        cannot be transplanted into an event-column MAC position (or vice
+        versa). 32-byte output matches AES-256/HMAC-SHA-256 strength.
+        """
+        try:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+            return HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b"agenttrace/projection-mac/v1",
+            ).derive(encryption.key_bytes)
+        except ImportError:  # pragma: no cover - cryptography is a hard dep
+            return hmac.new(
+                b"agenttrace/projection-mac/v1", encryption.key_bytes, hashlib.sha256
+            ).digest()
+
+    @staticmethod
+    def _projection_digest(
+        snapshot_json: str, session_id: UUID, mac_key: bytes
+    ) -> str:
+        """HMAC-SHA-256 over snapshot + session id (domain-separated)."""
+        material = (
+            b"agenttrace/projection-snapshot/v1"
+            + str(session_id).encode()
+            + b"\x00"
+            + snapshot_json.encode("utf-8")
+        )
+        return hmac.new(mac_key, material, hashlib.sha256).hexdigest()
+
+    @_locked
+    def store_projection_snapshot(self, session_id: UUID, snapshot_json: str) -> str:
+        """Persist the keyed MAC of one projection snapshot (latest wins).
+
+        Returns the stored digest. The snapshot body itself is NOT stored —
+        the MAC only authenticates the snapshot a client or analyst holds,
+        so a forged projection cannot be minted without the key.
+        """
+        digest = self._projection_digest(
+            snapshot_json, session_id, self._projection_key(self._encryption)
+        )
+        self._conn.execute(
+            "INSERT OR REPLACE INTO projection_mac (session_id, digest, stored_at) "
+            "VALUES (?, ?, ?)",
+            (
+                str(session_id),
+                digest,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self._conn.commit()
+        return digest
+
+    @_locked
+    def verify_projection_snapshot(
+        self, session_id: UUID, snapshot_json: str
+    ) -> bool | None:
+        """Verify a projection snapshot against its stored MAC.
+
+        True = key-authenticated match. False = forgery or mismatch (the
+        snapshot differs from what this host last committed). None = no
+        snapshot was ever committed for this session — 'not checked', never
+        conflated with a pass.
+        """
+        row = self._conn.execute(
+            "SELECT digest FROM projection_mac WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        expected = self._projection_digest(
+            snapshot_json, session_id, self._projection_key(self._encryption)
+        )
+        return hmac.compare_digest(str(row["digest"]), expected)
+
+    @_locked
+    def get_projection_digest(self, session_id: UUID) -> str | None:
+        """The stored MAC for a session's latest projection snapshot."""
+        row = self._conn.execute(
+            "SELECT digest FROM projection_mac WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        return str(row["digest"]) if row else None
+
     # -- Key rotation --
 
     # Every encrypted column, grouped by table. Table and column names are
@@ -1455,32 +1742,58 @@ class EventLedger:
             for table, columns in self._ENCRYPTED_COLUMNS.items():
                 for column in columns:
                     self._reencrypt_column(table, column, new_key)
+            # Projection MACs are keyed under the (old) master key and their
+            # snapshot bodies are deliberately not stored, so they cannot be
+            # re-derived under the new key. Clear them: verification then
+            # reports 'not checked' instead of failing everything; the next
+            # projection write re-anchors under the new key.
+            self._conn.execute("DELETE FROM projection_mac")
             self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
 
+    # Every table's row-identity columns for AAD binding: (key column(s)
+    # selected per row, key argument(s) for _row_aad). Events keep their
+    # dedicated P1.1 map; this covers the non-event encrypted tables.
+    _TABLE_ROW_AAD: dict[str, tuple[str, str, str]] = {
+        "sessions": ("session_id", "session_id", "session_id"),
+        "adapter_cursors": ("session_id", "session_id", "session_id"),
+        "graph_nodes": ("session_id, node_id", "session_id", "node_id"),
+        "graph_edges": ("session_id, edge_id", "session_id", "edge_id"),
+        "approvals": ("session_id, approval_id", "session_id", "approval_id"),
+        "task_contracts": ("session_id, contract_id", "session_id", "contract_id"),
+        "review_runs": ("session_id, loop_id", "session_id", "loop_id"),
+    }
+
     @_locked
     def _reencrypt_column(self, table: str, column: str, new_key: bytes) -> None:
         """Re-encrypt one column: decrypt with the current key, encrypt with the new one.
 
-        Bound event columns (P1.1) keep their row binding across rotation and
-        legacy rows are upgraded to bound in place."""
-        aad_column = (
-            self._EVENT_COLUMN_AAD.get(column) if table == "events" else None
-        )
-        if aad_column:
-            rows = self._conn.execute(
-                f"SELECT rowid, {column}, session_id, event_id FROM {table} "
-                f"WHERE {column} IS NOT NULL"
-            ).fetchall()
+        Row-bound columns (P1.1 event columns and every bound non-event
+        table) keep their row binding across rotation; legacy unbound rows
+        are upgraded to bound in place."""
+        if table == "events":
+            aad_column = self._EVENT_COLUMN_AAD.get(column)
+            id_select = "session_id, event_id"
         else:
-            rows = self._conn.execute(
-                f"SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
-            ).fetchall()
+            aad_column = column
+            id_select = self._TABLE_ROW_AAD[table][0]
+        rows = self._conn.execute(
+            f"SELECT rowid, {column}, {id_select} FROM {table} "
+            f"WHERE {column} IS NOT NULL"
+        ).fetchall()
         for r in rows:
-            if aad_column:
+            aad: bytes | None
+            if table == "events" and aad_column:
                 aad = self._event_aad(r["session_id"], r["event_id"], aad_column)
+                try:
+                    plaintext = self._encryption.decrypt(r[column], associated_data=aad)
+                except EncryptionError:
+                    plaintext = self._encryption.decrypt(r[column])
+            elif table != "events":
+                keys = self._TABLE_ROW_AAD[table]
+                aad = self._row_aad(table, r[keys[1]], r[keys[2]])
                 try:
                     plaintext = self._encryption.decrypt(r[column], associated_data=aad)
                 except EncryptionError:
