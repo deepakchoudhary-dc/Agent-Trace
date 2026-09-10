@@ -58,6 +58,8 @@ dist/
 # Testing, coverage, lint, and type checking caches
 .pytest_cache/
 **/.pytest_cache/
+.hypothesis/
+**/.hypothesis/
 .mypy_cache/
 **/.mypy_cache/
 .ruff_cache/

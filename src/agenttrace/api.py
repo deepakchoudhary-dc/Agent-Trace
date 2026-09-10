@@ -79,6 +79,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Request body cap (plan2.md P2.3): every accepted body must fit in 1 MiB.
+# Starlette reads the stream only when a handler consumes it, so without this
+# cap a multi-gigabyte body would be buffered per request by FastAPI's JSON
+# parser before any handler logic could reject it. 413 for oversize bodies.
+MAX_BODY_BYTES = 1_000_000
+
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next: Any) -> Response:
+    content_length = request.headers.get("content-length")
+    if (
+        content_length is not None
+        and content_length.isdigit()
+        and int(content_length) > MAX_BODY_BYTES
+    ):
+        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+    return cast("Response", await call_next(request))
+
 
 @app.middleware("http")
 async def require_token(request: Request, call_next: Any) -> Response:
@@ -104,18 +122,24 @@ async def health() -> dict[str, str]:
 # -- Request & Response DTO Models --
 
 class CreateSessionRequest(BaseModel):
-    workspace_path: str
-    task_description: str = ""
-    agent_type: str = "auto"
-    allowed_paths: list[str] = Field(default_factory=lambda: ["*"])
-    prohibited_paths: list[str] = Field(default_factory=lambda: [".env*", "*.pem", "*.key"])
-    expected_tests: list[str] = Field(default_factory=list)
-    allowed_tools: list[str] = Field(default_factory=list)
+    workspace_path: str = Field(min_length=1, max_length=1024)
+    task_description: str = Field(default="", max_length=8192)
+    agent_type: str = Field(default="auto", max_length=64)
+    # Collection input bounds: lists are capped server-side so a hostile
+    # create payload cannot flood the policy engine or storage with garbage.
+    allowed_paths: list[str] = Field(
+        default_factory=lambda: ["*"], max_length=128
+    )
+    prohibited_paths: list[str] = Field(
+        default_factory=lambda: [".env*", "*.pem", "*.key"], max_length=128
+    )
+    expected_tests: list[str] = Field(default_factory=list, max_length=256)
+    allowed_tools: list[str] = Field(default_factory=list, max_length=256)
     # Declared network boundary for the audited environment (sealed-eval
     # detection). internet_access_allowed=False seals the env: any public
     # egress is a critical finding + unexpected_egress incident.
     internet_access_allowed: bool | None = None
-    allowed_destinations: list[str] = Field(default_factory=list)
+    allowed_destinations: list[str] = Field(default_factory=list, max_length=64)
 
 
 class CreateSessionResponse(BaseModel):
@@ -127,14 +151,17 @@ class CreateSessionResponse(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
-    finding_id: str
+    finding_id: str = Field(min_length=1, max_length=128)
     approved: bool = True
-    reason: str = ""
-    scope: str = ""
-    expiry_minutes: int = 60
-    affected_paths: list[str] = Field(default_factory=list)
-    affected_commands: list[str] = Field(default_factory=list)
-    operator_challenge: str = ""
+    reason: str = Field(default="", max_length=4096)
+    scope: str = Field(default="", max_length=1024)
+    # Operator-channel tiering (item 4): bearer-only grants are capped to
+    # UNAUTHENTICATED_EXPIRY_MINUTES regardless of this request; challenge
+    # grants can never outlive the approval manager's MAX_EXPIRY_MINUTES.
+    expiry_minutes: int = Field(default=60, ge=1, le=24 * 60)
+    affected_paths: list[str] = Field(default_factory=list, max_length=64)
+    affected_commands: list[str] = Field(default_factory=list, max_length=64)
+    operator_challenge: str = Field(default="", max_length=256)
 
 
 class FindingDTO(BaseModel):
@@ -175,34 +202,34 @@ class VerifyResponse(BaseModel):
 
 
 class SimulationRequest(BaseModel):
-    verification_commands: list[str] = Field(default_factory=list)
+    verification_commands: list[str] = Field(default_factory=list, max_length=64)
     constraints: dict[str, Any] = Field(default_factory=dict)
-    commit_hash: str | None = None
+    commit_hash: str | None = Field(default=None, max_length=128)
 
 
 class EvaluateRequest(BaseModel):
     """A proposed action to run through the pre-execution policy gate."""
 
-    action_type: str  # file_mutation | command | network | git
-    target: str
+    action_type: str = Field(max_length=64)  # file_mutation | command | network | git
+    target: str = Field(max_length=1024)
     details: dict[str, Any] = Field(default_factory=dict)
 
 
 class BrokerChallengeRequest(BaseModel):
     """Request for a single-use execution challenge (plan2.md P0.2)."""
 
-    finding_id: str
-    argv: list[str]
-    path: str = ""
+    finding_id: str = Field(min_length=1, max_length=128)
+    argv: list[str] = Field(min_length=1, max_length=64)
+    path: str = Field(default="", max_length=1024)
 
 
 class BrokerExecuteRequest(BaseModel):
     """A brokered execution: structured argv + single-use challenge."""
 
-    finding_id: str
-    nonce: str
-    argv: list[str]
-    path: str = ""
+    finding_id: str = Field(min_length=1, max_length=128)
+    nonce: str = Field(min_length=1, max_length=256)
+    argv: list[str] = Field(min_length=1, max_length=64)
+    path: str = Field(default="", max_length=1024)
 
 
 class EvaluateResponse(BaseModel):
@@ -215,6 +242,33 @@ class EvaluateResponse(BaseModel):
 
 class ReviewRunRequest(BaseModel):
     max_iterations: int = Field(default=3, ge=1, le=5)
+
+
+# -- Pagination & collection bounds (plan2.md P2.2/P2.3) -----------------------
+
+# Every collection endpoint serves at most this many items per request. The
+# ledger already caps default event queries at 1000 rows; these constants make
+# that bound explicit, server-side, and uniform across every list the API
+# returns, so a huge session can no longer serialize an unbounded response.
+MAX_COLLECTION_LIMIT = 1000
+MAX_PAGE_LIMIT = 500
+
+
+def _validated_page(limit: int | None, offset: int) -> tuple[int, int]:
+    """Validate limit/offset query parameters, returning the effective pair."""
+    if limit is not None and not 1 <= limit <= MAX_PAGE_LIMIT:
+        raise HTTPException(
+            status_code=422,
+            detail=f"limit must be between 1 and {MAX_PAGE_LIMIT}",
+        )
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be non-negative")
+    return (limit if limit is not None else MAX_PAGE_LIMIT, offset)
+
+
+def _page_slice(items: list[Any], limit: int, offset: int) -> list[Any]:
+    """Slice one collection page (offset-based) from the fetched collection."""
+    return items[offset : offset + limit]
 
 
 # -- Session Endpoints --
@@ -263,10 +317,12 @@ async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
 
 
 @app.get("/sessions")
-async def list_sessions() -> list[dict[str, Any]]:
-    """List all sessions."""
+async def list_sessions(response: Response, limit: int | None = None) -> list[dict[str, Any]]:
+    """List all sessions (newest collection, bounded by ``limit``)."""
     sessions = daemon.list_sessions()
-    return [
+    page_limit, _ = _validated_page(limit, 0)
+    response.headers["X-Total-Count"] = str(len(sessions))
+    rows = [
         {
             "session_id": str(s.session_id),
             "workspace_path": s.config.workspace_path,
@@ -285,6 +341,7 @@ async def list_sessions() -> list[dict[str, Any]]:
         }
         for s in sessions
     ]
+    return _page_slice(rows, page_limit, 0)
 
 
 def _collect_session_gaps(session: object) -> list[str]:
@@ -452,16 +509,33 @@ async def get_session_brief(session_id: UUID) -> dict[str, Any]:
 # -- Timeline & Diff Endpoints --
 
 @app.get("/sessions/{session_id}/timeline")
-async def get_timeline(session_id: UUID) -> list[dict[str, Any]]:
-    """Get the full chronological event timeline for a session."""
+async def get_timeline(
+    session_id: UUID,
+    response: Response,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Get the chronological event timeline for a session (one page).
+
+    ``offset``/``limit`` paginate the full event list; the total event count
+    is returned in ``X-Total-Count`` so clients can walk every page.
+    """
     events = daemon.get_timeline(session_id)
-    return [e.model_dump(mode="json") for e in events]
+    page_limit, page_offset = _validated_page(limit, offset)
+    response.headers["X-Total-Count"] = str(len(events))
+    return [e.model_dump(mode="json") for e in _page_slice(events, page_limit, page_offset)]
 
 
 @app.get("/sessions/{session_id}/diffs", response_model=list[DiffItemDTO])
-async def get_diffs(session_id: UUID) -> list[DiffItemDTO]:
+async def get_diffs(
+    session_id: UUID,
+    response: Response,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[DiffItemDTO]:
     """Get real unified diffs and file mutations recorded during the session."""
     events = daemon._ledger.query_events(session_id, event_type=EventType.FILE_MUTATION)
+    page_limit, page_offset = _validated_page(limit, offset)
     diffs: list[DiffItemDTO] = []
     for evt in events:
         if isinstance(evt, FileMutationEvent):
@@ -475,7 +549,8 @@ async def get_diffs(session_id: UUID) -> list[DiffItemDTO]:
                     timestamp=evt.timestamp.isoformat(),
                 )
             )
-    return diffs
+    response.headers["X-Total-Count"] = str(len(diffs))
+    return _page_slice(diffs, page_limit, page_offset)
 
 
 # -- Review Loop (P0-7): real artifacts, real verdicts --
@@ -578,13 +653,19 @@ def get_session_review(session_id: UUID) -> dict[str, Any]:
 # -- Policy Findings & Approvals (P0-4, P1-8) --
 
 @app.get("/sessions/{session_id}/findings", response_model=list[FindingDTO])
-async def get_findings(session_id: UUID) -> list[FindingDTO]:
+async def get_findings(
+    session_id: UUID,
+    response: Response,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[FindingDTO]:
     """Get decrypted, redacted policy findings for a session.
 
     `auto_resolved` is computed at read time: a finding is resolved when an
     active (non-expired) approval covers its exact ID or path/command scope.
     Findings are immutable chain records, so resolution is never written back.
     """
+    page_limit, page_offset = _validated_page(limit, offset)
     findings_events = daemon.get_findings(session_id)
     mgr = daemon.get_approval_manager(session_id)
     results: list[FindingDTO] = []
@@ -613,7 +694,8 @@ async def get_findings(session_id: UUID) -> list[FindingDTO]:
                 ),
             )
         )
-    return results
+    response.headers["X-Total-Count"] = str(len(results))
+    return _page_slice(results, page_limit, page_offset)
 
 
 # A grant minted without an operator challenge (bearer-only) is capped to
@@ -625,8 +707,8 @@ UNAUTHENTICATED_EXPIRY_MINUTES = 5
 class ApprovalChallengeRequest(BaseModel):
     """Request an operator challenge for one finding + decision."""
 
-    finding_id: str
-    decision: str  # approved | denied
+    finding_id: str = Field(min_length=1, max_length=128)
+    decision: str = Field(max_length=16)  # approved | denied
 
 
 @app.post("/sessions/{session_id}/approvals")
@@ -986,16 +1068,28 @@ async def get_graph(session_id: UUID) -> dict[str, Any]:
 
 
 @app.get("/sessions/{session_id}/incidents")
-async def get_incidents(session_id: UUID) -> list[dict[str, Any]]:
+async def get_incidents(
+    session_id: UUID,
+    response: Response,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
     """List correlated multi-stage incidents for a session (evidence-backed)."""
     if not daemon.get_session(session_id) and not daemon._ledger.get_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
+    page_limit, page_offset = _validated_page(limit, offset)
     incidents = daemon.get_incidents(session_id)
-    return [e.model_dump(mode="json") for e in incidents]
+    response.headers["X-Total-Count"] = str(len(incidents))
+    return [e.model_dump(mode="json") for e in _page_slice(incidents, page_limit, page_offset)]
 
 
 @app.get("/sessions/{session_id}/collusion")
-async def get_collusion(session_id: UUID) -> list[dict[str, object]]:
+async def get_collusion(
+    session_id: UUID,
+    response: Response,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, object]]:
     """Cross-session coordination signals involving this session.
 
     Observable half only: shared artifacts, reused egress destinations,
@@ -1004,10 +1098,13 @@ async def get_collusion(session_id: UUID) -> list[dict[str, object]]:
     """
     if not daemon.get_session(session_id) and not daemon._ledger.get_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
+    page_limit, page_offset = _validated_page(limit, offset)
     from agenttrace.graph.collusion import CollusionCorrelationEngine
 
     engine = CollusionCorrelationEngine(daemon._ledger)
-    return [c.to_dict() for c in engine.for_session(session_id)]
+    candidates = engine.for_session(session_id)
+    response.headers["X-Total-Count"] = str(len(candidates))
+    return [c.to_dict() for c in _page_slice(candidates, page_limit, page_offset)]
 
 
 @app.get("/sessions/{session_id}/compliance")
