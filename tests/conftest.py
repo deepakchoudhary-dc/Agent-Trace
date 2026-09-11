@@ -1,5 +1,7 @@
 """Pytest configuration and path setup."""
 
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,7 +41,17 @@ class HostIsolationStub:
         self.calls.append(list(argv))
         self.last_env = env
         base = Path(argv[0]).name.lower().removesuffix(".exe")
-        resolved = [sys.executable, *argv[1:]] if base in _PYTHON_ALIASES else list(argv)
+        if base in _PYTHON_ALIASES:
+            resolved = [sys.executable, *argv[1:]]
+        else:
+            # Bare console-script names (e.g. "pytest") resolve via PATH on
+            # POSIX but CreateProcess on Windows needs the ".exe" suffix;
+            # resolve explicitly so tests behave identically on both.
+            resolved = list(argv)
+            if os.name == "nt" and not Path(argv[0]).suffix:
+                which = shutil.which(argv[0], path=str(Path(sys.executable).parent))
+                if which:
+                    resolved = [which, *argv[1:]]
         proc = subprocess.run(  # noqa: S603
             resolved,
             cwd=str(workspace_path),
