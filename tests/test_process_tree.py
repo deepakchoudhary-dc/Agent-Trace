@@ -7,7 +7,12 @@ from uuid import uuid4
 
 import psutil  # type: ignore[import-untyped]
 
-from agenttrace.models.events import CommandEvent, EventBase, ProcessEvent
+from agenttrace.models.events import (
+    CommandEvent,
+    ConfidenceLevel,
+    EventBase,
+    ProcessEvent,
+)
 from agenttrace.observers.process_tree import ProcessTreeObserver
 
 
@@ -19,18 +24,24 @@ class _FakeProc:
         cmdline: list[str],
         cwd: str,
         create_time: float,
+        ppid: int = 1,
     ) -> None:
+        self.pid = pid
         self.info: dict[str, Any] = {
             "pid": pid,
-            "ppid": 1,
             "name": name,
             "cmdline": cmdline,
             "cwd": cwd,
             "create_time": create_time,
         }
+        self._ppid = ppid
 
     def cwd(self) -> str:
         return str(self.info["cwd"])
+
+    def ppid(self) -> int:
+        """Parent pid — the observer resolves this on demand, not in attrs."""
+        return self._ppid
 
 
 def _make_observer(workspace: str) -> tuple[ProcessTreeObserver, list[Any]]:
@@ -61,8 +72,29 @@ async def _scan(observer: ProcessTreeObserver, procs: list[_FakeProc]) -> None:
     def fake_iter(_attrs: list[str]) -> list[_FakeProc]:
         return procs
 
+    live = {p.info["pid"]: p for p in procs}
+
+    class _FakeProcess:
+        """Stands in for psutil.Process — only the surface the observer uses."""
+
+        def __init__(self, pid: int) -> None:
+            self._pid = pid
+
+        def children(self) -> list[_FakeProc]:
+            if self._pid not in live:
+                raise psutil.NoSuchProcess(self._pid)
+            return [p for p in procs if p.ppid() == self._pid]
+
     fake_psutil = type(
-        "_FakePSUtil", (), {"process_iter": staticmethod(fake_iter)}
+        "_FakePSUtil",
+        (),
+        {
+            "process_iter": staticmethod(fake_iter),
+            "Process": staticmethod(_FakeProcess),
+            "NoSuchProcess": psutil.NoSuchProcess,
+            "AccessDenied": psutil.AccessDenied,
+            "ZombieProcess": psutil.ZombieProcess,
+        },
     )()
     pt_mod.psutil = fake_psutil  # type: ignore[attr-defined]
     try:
@@ -245,3 +277,77 @@ def test_harness_outside_workspace_not_captured(tmp_path: Path) -> None:
     observer, _ = _make_observer(str(tmp_path))
     other = tmp_path.parent / "other-project"
     assert observer._containment_eligible(False, "claude", str(other)) is False
+
+
+async def test_child_of_tracked_process_is_descendant(tmp_path: Path) -> None:
+    """VULN-04 end to end: the agent's spawn tree stays relevant even when a
+    child's cwd escapes the workspace and its name would otherwise be
+    excluded. The observer resolves this from the tracked pids' live children,
+    not from a parent lookup on every process."""
+    observer, events = _make_observer(str(tmp_path))
+
+    # Scan 1: the agent harness in the workspace is tracked.
+    await _scan(observer, [
+        _FakeProc(2001, "claude", ["claude", "run"], str(tmp_path), 2222.0),
+    ])
+    assert observer.get_tracked_pids() == {2001}
+
+    # Scan 2: its child, spawned outside the workspace, under an editor-host
+    # name that the non-descendant rules would reject.
+    await _scan(observer, [
+        _FakeProc(2001, "claude", ["claude", "run"], str(tmp_path), 2222.0),
+        _FakeProc(
+            2002, "code.exe", ["code.exe", "--ext"], "C:/elsewhere", 2223.0,
+            ppid=2001,
+        ),
+    ])
+    children = [e for e in await _starts(events) if e.pid == 2002]
+    assert children, "child of a tracked process was never observed"
+    assert children[0].payload["contained_descendant"] is True
+    assert children[0].confidence is ConfidenceLevel.HIGH
+
+
+async def test_bulk_scan_does_not_request_ppid(tmp_path: Path) -> None:
+    """Regression guard for a measured performance defect.
+
+    Requesting ``ppid`` in process_iter's attribute list makes Windows psutil
+    resolve the parent with a full system snapshot *per process*: a
+    328-process scan cost ~3.2s that way versus ~20ms without it — longer than
+    the 1.5s poll interval, so the observer could never keep up. The parent pid
+    must stay resolved on demand for relevant processes only.
+    """
+    import agenttrace.observers.process_tree as pt_mod
+
+    seen: list[list[str]] = []
+
+    def fake_iter(attrs: list[str]) -> list[_FakeProc]:
+        seen.append(list(attrs))
+        return []
+
+    class _NeverLive:
+        def __init__(self, pid: int) -> None:
+            raise psutil.NoSuchProcess(pid)
+
+    fake_psutil = type(
+        "_FakePSUtil",
+        (),
+        {
+            "process_iter": staticmethod(fake_iter),
+            "Process": staticmethod(_NeverLive),
+            "NoSuchProcess": psutil.NoSuchProcess,
+            "AccessDenied": psutil.AccessDenied,
+            "ZombieProcess": psutil.ZombieProcess,
+        },
+    )()
+    observer, _ = _make_observer(str(tmp_path))
+    pt_mod.psutil = fake_psutil  # type: ignore[attr-defined]
+    try:
+        await observer._scan_processes()
+    finally:
+        pt_mod.psutil = psutil  # type: ignore[attr-defined]
+
+    assert seen, "the scan never enumerated processes"
+    assert "ppid" not in seen[0], (
+        "bulk attrs must not include 'ppid' — that made a scan ~157x slower "
+        f"on Windows: {seen[0]}"
+    )

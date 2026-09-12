@@ -146,18 +146,45 @@ class ProcessTreeObserver(BaseObserver):
     async def _scan_processes(self) -> None:
         """Scan running processes for workspace-scoped activity.
 
-        Two-phase scan: cheap attributes (pid/ppid/name/cmdline/create_time)
-        are fetched for every process; the expensive cwd lookup is only done
-        for candidates that could plausibly relate to the workspace, and a
-        cached "irrelevant" verdict (keyed by pid identity = create_time)
-        skips even that.
+        Two-phase scan: cheap attributes (pid/name/cmdline/create_time) are
+        fetched for every process; the expensive cwd lookup is only done for
+        candidates that could plausibly relate to the workspace, and a cached
+        "irrelevant" verdict (keyed by pid identity = create_time) skips even
+        that.
+
+        The parent pid is deliberately NOT part of the bulk attribute set. On
+        Windows psutil resolves ``ppid`` with a full system snapshot *per
+        process*, so requesting it made a 328-process scan cost ~3.2s instead
+        of ~25ms — far longer than the poll interval, so the observer could
+        never keep up. Descendant membership is instead resolved once per scan
+        by asking the handful of tracked pids for their children, and the
+        parent pid is fetched on demand for the few processes that turn out to
+        be relevant (it is stored on the tracked record and emitted with the
+        event).
         """
         current_pids: set[int] = set()
         workspace_l = str(self._workspace_resolved).lower()
         ws_raw_l = self.workspace_path.lower()
         job_pids: set[int] = set(self._job_object.get_pids()) if self._job_object else set()
 
-        for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]):
+        # Direct children of already-tracked session processes are always
+        # relevant (VULN-04: prevents out-of-workspace CWD escape). One
+        # children() call per tracked pid — and there are only ever a handful
+        # of tracked pids — instead of a parent lookup for every process on
+        # the box. Deeper descendants are picked up on the next scan, once
+        # their parent is itself tracked; the previous per-process form could
+        # only ever catch a grandchild in the same scan by iteration-order
+        # luck, so this is no weaker.
+        descendant_pids: set[int] = set()
+        for tracked_pid in self._tracked_pids:
+            try:
+                descendant_pids.update(
+                    child.pid for child in psutil.Process(tracked_pid).children()
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
             try:
                 info = proc.info
                 pid = info["pid"]
@@ -168,13 +195,9 @@ class ProcessTreeObserver(BaseObserver):
                 cmdline = info.get("cmdline") or []
                 create_time = info.get("create_time")
 
-                # Descendants of already-tracked session processes or Job Object members
-                # are always relevant (VULN-04: prevents out-of-workspace CWD escape)
-                ppid = info.get("ppid")
-                is_descendant = bool(
-                    (ppid is not None and ppid in self._tracked_pids)
-                    or (pid in job_pids)
-                )
+                # Descendants of already-tracked session processes or Job
+                # Object members are always relevant (VULN-04).
+                is_descendant = bool(pid in descendant_pids or pid in job_pids)
 
                 if not is_descendant:
                     # Skip identities already judged irrelevant (no cwd lookup)
@@ -224,10 +247,13 @@ class ProcessTreeObserver(BaseObserver):
                     else:
                         continue
 
-                # New relevant workspace process found
+                # New relevant workspace process found. The parent pid is
+                # resolved here, on demand — only relevant processes need it,
+                # and there are few of them per scan.
+                ppid = self._safe_ppid(proc)
                 proc_info: dict[str, str | int | float | None] = {
                     "pid": pid,
-                    "ppid": info.get("ppid"),
+                    "ppid": ppid,
                     "name": name,
                     "cmdline": " ".join(cmdline) if cmdline else name,
                     "cwd": cwd,
@@ -250,7 +276,7 @@ class ProcessTreeObserver(BaseObserver):
                     source_adapter="process_tree_observer",
                     confidence=proc_confidence,
                     pid=pid,
-                    ppid=info.get("ppid") or 0,
+                    ppid=ppid or 0,
                     command_line=str(proc_info["cmdline"]),
                     working_dir=cwd,
                     started_at=started_at,
@@ -311,6 +337,23 @@ class ProcessTreeObserver(BaseObserver):
             return str(proc.cwd() or "")
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
             return ""
+
+    @staticmethod
+    def _safe_ppid(proc: psutil.Process) -> int | None:
+        """Parent pid of one process, resolved on demand.
+
+        Never requested through ``process_iter``'s attribute list: on Windows
+        that resolves ppid with a full system snapshot per process (measured
+        ~9.6ms each, ~3.2s for a 328-process scan). Callers use it only for
+        processes they are about to record, so the cost stays proportional to
+        new workspace processes rather than to the size of the process table.
+        A process that exited between enumeration and this call simply has no
+        parent to report.
+        """
+        try:
+            return int(proc.ppid())
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            return None
 
     @staticmethod
     def _is_pid_reused(
