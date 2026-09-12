@@ -218,6 +218,31 @@ def test_sync_absorbs_prunes_and_throttles_the_kernel_fetch() -> None:
     assert 100 in engine._kernel_bound
 
 
+def test_sync_does_not_drop_explicit_kernel_root() -> None:
+    """A kernel-verified root (bind_kernel_root) is not a sweep observation:
+    a sweep snapshot that does not contain it must NOT drop the binding —
+    the assignment's lifecycle ends with the unit's release (drop_session),
+    not with any single sync. Without this, a mid-test observer event firing
+    sync_kernel_bindings quietly erased the hand-bound pid and the egress
+    contradiction never landed (windows-CI flake)."""
+    engine = ProcessAttestationEngine()
+
+    def fetch_empty() -> list[int]:
+        return []
+
+    engine.bind_kernel_root(_SID_A, 100, _T0)
+    engine.sync_kernel_bindings(_SID_A, fetch_empty)
+    assert 100 in engine._kernel_bound
+    # The binding still drives a real contradiction after the sweep.
+    engine.observe(_proc(_SID_B, 200, 100))
+    incidents = engine.observe(_egress(_SID_B, 200))
+    assert len(incidents) == 1
+    assert incidents[0].incident_type == "egress_attribution_contradiction"
+    # Only the unit's release removes it.
+    engine.drop_session(_SID_A)
+    assert 100 not in engine._kernel_bound
+
+
 def test_seed_does_not_seed_bindings() -> None:
     """The 'bindings are not seeded' half, actually pinned: with lineage
     seeded but NO binding, a fresh session narrating that pid stays silent

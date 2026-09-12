@@ -79,6 +79,11 @@ class ProcessAttestationEngine:
     def __init__(self) -> None:
         # pid -> (session_id, bound_at): kernel-verified ownership
         self._kernel_bound: dict[int, tuple[UUID, datetime]] = {}
+        # pids bound via bind_kernel_root (kernel-verified assignment, not
+        # sweep-absorbed). Sync sweeps may prune members they absorbed, never
+        # these: an assigned root's lifecycle ends with its unit's release
+        # (drop_session), not with any single sweep's best-effort snapshot.
+        self._explicit_pins: set[int] = set()
         # pid -> (ppid, session_id, first_seen): observed lineage
         self._lineage: OrderedDict[int, tuple[int, UUID, datetime]] = OrderedDict()
         self._sync_at: dict[UUID, float] = {}
@@ -94,12 +99,14 @@ class ProcessAttestationEngine:
             # into attribution.
             return
         self._kernel_bound[pid] = (session_id, now or datetime.now(timezone.utc))
+        self._explicit_pins.add(pid)
 
     def drop_session(self, session_id: UUID) -> None:
         """Forget bindings when a session's containment unit is released."""
         dead = [pid for pid, (sid, _) in self._kernel_bound.items() if sid == session_id]
         for pid in dead:
             del self._kernel_bound[pid]
+            self._explicit_pins.discard(pid)
 
     def sync_kernel_bindings(
         self, session_id: UUID, get_member_pids: Callable[[], list[int]]
@@ -112,7 +119,11 @@ class ProcessAttestationEngine:
         fetcher is invoked ONLY inside the throttle window: it is a real
         kernel query (Job Object / cgroup read), and events can be chatty.
         Members absent from the live set are dropped — a pid the kernel no
-        longer reports must not keep manufacturing contradictions.
+        longer reports must not keep manufacturing contradictions — EXCEPT
+        pids bound through :meth:`bind_kernel_root`: those are
+        kernel-verified assignments (not sweep observations) whose lifecycle
+        ends with the unit's release, so a sweep snapshot that transiently
+        does not report them must never drop them.
         """
         now = time.monotonic()
         last = self._sync_at.get(session_id)
@@ -130,7 +141,11 @@ class ProcessAttestationEngine:
         dead = [
             pid
             for pid, (sid, _) in self._kernel_bound.items()
-            if sid == session_id and pid not in live
+            if (
+                sid == session_id
+                and pid not in live
+                and pid not in self._explicit_pins
+            )
         ]
         for pid in dead:
             del self._kernel_bound[pid]
