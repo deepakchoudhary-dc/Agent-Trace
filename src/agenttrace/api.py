@@ -23,13 +23,14 @@ if TYPE_CHECKING:
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agenttrace.daemon import AgentTraceDaemon
 from agenttrace.graph.assistant import narrate_paths, recommended_action
 from agenttrace.graph.blast_radius import BlastRadiusAnalyzer
 from agenttrace.graph.causal_engine import CausalExplanationEngine
 from agenttrace.graph.replay import ReplayEngine
+from agenttrace.graph.severity import SEVERITY_LADDER, severity_rank
 from agenttrace.models.events import ConfidenceLevel, EventType, FileMutationEvent
 from agenttrace.models.session import AgentType
 from agenttrace.review_loop.loop import ReviewLoop
@@ -245,10 +246,21 @@ class ReviewRunRequest(BaseModel):
 
 
 class RescanRequest(BaseModel):
-    """Scope for a ledger retro-scan (ant.md P1 #4)."""
+    """Scope for a ledger retro-scan (ant.md P1 #4 / P2 #10)."""
 
     session_ids: list[UUID] | None = None
     exhaustive: bool = False
+    threshold: str = "high"
+
+    @field_validator("threshold")
+    @classmethod
+    def _threshold_is_on_the_ladder(cls, value: str) -> str:
+        if severity_rank(value) is None:
+            raise ValueError(
+                f"unknown severity threshold {value!r}; expected one of "
+                f"{', '.join(SEVERITY_LADDER)}"
+            )
+        return value
 
 
 # -- Pagination & collection bounds (plan2.md P2.2/P2.3) -----------------------
@@ -1138,6 +1150,12 @@ def rescan_ledger(req: RescanRequest | None = None) -> dict[str, Any]:
         "retro_incidents": len(report.retro_incidents),
         "errors": list(report.errors),
         "summary": report.summary(),
+        # P2 #10: the calibrated verdict, so "nothing of similar or worse
+        # severity" is checkable against one ordered scale and carries the
+        # boundary of what was actually read.
+        "threshold": body.threshold,
+        "calibration": report.calibration().to_payload(),
+        "negative_result": report.negative_result(threshold=body.threshold),
     }
 
 

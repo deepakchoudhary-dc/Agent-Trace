@@ -39,6 +39,12 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from agenttrace.graph.evidence_boundary import EvidenceClass, event_evidence_class
+from agenttrace.graph.severity import (
+    DEFAULT_THRESHOLD,
+    SeverityCalibration,
+    calibrate,
+    negative_result_statement,
+)
 from agenttrace.models.events import (
     CommandEvent,
     ConfidenceLevel,
@@ -117,6 +123,31 @@ class RetroScanReport:
         if self.errors:
             lines.append(f"Errors ({len(self.errors)}): " + "; ".join(self.errors[:5]))
         return "\n".join(lines)
+
+    def calibration(self) -> SeverityCalibration:
+        """Severity distribution of the incidents this scan surfaced (P2 #10).
+
+        Calibrating the scan's own output is what makes its conclusion
+        comparable with an earlier sweep's: "nothing of similar or worse
+        severity" is only checkable against one ordered scale.
+        """
+        return calibrate(self.retro_incidents)
+
+    def negative_result(
+        self,
+        *,
+        threshold: str = DEFAULT_THRESHOLD,
+        detectors_applied: int | None = None,
+    ) -> str:
+        """The sweep's result — positive or negative — with its coverage gap."""
+        return negative_result_statement(
+            self.calibration(),
+            threshold=threshold,
+            sessions_scanned=self.sessions_scanned,
+            events_scanned=self.events_scanned,
+            errors=self.errors,
+            detectors_applied=detectors_applied,
+        )
 
 
 def stage1_screen(events: Iterable[EventBase], session_id: UUID) -> list[Stage1Hit]:

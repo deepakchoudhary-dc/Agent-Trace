@@ -652,16 +652,28 @@ def verify(session_id: str) -> None:
     is_flag=True,
     help="Replay stage 2 for every session, not only those with stage-1 hits.",
 )
+@click.option(
+    "--threshold",
+    default="high",
+    show_default=True,
+    help="Severity at which a finding counts as 'similar or worse'.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit the raw report as JSON.")
-def rescan(session_id: str | None, exhaustive: bool, as_json: bool) -> None:
+def rescan(
+    session_id: str | None, exhaustive: bool, threshold: str, as_json: bool
+) -> None:
     """Re-run the detector arsenal over stored history (ant.md P1 #4).
 
     Detectors normally only run forward. A wide-net retro-scan re-screens the
     ledger with the CURRENT arsenal, so a newly added detector can flag
     sessions that predate it — the failure mode the Anthropic report hit when
     its own agentic transcript search missed an incident.
+
+    Closes with a calibrated verdict (ant.md P2 #10): the severity
+    distribution, and — when nothing reaches the threshold — an explicit
+    negative result stating what was searched and what could not be read.
     """
-    payload: dict[str, Any] = {"exhaustive": exhaustive}
+    payload: dict[str, Any] = {"exhaustive": exhaustive, "threshold": threshold}
     if session_id:
         payload["session_ids"] = [str(UUID(session_id))]
     try:
@@ -683,9 +695,9 @@ def rescan(session_id: str | None, exhaustive: bool, as_json: bool) -> None:
         f"Sessions replayed (stage 2): {len(res.get('sessions_stage2', []))}\n"
         f"Retro incidents:             {res.get('retro_incidents', 0)}"
     )
-    errors = res.get("errors") or []
-    if errors:
-        body += f"\nErrors:                      {'; '.join(errors[:5])}"
+    verdict = res.get("negative_result")
+    if verdict:
+        body += f"\n\n{verdict}"
     console.print(Panel(
         body,
         title="🔎 Ledger retro-scan (two-stage wide net)",

