@@ -27,6 +27,8 @@ from agenttrace.graph.attestation import ProcessAttestationEngine
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
 from agenttrace.graph.context_graph import ContextGraph
+from agenttrace.graph.continuation_risk import ContinuationRiskTracker
+from agenttrace.graph.cot_realism import CoTRealismDivergenceDetector
 from agenttrace.graph.coverage import CoverageMonitor
 from agenttrace.graph.covert_channel import CovertChannelDetector
 from agenttrace.graph.credential_loops import CredentialLoopTracker
@@ -36,12 +38,14 @@ from agenttrace.graph.eval_integrity import (
 )
 from agenttrace.graph.evidence_boundary import ToolClaimReconciler, event_evidence_class
 from agenttrace.graph.hesitation import HesitationDetector
+from agenttrace.graph.identity_chain import IdentityBootstrapDetector
 from agenttrace.graph.incidents import IncidentCorrelationEngine
 from agenttrace.graph.meta_detection import (
     DetectorStalenessMonitor,
     MetaAnomalyDetector,
 )
 from agenttrace.graph.post_exit import PostExitRegistry
+from agenttrace.graph.retro_scan import RetroScan, RetroScanReport
 from agenttrace.graph.task_boundary import TaskBoundaryEngine
 from agenttrace.models.events import (
     ApprovalEvent,
@@ -76,6 +80,7 @@ from agenttrace.observers.network import NetworkObserver
 from agenttrace.observers.process_tree import ProcessTreeObserver
 from agenttrace.observers.terminal import TerminalObserver
 from agenttrace.security.approval import ApprovalManager
+from agenttrace.security.attestation import EnvironmentAttester, EnvironmentContract
 from agenttrace.security.containment import ContainmentError, ContainmentManager
 from agenttrace.security.detectors import (
     DEFAULT_DETECTORS,
@@ -201,6 +206,13 @@ class AgentTraceDaemon:
         self._reconcilers: dict[UUID, ToolClaimReconciler] = {}
         self._hesitations: dict[UUID, HesitationDetector] = {}
         self._eval_detectors: dict[UUID, SandbaggingDetector] = {}
+        # METR-gap behavioural detectors (ant.md P0 #3 / P1 #6 / P1 #7):
+        # per-session screens folded into the ingest pipeline alongside the
+        # other 5b-N stages. Kept per session because each keys its windows,
+        # cooldowns, and stage history by the session it observes.
+        self._cot_realism: dict[UUID, CoTRealismDivergenceDetector] = {}
+        self._identity_chain: dict[UUID, IdentityBootstrapDetector] = {}
+        self._continuation_risk: dict[UUID, ContinuationRiskTracker] = {}
         # Post-exit surveillance is daemon-wide: shared-infrastructure and
         # post-close detection only work across sessions.
         self._post_exit: PostExitRegistry = PostExitRegistry()
@@ -242,6 +254,15 @@ class AgentTraceDaemon:
         # Kernel-bound process attribution (P1.2 residual): pid ownership
         # from containment truth vs the narrative's claims.
         self._attestation: ProcessAttestationEngine = ProcessAttestationEngine()
+        # Environment attestation (ant.md P1 #5): pre-flight proof that an
+        # environment DECLARED isolated actually is. The probes are network
+        # and subprocess bound (DNS canary, ipconfig/route), so they run
+        # off-thread and only for sessions that make an isolation claim.
+        self._attester: EnvironmentAttester = EnvironmentAttester()
+        # Ledger retro-scan (ant.md P1 #4): re-runs the detector arsenal over
+        # stored history. Pull-based over the ledger, so it is constructed
+        # once for the daemon rather than per session.
+        self._retro_scan: RetroScan = RetroScan(self._ledger)
         # Total ledger event count at the last collusion scan: a cheap O(1)
         # gate so the scan runs only when the ledger actually grew.
         self._collusion_last_count: int = -1
@@ -351,6 +372,13 @@ class AgentTraceDaemon:
                         ),
                         task_goal=(contract.goal if contract is not None else ""),
                     )
+                    # METR-gap behavioural detectors rebuild fresh on restore:
+                    # their windows are wall-clock relative to the events they
+                    # observe, so a restored session resumes with empty state
+                    # rather than replaying pre-restart history as new signals.
+                    self._cot_realism[sid] = CoTRealismDivergenceDetector(sid)
+                    self._identity_chain[sid] = IdentityBootstrapDetector(sid)
+                    self._continuation_risk[sid] = ContinuationRiskTracker(sid)
 
                     # Threat-detection rule engine
                     self._detectors[sid] = DetectionEngine(
@@ -564,6 +592,10 @@ class AgentTraceDaemon:
             self._adapter_tasks.pop(sid, None)
             self._adapters.pop(sid, None)
             self._observers.pop(sid, None)
+            # The unadopted session's behavioural detector state goes with it.
+            self._cot_realism.pop(sid, None)
+            self._identity_chain.pop(sid, None)
+            self._continuation_risk.pop(sid, None)
             stale_manager = self._containment.pop(sid, None)
             if stale_manager is not None:
                 with contextlib.suppress(Exception):
@@ -694,6 +726,19 @@ class AgentTraceDaemon:
             task_goal=contract.goal,
         )
 
+        # METR-gap behavioural detectors (ant.md P0 #3, P1 #6, P1 #7). Each
+        # carries per-session window/cooldown/stage state, so it is built per
+        # session exactly like the engines above.
+        self._cot_realism[session.session_id] = CoTRealismDivergenceDetector(
+            session.session_id
+        )
+        self._identity_chain[session.session_id] = IdentityBootstrapDetector(
+            session.session_id
+        )
+        self._continuation_risk[session.session_id] = ContinuationRiskTracker(
+            session.session_id
+        )
+
         # Threat-detection rule engine
         self._detectors[session.session_id] = DetectionEngine(
             session.session_id,
@@ -705,6 +750,14 @@ class AgentTraceDaemon:
         # not re-flagged as new after restarts.
         baseline = self._ledger.get_destination_baseline(config.workspace_path)
         policy.add_known_destinations(baseline)
+
+        # 3b. Environment attestation (ant.md P1 #5): a session that DECLARES
+        # isolation gets a pre-flight proof recorded in the ledger before any
+        # observation starts. All four Anthropic incidents began with an
+        # environment declared isolated that was in fact connected; the
+        # declaration is what makes the claim checkable, so only declaring
+        # sessions are probed.
+        await self._attest_environment(session.session_id, config)
 
         # 4. Generate Baseline Graph & Persist Nodes
         baseline_gen = BaselineGenerator(session.session_id, config.workspace_path)
@@ -940,6 +993,11 @@ class AgentTraceDaemon:
         # Actor-identity memory: late large writes in a closing session
         # become dossier candidates for cross-session correlation (#2).
         self._actor_graph.close_session(session_id, session.stopped_at)
+        # Per-session behavioural detector state is meaningless once the
+        # session is closed; dropping it also bounds daemon memory.
+        self._cot_realism.pop(session_id, None)
+        self._identity_chain.pop(session_id, None)
+        self._continuation_risk.pop(session_id, None)
         logger.info("Session %s stopped", session_id)
 
     def register_session_pid(self, session_id: UUID, pid: int) -> bool:
@@ -1289,6 +1347,40 @@ class AgentTraceDaemon:
             ):
                 await self.ingest_event(incident)
 
+        # 5b-10. CoT realism divergence (ant.md P0 #3, "biased reasoning"):
+        # reasoning that asserts a simulated / not-real environment while the
+        # observed evidence says otherwise, or that diverges from the action
+        # taken next.
+        cot_engine = self._cot_realism.get(event.session_id)
+        if cot_engine and not isinstance(event, IncidentEvent):
+            for incident in await self._safe_observe(
+                "cot_realism", event, lambda: cot_engine.observe(event)
+            ):
+                await self.ingest_event(incident)
+
+        # 5b-11. Identity-bootstrap chain (ant.md P1 #6): the Mythos-5
+        # composite — payment-processor / crypto / phone / disposable-email
+        # steps converging on a registry account. No single step is
+        # incriminating; the ordered chain is.
+        identity_engine = self._identity_chain.get(event.session_id)
+        if identity_engine and not isinstance(event, IncidentEvent):
+            for incident in await self._safe_observe(
+                "identity_chain", event, lambda: identity_engine.observe(event)
+            ):
+                await self.ingest_event(incident)
+
+        # 5b-12. Correlated-continuation risk (ant.md P1 #7): how often a
+        # realism signal is followed by continued risky action instead of a
+        # stop — the metric behind "stopping eventually is not stopping now".
+        continuation_engine = self._continuation_risk.get(event.session_id)
+        if continuation_engine and not isinstance(event, IncidentEvent):
+            for incident in await self._safe_observe(
+                "continuation_risk",
+                event,
+                lambda: continuation_engine.observe(event),
+            ):
+                await self.ingest_event(incident)
+
         # R2: response ladder — any critical incident reaching the pipeline
         # (created live, restored, or injected) freezes the session.
         if isinstance(event, IncidentEvent) and event.severity == "critical":
@@ -1548,6 +1640,74 @@ class AgentTraceDaemon:
             self._ledger.append_event(containment)
         except Exception:
             logger.warning("Could not record containment finding", exc_info=True)
+
+    async def _attest_environment(
+        self, session_id: UUID, config: SessionConfig
+    ) -> None:
+        """Pre-flight the declared environment boundary; record the verdict.
+
+        Runs only for sessions that DECLARE isolation
+        (``internet_access_allowed is False``). All four Anthropic incidents
+        began with an environment declared isolated that was in fact
+        connected, so the declaration is precisely what makes the claim
+        checkable — an unclaimed boundary has nothing to verify.
+
+        The probes are blocking (a UDP DNS canary plus ``ipconfig``/``route``),
+        so they are pushed off the event loop, the same discipline the
+        baseline generator uses. A probe failure is itself a verdict
+        (``unverifiable``, fail-closed) rather than an exception that would
+        abort session creation.
+        """
+        if config.internet_access_allowed is not False:
+            return
+        contract = EnvironmentContract(
+            internet_access_allowed=False,
+            allowed_destinations=tuple(config.allowed_destinations),
+        )
+        try:
+            result = await asyncio.to_thread(self._attester.preflight, contract)
+        except Exception:
+            logger.warning(
+                "Environment attestation probe failed for session %s",
+                session_id,
+                exc_info=True,
+            )
+            return
+        # A sealed contract that measured reachable egress is the exact
+        # misconfiguration shape from the report: it must be loud, not a
+        # low-severity note.
+        severity = "critical" if result.verdict == "isolation_broken" else "low"
+        with contextlib.suppress(Exception):
+            self._ledger.append_event(PolicyFindingEvent(
+                session_id=session_id,
+                actor_id="daemon",
+                source_adapter="environment_attestation",
+                confidence=ConfidenceLevel.HIGH,
+                finding_type="environment_attestation",
+                severity=severity,
+                description=(
+                    f"Pre-flight environment attestation: {result.verdict}. "
+                    + " ".join(result.reasons)
+                ),
+                evidence_refs=[],
+                payload=result.to_payload(),
+            ))
+
+    def retro_scan(
+        self,
+        *,
+        session_ids: list[UUID] | None = None,
+        exhaustive: bool = False,
+    ) -> RetroScanReport:
+        """Re-run the detector arsenal over stored history (ant.md P1 #4).
+
+        The report's own agentic search missed a transcript; the answer is a
+        repeatable two-stage wide-net re-scan over the ledger. Pull-based and
+        read-only, so it is safe to invoke while the daemon is live.
+        """
+        return self._retro_scan.scan(
+            session_ids=session_ids, exhaustive=exhaustive
+        )
 
     async def _scan_collusion(self, session_id: UUID) -> None:
         """Cross-session collusion scan (R3), throttled to every 5s per session.

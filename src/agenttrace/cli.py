@@ -15,6 +15,7 @@ Commands:
   agenttrace verify <session-id>
   agenttrace report <session-id> [--output <file>]
   agenttrace incidents <session-id>
+  agenttrace rescan [--session <id>] [--exhaustive] [--json]
   agenttrace shield check|run|install <session-id> <command...>
 """
 
@@ -63,12 +64,17 @@ def _read_token() -> str:
 
 
 def _call_api(
-    endpoint: str, method: str = "GET", data: dict[str, Any] | None = None
+    endpoint: str,
+    method: str = "GET",
+    data: dict[str, Any] | None = None,
+    timeout: float = 5.0,
 ) -> dict[str, Any] | list[Any]:
     """Call the local daemon API; raise ApiError on any failure.
 
     The daemon is the single writer of the ledger: there is intentionally no
     direct-storage fallback, so a failed call can never masquerade as success.
+    ``timeout`` is a parameter because a few endpoints (retro-scan) do
+    ledger-wide work that legitimately exceeds the interactive default.
     """
     url = f"{_api_url()}{endpoint}"
     req = urllib.request.Request(url, method=method)
@@ -79,7 +85,7 @@ def _call_api(
     body = json.dumps(data).encode("utf-8") if data else None
 
     try:
-        with urllib.request.urlopen(req, data=body, timeout=5.0) as resp:  # noqa: S310 (loopback only)
+        with urllib.request.urlopen(req, data=body, timeout=timeout) as resp:  # noqa: S310 (loopback only)
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = ""
@@ -632,6 +638,59 @@ def verify(session_id: str) -> None:
             title="🛡 Forensic Integrity Alert",
             border_style="red",
         ))
+
+
+@main.command()
+@click.option(
+    "--session",
+    "session_id",
+    default=None,
+    help="Limit the scan to a single session id (default: every stored session).",
+)
+@click.option(
+    "--exhaustive",
+    is_flag=True,
+    help="Replay stage 2 for every session, not only those with stage-1 hits.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the raw report as JSON.")
+def rescan(session_id: str | None, exhaustive: bool, as_json: bool) -> None:
+    """Re-run the detector arsenal over stored history (ant.md P1 #4).
+
+    Detectors normally only run forward. A wide-net retro-scan re-screens the
+    ledger with the CURRENT arsenal, so a newly added detector can flag
+    sessions that predate it — the failure mode the Anthropic report hit when
+    its own agentic transcript search missed an incident.
+    """
+    payload: dict[str, Any] = {"exhaustive": exhaustive}
+    if session_id:
+        payload["session_ids"] = [str(UUID(session_id))]
+    try:
+        res = _call_api("/rescan", method="POST", data=payload, timeout=600.0)
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(res, dict):
+        console.print("[red]Unexpected API response[/red]")
+        return
+    if as_json:
+        console.print_json(json.dumps(res, indent=2))
+        return
+
+    body = (
+        f"Sessions scanned:            {res.get('sessions_scanned', 0)}\n"
+        f"Events scanned:              {res.get('events_scanned', 0)}\n"
+        f"Stage 1 (wide net) hits:     {res.get('stage1_hits', 0)}\n"
+        f"Sessions replayed (stage 2): {len(res.get('sessions_stage2', []))}\n"
+        f"Retro incidents:             {res.get('retro_incidents', 0)}"
+    )
+    errors = res.get("errors") or []
+    if errors:
+        body += f"\nErrors:                      {'; '.join(errors[:5])}"
+    console.print(Panel(
+        body,
+        title="🔎 Ledger retro-scan (two-stage wide net)",
+        border_style="cyan",
+    ))
 
 
 @main.command()

@@ -244,6 +244,13 @@ class ReviewRunRequest(BaseModel):
     max_iterations: int = Field(default=3, ge=1, le=5)
 
 
+class RescanRequest(BaseModel):
+    """Scope for a ledger retro-scan (ant.md P1 #4)."""
+
+    session_ids: list[UUID] | None = None
+    exhaustive: bool = False
+
+
 # -- Pagination & collection bounds (plan2.md P2.2/P2.3) -----------------------
 
 # Every collection endpoint serves at most this many items per request. The
@@ -1105,6 +1112,33 @@ async def get_collusion(
     candidates = engine.for_session(session_id)
     response.headers["X-Total-Count"] = str(len(candidates))
     return [c.to_dict() for c in _page_slice(candidates, page_limit, page_offset)]
+
+
+@app.post("/rescan")
+def rescan_ledger(req: RescanRequest | None = None) -> dict[str, Any]:
+    """Re-run the detector arsenal over stored history (ant.md P1 #4).
+
+    The report's own agentic transcript search missed an incident; the answer
+    is a two-stage wide-net re-scan that is repeatable offline. Declared
+    ``def`` rather than ``async def`` on purpose: FastAPI then runs it on the
+    worker threadpool, because a retro-scan re-reads and decrypts stored
+    history and would otherwise stall the event loop (and every observer and
+    adapter poll) for seconds. Read-only over the ledger, so it is safe while
+    the daemon is live.
+    """
+    body = req or RescanRequest()
+    report = daemon.retro_scan(
+        session_ids=body.session_ids, exhaustive=body.exhaustive
+    )
+    return {
+        "sessions_scanned": report.sessions_scanned,
+        "events_scanned": report.events_scanned,
+        "stage1_hits": len(report.stage1_hits),
+        "sessions_stage2": [str(s) for s in report.sessions_stage2],
+        "retro_incidents": len(report.retro_incidents),
+        "errors": list(report.errors),
+        "summary": report.summary(),
+    }
 
 
 @app.get("/sessions/{session_id}/compliance")

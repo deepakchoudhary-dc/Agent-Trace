@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 # Ensure src/ is on sys.path
@@ -14,6 +15,31 @@ if src_dir not in sys.path:
 from agenttrace.security.isolation import IsolationResult  # noqa: E402
 
 _PYTHON_ALIASES = {"python", "python3", "py"}
+
+
+def _console_script_path(name: str) -> str | None:
+    """Resolve a bare console-script name against the ACTIVE environment.
+
+    ``Path(sys.executable).parent`` only holds the scripts when the
+    interpreter is a venv interpreter (``<env>/Scripts/python.exe``). CI
+    installs into the system interpreter, whose executable sits in the
+    install root while the scripts sit in ``<prefix>/Scripts`` — so the
+    old lookup returned ``None`` on every runner and silently degraded to
+    a bare name, which only works while the child inherits a PATH that
+    contains the scripts directory. Same rule as
+    ``graph.replay._venv_bin_dir``.
+    """
+    candidates = [
+        sysconfig.get_path("scripts"),
+        str(Path(sys.prefix) / ("Scripts" if os.name == "nt" else "bin")),
+    ]
+    for directory in candidates:
+        if not directory:
+            continue
+        found = shutil.which(name, path=directory)
+        if found:
+            return found
+    return None
 
 
 class HostIsolationStub:
@@ -49,7 +75,7 @@ class HostIsolationStub:
             # resolve explicitly so tests behave identically on both.
             resolved = list(argv)
             if os.name == "nt" and not Path(argv[0]).suffix:
-                which = shutil.which(argv[0], path=str(Path(sys.executable).parent))
+                which = _console_script_path(argv[0])
                 if which:
                     resolved = [which, *argv[1:]]
         proc = subprocess.run(  # noqa: S603
