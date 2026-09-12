@@ -87,7 +87,7 @@ class EnvironmentMeasurement:
 class AttestationResult:
     """Declared-vs-measured verdict, sealed and session-bound."""
 
-    verdict: str  # isolated_verified | isolation_broken | unverifiable
+    verdict: str  # isolated_verified | isolation_broken | unverifiable | unsealed_recorded
     contract: EnvironmentContract
     measurement: EnvironmentMeasurement | None
     reasons: tuple[str, ...]
@@ -247,7 +247,6 @@ class EnvironmentAttester:
         if not contract.sealed:
             reasons.append("contract declares internet access allowed; "
                            "attestation records the measured boundary for provenance")
-            verdict = "isolated_verified"  # N/A — nothing claimed to verify
             verdict = "unsealed_recorded"
         elif canary_reachable:
             verdict = "isolation_broken"
