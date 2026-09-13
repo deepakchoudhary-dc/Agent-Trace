@@ -9,6 +9,7 @@ import {
   Clock,
   AlertTriangle,
   FileCode,
+  FileSearch,
   Repeat,
   Radio,
   ChevronDown,
@@ -33,6 +34,7 @@ const TABS = [
   { id: 'graph', label: 'Context Graph', icon: GitGraph },
   { id: 'timeline', label: 'Timeline & Actors', icon: Clock },
   { id: 'incidents', label: 'Incidents & Policy', icon: AlertTriangle },
+  { id: 'audit', label: 'Audit & Verification', icon: FileSearch },
   { id: 'review_loop', label: 'Review Loop', icon: Repeat },
   { id: 'diff', label: 'Diff & Blast Radius', icon: FileCode },
 ];

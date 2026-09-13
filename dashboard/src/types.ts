@@ -279,3 +279,141 @@ export interface ReviewRunRecord {
   created_at: string;
   payload: ReviewRunData;
 }
+
+// -- ant.md P2 #8: compliance evidence manifest (EU AI Act / ISO 42001 / SOC 2) --
+
+export interface ComplianceBundle {
+  bundle_id: string;
+  session_id: string;
+  workspace_path: string;
+  generated_at: string;
+  event_count: number;
+  findings_count: number;
+  incidents_count: number;
+  approvals_count: number;
+  integrity: {
+    chain_verified: boolean;
+    chain_error: string;
+    head_event_hash: string;
+  };
+  frameworks: Record<string, unknown>;
+  report_signature_sha256: string;
+}
+
+// -- ant.md P1 #4: retro-scan report (two-stage wide-net re-scan) --
+
+export interface RetroScanResponse {
+  sessions_scanned: number;
+  events_scanned: number;
+  stage1_hits: number;
+  sessions_stage2: string[];
+  retro_incidents: number;
+  errors: string[];
+  summary: string;
+  threshold: string;
+  calibration: Record<string, unknown>;
+  negative_result: Record<string, unknown>;
+}
+
+// -- Correlated multi-stage incidents --
+
+export interface IncidentSummary {
+  incident_id: string;
+  session_id: string;
+  incident_type: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  description: string;
+  evidence_event_ids: string[];
+  timestamp: string;
+}
+
+// -- Operator briefing (real GET /sessions/{id}/brief payload) --
+
+export interface BriefAttentionItem {
+  finding_type: string;
+  severity: string;
+  description: string;
+  recommended_action: string;
+}
+
+export interface OpenApprovalSummary {
+  finding_id: string;
+  scope: string;
+  expiry: string;
+}
+
+export interface SessionBrief {
+  session_id: string;
+  status: string;
+  total_findings: number;
+  by_severity: Record<string, number>;
+  by_type: Record<string, number>;
+  attention: BriefAttentionItem[];
+  open_approvals: OpenApprovalSummary[];
+  integrity_failures: number;
+  last_activity: string | null;
+}
+
+// -- Coordination signals (real GET /sessions/{id}/collusion payload) --
+// Observable half only: every candidate carries an explicit reasoning gap and
+// never claims coordination itself.
+
+export interface CollusionCandidate {
+  signal: string;
+  session_ids: string[];
+  actors: string[];
+  detail: string;
+  confidence: string;
+  evidence_event_ids: string[];
+  reasoning_gap: string;
+  created_at: string;
+}
+
+// -- Projection MAC verdict (real GET /sessions/{id}/projection/verify) --
+// checked: false means no MAC was ever committed - it is not checked,
+// never a pass.
+
+export interface ProjectionVerdict {
+  checked: boolean;
+  authenticated: boolean;
+  stored_digest: string | null;
+}
+
+// -- Retro-scan (real POST /rescan payload) --
+// Single source of truth: RetroScanResponse above; RetroScanResult kept as a
+// strict alias so both the api-object signature and the standalone helper agree.
+
+export type RetroScanResult = RetroScanResponse;
+
+export type CalibrationPayload = RetroScanResponse['calibration'];
+export type NegativeResultPayload = RetroScanResponse['negative_result'];
+
+// -- Sealed forensic report envelope (real GET /sessions/{id}/report) --
+// The signed manifest also carries the reasoning trail and incidents summary;
+// both are surfaced in the dashboard instead of being dropped.
+
+export interface ReasoningTrailEntry {
+  event_id: string;
+  timestamp: string;
+  kind: string;
+  excerpt: string;
+}
+
+export interface IncidentSummaryEntry {
+  incident_id: string;
+  incident_type: string;
+  severity: string;
+  title: string;
+  related_events: string[];
+}
+
+export interface SignedForensicReport extends ForensicReport {
+  incidents_count: number;
+  reasoning_trail: ReasoningTrailEntry[];
+  incidents_summary: IncidentSummaryEntry[];
+  chain_binding: {
+    chain_tip: string;
+    chain_length: number;
+  };
+  report_signature: string;
+}

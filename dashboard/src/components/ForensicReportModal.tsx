@@ -5,6 +5,7 @@ import {
   ContextGraphData,
   TimelineEvent,
   PolicyFinding,
+  SignedForensicReport,
   VerificationResult,
 } from '../types';
 import {
@@ -33,6 +34,7 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
 }) => {
   const [downloading, setDownloading] = useState(false);
   const [verification, setVerification] = useState<VerificationResult | null>(null);
+  const [signedReport, setSignedReport] = useState<SignedForensicReport | null>(null);
   const [verifying, setVerifying] = useState(true);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -49,6 +51,7 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
     let active = true;
     if (session?.session_id) {
       setVerifying(true);
+      setSignedReport(null);
       api
         .verifyChain(session.session_id)
         .then((res) => {
@@ -63,6 +66,18 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
               event_count: timeline.length,
               last_event_hash: timeline.length > 0 ? timeline[timeline.length - 1].event_hash : '',
             });
+          }
+        })
+        // The signed envelope (reasoning trail + incidents) is part of the
+        // report contract; fetch it alongside the chain verdict. Failure leaves
+        // the state null — the modal renders the honest "unavailable" gap
+        // instead of a synthetic placeholder.
+        .then(async () => {
+          try {
+            const report = await api.getSignedForensicReport(session.session_id);
+            if (active) setSignedReport(report);
+          } catch {
+            if (active) setSignedReport(null);
           }
         })
         .finally(() => {
@@ -116,6 +131,27 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
         event_hash: e.event_hash,
         prev_hash: e.prev_hash,
       })),
+      // Server-generated signed envelope: HMAC chain-anchored fields straight
+      // from GET /sessions/{id}/report. Null when the envelope could not be
+      // fetched — the export then honestly lacks the signature instead of
+      // carrying a fabricated one.
+      signed_report: signedReport
+        ? {
+            report_id: signedReport.report_id,
+            generated_at: signedReport.generated_at,
+            integrity_status: signedReport.integrity_status,
+            integrity_error: signedReport.integrity_error || null,
+            head_event_hash: signedReport.head_event_hash,
+            event_count: signedReport.event_count,
+            findings_count: signedReport.findings_count,
+            approvals_count: signedReport.approvals_count,
+            incidents_count: signedReport.incidents_count,
+            report_signature_sha256: signedReport.report_signature_sha256,
+            chain_binding: signedReport.chain_binding,
+            incidents_summary: signedReport.incidents_summary,
+            reasoning_trail: signedReport.reasoning_trail,
+          }
+        : null,
     };
 
     const blob = new Blob([JSON.stringify(reportData, null, 2)], { type: 'application/json' });
@@ -226,6 +262,66 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
             </p>
           )}
         </div>
+
+        {/* Incidents summary — from the server's signed report, not client-side */}
+        {signedReport && signedReport.incidents_summary.length > 0 && (
+          <div className="flex-col" style={{ gap: '6px' }}>
+            <label style={{ fontSize: '11px', fontWeight: 550, color: 'var(--text-muted)' }}>
+              Incidents ({signedReport.incidents_count})
+            </label>
+            {signedReport.incidents_summary.map((inc) => (
+              <div key={inc.incident_id} className="card" style={{ padding: '8px 10px', fontSize: '11px' }}>
+                <div className="flex-between">
+                  <span className={`badge badge-${inc.severity === 'critical' ? 'critical' : inc.severity === 'high' ? 'high' : inc.severity === 'low' ? 'low' : 'medium'}`}>
+                    {inc.incident_type}
+                  </span>
+                  <span className="font-mono" style={{ fontSize: '9.5px', color: 'var(--text-dim)' }}>
+                    {inc.related_events.length} linked event(s)
+                  </span>
+                </div>
+                <div style={{ marginTop: '4px', color: '#e4e4e7' }}>{inc.title}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Reasoning trail — the model's own captured thinking around risky
+            actions. Rendered verbatim from the signed envelope; the server
+            already redacts excerpts through the write-boundary redactor. */}
+        {signedReport && signedReport.reasoning_trail.length > 0 && (
+          <div className="flex-col" style={{ gap: '6px' }}>
+            <label style={{ fontSize: '11px', fontWeight: 550, color: 'var(--text-muted)' }}>
+              Reasoning Trail ({signedReport.reasoning_trail.length})
+            </label>
+            {signedReport.reasoning_trail.map((r) => (
+              <div key={r.event_id} className="card" style={{ padding: '8px 10px' }}>
+                <div className="flex-between" style={{ marginBottom: '3px' }}>
+                  <span className="badge badge-medium">{r.kind}</span>
+                  <span className="font-mono" style={{ fontSize: '9.5px', color: 'var(--text-dim)' }}>
+                    {new Date(r.timestamp).toLocaleString()}
+                  </span>
+                </div>
+                <div className="font-mono" style={{ fontSize: '10px', color: '#d4d4d8', whiteSpace: 'pre-wrap' }}>
+                  {r.excerpt}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {signedReport && signedReport.reasoning_trail.length === 0 && (
+          <p style={{ fontSize: '10.5px', color: 'var(--text-dim)' }}>
+            No context-boundary reasoning was captured for this session — the gap is stated, not filled.
+          </p>
+        )}
+
+        {signedReport && (
+          <p className="font-mono" style={{ fontSize: '9.5px', color: 'var(--text-dim)', wordBreak: 'break-all' }}>
+            signature: {signedReport.report_signature_sha256}
+            <br />
+            chain binding: tip {signedReport.chain_binding.chain_tip.slice(0, 24)}… · len {signedReport.chain_binding.chain_length}
+          </p>
+        )}
 
         {/* Action Buttons */}
         <div className="flex" style={{ justifyContent: 'flex-end', gap: '10px', marginTop: '6px' }}>

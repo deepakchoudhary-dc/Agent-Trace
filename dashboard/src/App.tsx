@@ -8,6 +8,12 @@ import {
   GraphNode,
   EvidencePath,
   BlastRadiusResult,
+  ComplianceBundle,
+  CollusionCandidate,
+  IncidentSummary,
+  ProjectionVerdict,
+  RetroScanResponse,
+  SessionBrief,
 } from './types';
 import { Navbar } from './components/Navbar';
 import { GraphView } from './components/GraphView';
@@ -18,6 +24,7 @@ import { ReviewLoopView } from './components/ReviewLoopView';
 import { ApprovalGateModal } from './components/ApprovalGateModal';
 import { ForensicReportModal } from './components/ForensicReportModal';
 import { ObservabilityGapsBanner } from './components/ObservabilityGapsBanner';
+import { AuditPanel } from './components/AuditPanel';
 import { AlertCircle, RefreshCw, X } from 'lucide-react';
 
 const LoadingShell: React.FC = () => (
@@ -44,6 +51,14 @@ export const App: React.FC = () => {
   const [findings, setFindings] = useState<PolicyFinding[]>([]);
   const [causalPaths, setCausalPaths] = useState<EvidencePath[]>([]);
   const [blastRadius, setBlastRadius] = useState<BlastRadiusResult | null>(null);
+  // Audit plane (brief / incidents / collusion / retro-scan / compliance manifest)
+  const [brief, setBrief] = useState<SessionBrief | null>(null);
+  const [incidents, setIncidents] = useState<IncidentSummary[]>([]);
+  const [collusion, setCollusion] = useState<CollusionCandidate[]>([]);
+  const [retroScan, setRetroScan] = useState<RetroScanResponse | null>(null);
+  const [retroScanning, setRetroScanning] = useState<boolean>(false);
+  const [compliance, setCompliance] = useState<ComplianceBundle | null>(null);
+  const [projection, setProjection] = useState<ProjectionVerdict | null>(null);
 
   const [activeTab, setActiveTab] = useState<string>('graph');
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -98,10 +113,14 @@ export const App: React.FC = () => {
     setConnectionError('');
 
     try {
-      const [graph, time, fnd] = await Promise.all([
+      const [graph, time, fnd, briefData, incData, colData, projData] = await Promise.all([
         api.getGraph(sessionId),
         api.getTimeline(sessionId),
         api.getFindings(sessionId),
+        api.getSessionBrief(sessionId),
+        api.getIncidents(sessionId),
+        api.getCollusion(sessionId),
+        api.getProjectionVerdict(sessionId),
       ]);
 
       // Guard against stale asynchronous response
@@ -111,6 +130,10 @@ export const App: React.FC = () => {
       setGraphData(graph);
       setTimeline(time);
       setFindings(fnd);
+      setBrief(briefData);
+      setIncidents(incData);
+      setCollusion(colData);
+      setProjection(projData);
 
       // Causal & blast radius for selected or first node
       const targetNodeId = selectedNode?.node_id || (graph.nodes.length > 0 ? graph.nodes[0].node_id : null);
@@ -136,6 +159,12 @@ export const App: React.FC = () => {
         setFindings([]);
         setCausalPaths([]);
         setBlastRadius(null);
+        setBrief(null);
+        setIncidents([]);
+        setCollusion([]);
+        setRetroScan(null);
+        setCompliance(null);
+        setProjection(null);
         setConnectionError(err instanceof Error ? err.message : 'UNVERIFIED — daemon unreachable');
       }
     } finally {
@@ -228,6 +257,41 @@ export const App: React.FC = () => {
     }
   };
 
+  // Retro-scan (ant.md P1 #4): re-run the two-stage wide-net detector sweep
+  // over stored history. Real POST /rescan — never client-side synthesis.
+  const handleRunRetroScan = useCallback(async () => {
+    if (!currentSession || retroScanning) return;
+    setRetroScanning(true);
+    try {
+      const res = await api.runRetroScan([currentSession.session_id], false);
+      setRetroScan(res);
+    } catch {
+      setRetroScan(null);
+    } finally {
+      setRetroScanning(false);
+    }
+  }, [currentSession, retroScanning]);
+
+  // ant.md P2 #8: fetch the compliance evidence manifest from the real
+  // GET /sessions/{id}/compliance route. Failure surfaces as "null" (panel
+  // shows the honest "not generated" state), never synthetic data.
+  useEffect(() => {
+    let active = true;
+    const sid = currentSession?.session_id;
+    if (!sid) return;
+    api
+      .getComplianceBundle(sid)
+      .then((bundle) => {
+        if (active) setCompliance(bundle);
+      })
+      .catch(() => {
+        if (active) setCompliance(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [currentSession?.session_id]);
+
   const showInitialSkeleton = loading && sessions.length === 0 && !connectionError;
 
   return (
@@ -243,6 +307,9 @@ export const App: React.FC = () => {
           // newly selected session's views.
           setCausalPaths([]);
           setBlastRadius(null);
+          // Stale compliance/retro-scan data must not leak into the new session.
+          setCompliance(null);
+          setRetroScan(null);
         }}
         activeTab={activeTab}
         onTabChange={setActiveTab}
@@ -337,6 +404,21 @@ export const App: React.FC = () => {
 
             {activeTab === 'diff' && (
               <DiffPanel sessionId={currentSession?.session_id} blastRadius={blastRadius} />
+            )}
+
+            {activeTab === 'audit' && (
+              <AuditPanel
+                brief={brief}
+                incidents={incidents}
+                collusion={collusion}
+                retroScan={retroScan}
+                retroScanning={retroScanning}
+                compliance={compliance}
+                findings={findings}
+                projection={projection}
+                unverified={!dataVerified}
+                onRunRetroScan={() => void handleRunRetroScan()}
+              />
             )}
           </>
         )}

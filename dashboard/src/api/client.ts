@@ -5,14 +5,21 @@
 
 import {
   BlastRadiusResult,
+  CollusionCandidate,
+  ComplianceBundle,
   ContextGraphData,
   DiffItem,
   EvidencePath,
   ForensicReport,
+  IncidentSummary,
   PolicyFinding,
+  ProjectionVerdict,
+  RetroScanResponse,
   ReviewRunData,
   ReviewRunRecord,
+  SessionBrief,
   SessionInfo,
+  SignedForensicReport,
   TimelineEvent,
   VerificationResult,
 } from '../types';
@@ -47,8 +54,10 @@ export function getApiToken(): string | null {
 
 export function setApiToken(token: string): void {
   if (typeof window !== 'undefined') {
+    // Session-scoped only. A daemon token must not outlive the tab it was
+    // issued for; localStorage persistence would leave a live credential
+    // readable by any same-origin script after the operator walks away.
     sessionStorage.setItem('agenttrace_token', token);
-    localStorage.setItem('agenttrace_token', token);
   }
 }
 
@@ -82,6 +91,45 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
     }
 
     return (await res.json()) as T;
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      throw err;
+    }
+    throw new Error(
+      `AgentTrace daemon unreachable at ${apiBase}. Ensure daemon is running.`,
+      { cause: err }
+    );
+  }
+}
+
+async function requestWithCount<T>(endpoint: string): Promise<{ items: T; total: number }> {
+  const apiBase = getApiBase();
+  const token = getApiToken();
+  const url = `${apiBase}${endpoint}`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(token ? { 'X-AgentTrace-Token': token } : {}),
+  };
+
+  try {
+    const res = await fetch(url, { headers });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new ApiError(res.status, errBody.detail || `Request failed with status ${res.status}`);
+    }
+    const items = (await res.json()) as T;
+    // Prefer the server's total count header; fall back to page length only
+    // when the header is absent. (The old one-liner's precedence silently
+    // discarded the header — the pagination total lied.)
+    const totalHeader = res.headers.get('X-Total-Count');
+    const total =
+      totalHeader !== null
+        ? Number(totalHeader)
+        : Array.isArray(items)
+          ? (items as unknown[]).length
+          : 0;
+    return { items, total: Number.isFinite(total) ? total : (items as unknown[]).length };
   } catch (err: unknown) {
     if (err instanceof ApiError) {
       throw err;
@@ -205,5 +253,45 @@ export const api = {
 
   async getReviewRun(sessionId: string): Promise<ReviewRunRecord> {
     return request<ReviewRunRecord>(`/sessions/${sessionId}/review`);
+  },
+
+  // -- ant.md P2 #8: verifiable compliance evidence manifest (EU AI Act / ISO 42001 / SOC 2) --
+  async getComplianceBundle(sessionId: string): Promise<ComplianceBundle> {
+    return request<ComplianceBundle>(`/sessions/${sessionId}/compliance`);
+  },
+
+  // -- ant.md P1 #4: two-stage wide-net retro-scan over stored history --
+  async runRetroScan(sessionIds?: string[], exhaustive = false): Promise<RetroScanResponse> {
+    return request<RetroScanResponse>('/rescan', {
+      method: 'POST',
+      body: JSON.stringify({ session_ids: sessionIds, exhaustive }),
+    });
+  },
+
+  // -- Collusion correlation: observable coordination half only --
+  async getCollusion(sessionId: string): Promise<CollusionCandidate[]> {
+    const { items } = await requestWithCount<CollusionCandidate[]>(`/sessions/${sessionId}/collusion`);
+    return items;
+  },
+
+  // -- Multi-stage correlated incidents (evidence-backed) --
+  async getIncidents(sessionId: string): Promise<IncidentSummary[]> {
+    const { items } = await requestWithCount<IncidentSummary[]>(`/sessions/${sessionId}/incidents`);
+    return items;
+  },
+
+  // -- Operator briefing: what happened, what needs attention --
+  async getSessionBrief(sessionId: string): Promise<SessionBrief> {
+    return request<SessionBrief>(`/sessions/${sessionId}/brief`);
+  },
+
+  // -- Projection MAC verdict: checked:false means never committed, not a pass --
+  async getProjectionVerdict(sessionId: string): Promise<ProjectionVerdict> {
+    return request<ProjectionVerdict>(`/sessions/${sessionId}/projection/verify`);
+  },
+
+  // -- Sealed, chain-bound forensic report (incl. reasoning trail + incidents) --
+  async getSignedForensicReport(sessionId: string): Promise<SignedForensicReport> {
+    return request<SignedForensicReport>(`/sessions/${sessionId}/report`);
   },
 };
