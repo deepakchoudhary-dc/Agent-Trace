@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 if TYPE_CHECKING:
     from agenttrace.graph.retro_scan import RetroScanReport
 
+from agenttrace.security.affected_parties import extract_affected_parties
 from agenttrace.security.compliance import build_compliance_bundle
 from agenttrace.security.report_auth import (
     chain_binding_block,
@@ -105,6 +106,13 @@ def build_safety_case(
                 ),
             }
         ),
+        # Affected-third-parties enumeration (ant.md P2 #9): the external
+        # hosts/systems this session touched, anchored to chain hashes —
+        # the "we have notified all affected parties" list, generated
+        # offline from the ledger with its extraction limits stated.
+        "affected_third_parties": extract_affected_parties(
+            {session_id: events}
+        ).to_payload(),
         "compliance_bundle": compliance,
         "coverage_boundary": {
             "covers": [
@@ -112,6 +120,7 @@ def build_safety_case(
                 "policy findings, approvals, correlated incidents",
                 "detector verdicts over stored history",
                 "declared-vs-measured environment state",
+                "external third parties evidenced in the ledger",
             ],
             "does_not_cover": [
                 "model internals (reasoning is only observable where the adapter captured it)",

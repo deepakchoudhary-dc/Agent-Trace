@@ -765,6 +765,62 @@ def safety_case(session_id: str, as_json: bool) -> None:
 
 
 @main.command()
+@click.argument("session_ids", metavar="[SESSION_IDS]...", required=False, nargs=-1)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit the full affected-parties report as JSON.",
+)
+def affected_parties(session_ids: tuple[str, ...], as_json: bool) -> None:
+    """Enumerate external third parties the sessions touched (ant.md P2 #9).
+
+    The notification list behind "we have notified all affected parties":
+    hosts/systems observed via kernel network events or claimed in command
+    text, each anchored to chain hashes of the observing events. With no
+    arguments, every stored session is included.
+    """
+    try:
+        ids = [str(UUID(s)) for s in session_ids]
+    except ValueError as e:
+        console.print(f"[red]Invalid session id: {e}[/red]")
+        return
+    query = f"?session_ids={','.join(ids)}" if ids else ""
+    try:
+        res = _call_api(f"/affected-parties{query}", timeout=600.0)
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(res, dict):
+        console.print("[red]Unexpected API response[/red]")
+        return
+    if as_json:
+        console.print_json(json.dumps(res, indent=2))
+        return
+
+    parties = res.get("parties", [])
+    body = f"Sessions covered:          {len(res.get('session_ids', []))}\n"
+    body += f"External parties found:    {res.get('party_count', 0)}\n"
+    for p in parties[:20]:
+        ident = p.get("identifier", "")
+        port = p.get("port")
+        body += (
+            f"  - {ident}" + (f":{port}" if port else "")
+            + f"  [{p.get('kind', '')}, {len(p.get('sessions', []))} session(s),"
+            f" {len(p.get('evidence_refs', []))} evidence hash(es)]\n"
+        )
+    if len(parties) > 20:
+        body += f"  … and {len(parties) - 20} more (use --json for the full list)\n"
+    console.print(Panel(
+        body,
+        title="🌐 Affected third parties (offline, chain-anchored)",
+        border_style="cyan",
+    ))
+    for limit in res.get("extraction_limits", []):
+        console.print(f"[dim]Limit: {limit}[/dim]")
+
+
+@main.command()
 @click.argument("session_id")
 def brief(session_id: str) -> None:
     """Operator briefing: what happened and what needs your attention."""

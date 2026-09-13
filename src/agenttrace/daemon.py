@@ -91,6 +91,10 @@ from agenttrace.security.detectors import (
 from agenttrace.security.encryption import EncryptionManager
 from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.redaction import SecretRedactor
+from agenttrace.security.safeguard_context import (
+    build_safeguard_context_payload,
+    emit_safeguard_context,
+)
 from agenttrace.storage.blob_store import BlobStore
 from agenttrace.storage.ledger import EventLedger, LedgerError
 
@@ -123,6 +127,15 @@ _SCOPE_IMMUNE_HITS = frozenset({
     "credential_read_heuristic",
     "credential_access_drift",
 })
+
+
+def _escape_boundary_paths(contract: TaskContract) -> list[str] | None:
+    """Containment-escape boundary: the tighter declared scope when the
+    contract supplies one, otherwise None (the detector falls back to the
+    workspace root)."""
+    if contract.allowed_paths and contract.allowed_paths != ["*"]:
+        return list(contract.allowed_paths)
+    return None
 
 
 def _over_broad_scope_entries(paths: list[str]) -> list[str]:
@@ -390,8 +403,8 @@ class AgentTraceDaemon:
                         sid,
                         workspace_root=config.workspace_path,
                         allowed_paths=(
-                            contract.allowed_paths
-                            if contract is not None and contract.allowed_paths
+                            _escape_boundary_paths(contract)
+                            if contract is not None
                             else None
                         ),
                     )
@@ -754,6 +767,15 @@ class AgentTraceDaemon:
         self._continuation_risk[session.session_id] = ContinuationRiskTracker(
             session.session_id
         )
+        # Containment-escape lineage (Bengio 2026): sim framing chained to a
+        # mutation outside the declared boundary. Built here for LIVE
+        # sessions — this was previously only built on the restore path,
+        # which left every freshly created session unscreened.
+        self._containment_escape[session.session_id] = ContainmentEscapeDetector(
+            session.session_id,
+            workspace_root=config.workspace_path,
+            allowed_paths=_escape_boundary_paths(contract),
+        )
 
         # Threat-detection rule engine
         self._detectors[session.session_id] = DetectionEngine(
@@ -767,7 +789,14 @@ class AgentTraceDaemon:
         baseline = self._ledger.get_destination_baseline(config.workspace_path)
         policy.add_known_destinations(baseline)
 
-        # 3b. Environment attestation (ant.md P1 #5): a session that DECLARES
+        # 3b. Safeguard-context metadata (ant.md P2 #11): record WHICH
+        # detectors/monitors/response engines are enabled for this session,
+        # from live daemon state, as an info finding sealed into the chain.
+        # Honest post-hoc analysis requires distinguishing "the detector saw
+        # nothing" from "the detector was not running".
+        self._record_safeguard_context(session.session_id, config)
+
+        # 3c. Environment attestation (ant.md P1 #5): a session that DECLARES
         # isolation gets a pre-flight proof recorded in the ledger before any
         # observation starts. All four Anthropic incidents began with an
         # environment declared isolated that was in fact connected; the
@@ -1669,6 +1698,65 @@ class AgentTraceDaemon:
             self._ledger.append_event(containment)
         except Exception:
             logger.warning("Could not record containment finding", exc_info=True)
+
+    def _record_safeguard_context(
+        self, session_id: UUID, config: SessionConfig
+    ) -> None:
+        """Seal the session's safeguard context into the ledger (ant.md P2 #11).
+
+        Recorded once, close to session start, so the record exists before
+        any finding it may later contextualize. Never raises: a context-
+        recording failure must not break session creation, but it must be
+        loud, because its absence is exactly the gap the feature exists to
+        close.
+        """
+        per_session = {
+            "policy_engine": session_id in self._policies,
+            "task_boundary_engine": session_id in self._boundaries,
+            "incident_correlation": session_id in self._incidents,
+            "covert_channel": session_id in self._covert,
+            "tool_claim_reconciler": session_id in self._reconcilers,
+            "hesitation": session_id in self._hesitations,
+            "eval_integrity": session_id in self._eval_detectors,
+            "cot_realism": session_id in self._cot_realism,
+            "identity_chain": session_id in self._identity_chain,
+            "continuation_risk": session_id in self._continuation_risk,
+            "containment_escape": session_id in self._containment_escape,
+            "detection_rules": session_id in self._detectors,
+        }
+        daemon_wide = {
+            "post_exit_surveillance": True,
+            "credential_loops": True,
+            "coverage_accounting": True,
+            "meta_anomaly": True,
+            "detector_staleness": True,
+            "actor_identity": True,
+            "process_attestation": True,
+            "collusion_correlation": True,
+            "retro_scan": True,
+            "environment_attestation": True,
+        }
+        payload = build_safeguard_context_payload(
+            config=config,
+            per_session_detectors=per_session,
+            daemon_wide_engines=daemon_wide,
+            containment_active=session_id in self._containment,
+            kernel_observer_active=True,
+            auditd_observer_active=sys.platform.startswith("linux"),
+        )
+        event = emit_safeguard_context(
+            session_id=session_id,
+            chain_anchor=self._ledger.get_last_hash(session_id) or None,
+            payload=payload,
+        )
+        try:
+            self._ledger.append_event(event)
+        except Exception:
+            logger.warning(
+                "Could not record safeguard context for session %s",
+                session_id,
+                exc_info=True,
+            )
 
     async def _attest_environment(
         self, session_id: UUID, config: SessionConfig

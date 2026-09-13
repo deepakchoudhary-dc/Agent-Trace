@@ -110,6 +110,54 @@ def test_safety_case_detects_mutation() -> None:
     )
 
 
+def test_safety_case_includes_affected_third_parties() -> None:
+    """The bundle carries the P2 #9 third-party enumeration with its
+    extraction limits, so the notification list is reviewer-ready."""
+    from datetime import datetime, timezone
+
+    from agenttrace.models.events import (
+        CommandEvent,
+        ConfidenceLevel,
+        NetworkEvent,
+    )
+
+    net = NetworkEvent(
+        session_id=_SID,
+        actor_id="agent",
+        source_adapter="network_observer",
+        confidence=ConfidenceLevel.HIGH,
+        destination_ip="93.184.216.34",
+        destination_port=443,
+        protocol="tcp",
+        direction="outbound",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    class _EventLedger(_StubLedger):
+        def query_events(self, session_id, limit=None):
+            return [
+                net,
+                CommandEvent(
+                    session_id=_SID,
+                    actor_id="agent",
+                    source_adapter="sdk",
+                    confidence=ConfidenceLevel.LOW,
+                    command="echo local only",
+                ),
+            ]
+
+    case = build_safety_case(
+        _EventLedger(),
+        _SID,
+        r"C:\work\demo",
+        **_base_kwargs(),  # type: ignore[arg-type]
+    )
+    parties = case["affected_third_parties"]
+    assert parties["party_count"] == 1
+    assert parties["parties"][0]["identifier"] == "93.184.216.34"
+    assert parties["extraction_limits"]
+
+
 def test_safety_case_with_attestation_records_verdict() -> None:
     case = build_safety_case(
         _StubLedger(),

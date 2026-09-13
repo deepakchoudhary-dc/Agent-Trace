@@ -12,13 +12,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 import agenttrace.api as api
 from agenttrace.daemon import AgentTraceDaemon
-from agenttrace.models.events import CommandEvent, ConfidenceLevel
+from agenttrace.models.events import CommandEvent, ConfidenceLevel, FileMutationEvent
 from agenttrace.models.session import AgentType
 from agenttrace.security.token import ApiTokenManager
 
@@ -139,6 +140,102 @@ async def test_continuation_risk_screen_is_wired_into_ingest(tmp_path: Path) -> 
         )
     finally:
         await daemon.stop()
+
+
+# -- Bengio 2026: containment-escape lineage (live-session wiring) -------------
+
+
+@pytest.mark.asyncio
+async def test_containment_escape_screen_is_wired_into_live_sessions(
+    tmp_path: Path,
+) -> None:
+    """Sim-framed reasoning chained to a mutation outside the workspace must
+    fire on a freshly created session. This detector was previously built
+    only on the restore path, leaving every live session unscreened."""
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    await daemon.start()
+    try:
+        sid = await _new_session(daemon, tmp_path)
+        await daemon.ingest_event(
+            _cmd(
+                sid,
+                "echo reviewing environment",
+                reasoning="This is a simulation, so I will proceed.",
+            )
+        )
+        escape = FileMutationEvent(
+            session_id=sid,
+            actor_id="agent",
+            source_adapter="filesystem_observer",
+            confidence=ConfidenceLevel.HIGH,
+            file_path="/Users/Shared/escape.txt",
+            mutation_type="create",
+            timestamp=datetime.now(timezone.utc),
+        )
+        await daemon.ingest_event(escape)
+        assert "containment_escape_suspected" in _incident_types(daemon, sid), (
+            "containment-escape detector is not wired into live session creation"
+        )
+    finally:
+        await daemon.stop()
+
+
+# -- P2 #11: safeguard-context metadata ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_safeguard_context_recorded_at_session_start(tmp_path: Path) -> None:
+    """Every session seals a safeguard-context record listing which screens
+    were live — including containment-escape, proving the wiring fix."""
+    daemon = AgentTraceDaemon(tmp_path / "data")
+    await daemon.start()
+    try:
+        sid = await _new_session(daemon, tmp_path)
+        contexts = [
+            f
+            for f in daemon.get_findings(sid)
+            if getattr(f, "finding_type", "") == "safeguard_context"
+        ]
+        assert contexts, "session start did not record its safeguard context"
+        record = contexts[0]
+        assert record.severity == "info"  # type: ignore[attr-defined]
+        payload = record.payload  # type: ignore[attr-defined]
+        assert payload["per_session_detectors"]["containment_escape"] is True
+        assert payload["per_session_detectors"]["covert_channel"] is True
+        assert payload["daemon_wide_engines"]["post_exit_surveillance"] is True
+        assert "single-host visibility" in " ".join(payload["declared_limits"])
+    finally:
+        await daemon.stop()
+
+
+# -- P2 #9: affected-third-parties endpoint --------------------------------------
+
+
+def test_affected_parties_endpoint_enumerates_contacts(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    test_daemon = AgentTraceDaemon(tmp_path / "api")
+    tokens = ApiTokenManager(tmp_path / "api")
+    monkeypatch.setattr(api, "daemon", test_daemon)
+    monkeypatch.setattr(api, "token_manager", tokens)
+    headers = {"X-AgentTrace-Token": tokens.token()}
+    with TestClient(api.app) as client:
+        res = client.get("/affected-parties", headers=headers)
+        assert res.status_code in (200, 404)  # 404 only when no sessions exist
+        if res.status_code == 200:
+            body = res.json()
+            assert "party_count" in body
+            assert body["extraction_limits"]
+
+        bad = client.get(
+            "/affected-parties?session_ids=not-a-uuid", headers=headers
+        )
+        assert bad.status_code == 422
+
+        missing = client.get(
+            f"/affected-parties?session_ids={uuid4()}", headers=headers
+        )
+        assert missing.status_code == 404
 
 
 # -- P1 #5: environment attestation --------------------------------------------

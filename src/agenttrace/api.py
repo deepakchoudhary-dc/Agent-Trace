@@ -35,6 +35,7 @@ from agenttrace.models.events import ConfidenceLevel, EventType, FileMutationEve
 from agenttrace.models.session import AgentType
 from agenttrace.review_loop.loop import ReviewLoop
 from agenttrace.review_loop.serialization import loop_result_to_dict
+from agenttrace.security.affected_parties import extract_affected_parties
 from agenttrace.security.approval import (
     OPERATOR_CHALLENGE_TTL_SECONDS,
     ApprovalError,
@@ -1231,6 +1232,45 @@ async def get_safety_case(session_id: UUID) -> dict[str, Any]:
         get_findings=daemon.get_findings(session_id),
         get_incidents=daemon.get_incidents(session_id),
     )
+
+
+@app.get("/affected-parties")
+async def get_affected_parties(
+    session_ids: str | None = None,
+) -> dict[str, Any]:
+    """Enumerate external third parties the given sessions touched (P2 #9).
+
+    The notification list behind "we have notified all affected parties":
+    hosts/systems observed via kernel network events or claimed in command
+    text, each anchored to chain hashes. Read-only, offline from the
+    sealed ledger. Without arguments, every stored session is included.
+    """
+    if session_ids:
+        try:
+            ids: list[UUID] = [
+                UUID(part) for part in session_ids.split(",") if part.strip()
+            ]
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"invalid session id: {exc}"
+            ) from exc
+    else:
+        ids = [
+            UUID(row["session_id"])
+            for row in daemon._ledger.list_sessions()
+        ]
+    if not ids:
+        raise HTTPException(status_code=404, detail="No sessions found")
+
+    by_session: dict[UUID, list[Any]] = {}
+    for sid in ids:
+        session_row = daemon._ledger.get_session(sid)
+        if not session_row:
+            raise HTTPException(
+                status_code=404, detail=f"Session not found: {sid}"
+            )
+        by_session[sid] = daemon._ledger.query_events(sid, limit=None)
+    return extract_affected_parties(by_session).to_payload()
 
 
 @app.get("/sessions/{session_id}/report")
