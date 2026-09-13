@@ -15,6 +15,7 @@ from agenttrace.models.events import (
     ConfidenceLevel,
     FileMutationEvent,
     IncidentEvent,
+    ProcessEvent,
 )
 
 _SID_A = uuid4()
@@ -228,5 +229,88 @@ def test_two_sessions_closing_close_together_both_emit_summaries() -> None:
     assert len(second) == 1
     assert first[0].session_id == _SID_A
     assert second[0].session_id == _SID_B
+
+
+# -- Self-reference persistence (Bengio self-copy) ----------------------------------
+
+
+def _proc(
+    command_line: str,
+    sid: object = None,
+    at: datetime | None = None,
+) -> ProcessEvent:
+    return ProcessEvent(
+        session_id=_SID_A if sid is None else sid,  # type: ignore[arg-type]
+        actor_id="process_observer",
+        source_adapter="process_observer",
+        confidence=ConfidenceLevel.MEDIUM,
+        pid=4242,
+        command_line=command_line,
+        timestamp=at or _T0,
+    )
+
+
+def test_ended_session_artifact_referenced_by_process_fires() -> None:
+    registry = PostExitRegistry()
+    registry.observe(_file("/ws/tools/beacon.py", sid=_SID_B))
+    registry.close_session(_SID_B, _T0)
+    incidents = registry.observe(
+        _proc("python /ws/tools/beacon.py --loop", at=_T0 + timedelta(minutes=2))
+    )
+    assert len(incidents) == 1
+    assert incidents[0].incident_type == "self_reference_persistence"
+    assert incidents[0].severity == "high"
+    assert str(_SID_B) in incidents[0].description
+
+
+def test_artifact_of_running_session_does_not_fire() -> None:
+    registry = PostExitRegistry()
+    registry.observe(_file("/ws/tools/beacon.py", sid=_SID_B))
+    # _SID_B has not ended — its artifact may be executed in-scope.
+    assert registry.observe(
+        _proc("python /ws/tools/beacon.py", at=_T0 + timedelta(minutes=2))
+    ) == []
+
+
+def test_creator_in_flight_event_after_close_does_not_fire() -> None:
+    """The creator session's own in-flight events are not persistence."""
+    registry = PostExitRegistry()
+    registry.observe(_file("/ws/tools/beacon.py", sid=_SID_A))
+    registry.close_session(_SID_A, _T0)
+    assert registry.observe(
+        _proc("python /ws/tools/beacon.py", sid=_SID_A, at=_T0 + timedelta(seconds=10))
+    ) == []
+
+
+def test_deleted_artifact_reference_does_not_fire() -> None:
+    registry = PostExitRegistry()
+    registry.observe(_file("/ws/tools/beacon.py", sid=_SID_B))
+    registry.observe(_file("/ws/tools/beacon.py", sid=_SID_B, mutation="delete"))
+    registry.close_session(_SID_B, _T0)
+    assert registry.observe(
+        _proc("python /ws/tools/beacon.py", at=_T0 + timedelta(minutes=2))
+    ) == []
+
+
+def test_unrelated_cmdline_does_not_fire() -> None:
+    registry = PostExitRegistry()
+    registry.observe(_file("/ws/tools/beacon.py", sid=_SID_B))
+    registry.close_session(_SID_B, _T0)
+    assert registry.observe(
+        _proc("python /ws/other/script.py", at=_T0 + timedelta(minutes=2))
+    ) == []
+
+
+def test_self_reference_takes_precedence_over_post_close() -> None:
+    """A specific self-reference finding outranks the generic post-close signal."""
+    registry = PostExitRegistry()
+    registry.observe(_file("/ws/tools/beacon.py", sid=_SID_B))
+    registry.close_session(_SID_B, _T0)
+    registry.close_session(_SID_A, _T0)
+    incidents = registry.observe(
+        _proc("python /ws/tools/beacon.py", at=_T0 + timedelta(minutes=5))
+    )
+    assert len(incidents) == 1
+    assert incidents[0].incident_type == "self_reference_persistence"
 
 

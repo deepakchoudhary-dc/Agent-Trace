@@ -5,7 +5,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from agenttrace.graph.covert_channel import CovertChannelDetector
-from agenttrace.models.events import FileMutationEvent
+from agenttrace.models.events import CommandEvent, ConfidenceLevel, FileMutationEvent
 
 
 def _fme(path: str) -> FileMutationEvent:
@@ -15,6 +15,16 @@ def _fme(path: str) -> FileMutationEvent:
         source_adapter="filesystem",
         file_path=path,
         mutation_type="create",
+    )
+
+
+def _cmd(command: str) -> CommandEvent:
+    return CommandEvent(
+        session_id=uuid4(),
+        actor_id="agent",
+        source_adapter="terminal",
+        confidence=ConfidenceLevel.HIGH,
+        command=command,
     )
 
 
@@ -107,3 +117,46 @@ def test_delete_events_ignored() -> None:
     event = _fme("/ws/cache/zzFILE_d7shc-dF5g5622LVtEIW2yareqM2Nw_F9yRZB8rjn2Z7fSB")
     event.mutation_type = "delete"
     assert detector.observe(event) == []
+
+
+# -- High-entropy blob carriage (steganography-shaped, structural only) --
+
+
+def test_base64_blob_in_echo_context_detected() -> None:
+    detector = CovertChannelDetector(uuid4())
+    blob = "eW91bWrDn7p8q9s0t1u2v3w4x5y6zA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5"
+    incidents = detector.observe(
+        _cmd(f'echo "{blob}" | base64 -d > /tmp/payload.bin')
+    )
+    assert len(incidents) == 1
+    assert incidents[0].incident_type == "high_entropy_blob_command"
+    assert incidents[0].severity == "low"
+    assert "not a finding of intent" in incidents[0].description
+
+
+def test_hex_blob_in_sh_c_context_detected() -> None:
+    detector = CovertChannelDetector(uuid4())
+    hexblob = "4a6f686e2d4f6d2068652c6e54686f7261626c65337165342e426c7468"
+    incidents = detector.observe(_cmd(f"sh -c 'xxd -r -p <<< {hexblob} > note.bin'"))
+    assert len(incidents) == 1
+    assert incidents[0].incident_type == "high_entropy_blob_command"
+
+
+def test_blob_without_placement_context_is_silent() -> None:
+    detector = CovertChannelDetector(uuid4())
+    blob = "eW91bWrDn7p8q9s0t1u2v3w4x5y6zA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5"
+    # Same blob, but passed to a program as a plain argument (no decode/
+    # write/eval shape) — ordinary opaque token, indistinguishable.
+    assert detector.observe(_cmd(f"curl -H 'X-Custom: {blob}' https://api.x/")) == []
+
+
+def test_short_tokens_do_not_fire() -> None:
+    detector = CovertChannelDetector(uuid4())
+    assert detector.observe(_cmd("echo 'aGVsb28cWq4=' > tmp.txt")) == []
+    assert detector.observe(_cmd('echo "dGVz" > tmp.txt')) == []
+
+
+def test_checksum_context_is_benign() -> None:
+    detector = CovertChannelDetector(uuid4())
+    sha = "9" * 64
+    assert detector.observe(_cmd(f"echo {sha} > /tmp/checksum.txt")) == []

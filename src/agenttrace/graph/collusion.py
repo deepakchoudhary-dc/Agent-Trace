@@ -10,6 +10,7 @@ claim to detect coordination itself.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -25,6 +26,20 @@ if TYPE_CHECKING:
     from agenttrace.storage.ledger import EventLedger
 
 _INFRA_ACTORS = {"user", "cli", "detector_engine"}
+
+_GOAL_DIVERGENT_TERMS = 4
+_COMMAND_TERM_RE = re.compile(r"[a-z][a-z0-9_-]{4,}")
+
+# Tokens too generic to carry a divergence judgment on their own.
+_STOPWORDS = frozenset({
+    "python", "python3", "pip", "pip3", "npm", "npx", "bash", "sh", "cmd",
+    "powershell", "echo", "cat", "ls", "cd", "git", "clone", "install",
+    "activate", "export", "source", "write", "file", "path", "folder",
+    "mkdir", "rmdir", "remove", "copy", "move", "chmod", "chown", "sudo",
+    "open", "read", "print", "return", "error", "failed", "success",
+    "running", "start", "stop", "kill", "status", "check", "find", "grep",
+    "test", "tests", "run", "pytest", "build", "server", "client",
+})
 
 
 @dataclass
@@ -82,6 +97,12 @@ _GAPS: dict[str, str] = {
         "Identity claims are self-reported; true attribution is not "
         "observable at host level."
     ),
+    "goal_divergent": (
+        "A session's executed activity carries distinctive vocabulary "
+        "absent from its declared task contract. Coordination toward "
+        "unspecified goals is consistent with off-goal activity, and so is "
+        "brief exploratory work — intent is not observable at host level."
+    ),
 }
 
 
@@ -109,6 +130,7 @@ class CollusionCorrelationEngine:
             candidates.extend(self._shared_actors(sids))
             candidates.extend(self._complementary_roles(sids))
             candidates.extend(self._rotated_identity(sids))
+            candidates.extend(self._goal_divergence(sids))
         return candidates
 
     def for_session(self, session_id: UUID) -> list[CollusionCandidate]:
@@ -337,5 +359,61 @@ class CollusionCorrelationEngine:
                 confidence=ConfidenceLevel.LOW,
                 evidence_event_ids=evidence,
                 reasoning_gap=_GAPS["rotated_identity"],
+            ))
+        return out
+
+    def _goal_divergence(self, sids: list[UUID]) -> list[CollusionCandidate]:
+        """Activity with no lineage to the session's declared contract goal.
+
+        Coordination toward unspecified goals (Bengio 2026) is hard to
+        notice partly because off-goal behavior blends into the noise. The
+        observable half is vocabulary divergence: the session's executed
+        commands carry distinctive terms the declared task goal never
+        mentions. LOW confidence by design — exploratory work looks the
+        same from host telemetry alone.
+        """
+        get_contract = getattr(self._ledger, "get_task_contract", None)
+        if get_contract is None:
+            # Stub/legacy ledgers without contract storage: no divergence
+            # judgment possible without a contract, and none is fabricated.
+            return []
+
+        out: list[CollusionCandidate] = []
+        for sid in sids:
+            contract = get_contract(sid)
+            if not contract:
+                continue
+            goal = str(contract.get("goal") or "").lower()
+            goal_vocab = frozenset(_COMMAND_TERM_RE.findall(goal))
+            if not goal_vocab:
+                continue
+
+            unknown: set[str] = set()
+            actors: set[str] = set()
+            evidence: list[str] = []
+            for evt in self._events(sid):
+                if not isinstance(evt, CommandEvent) or not evt.command:
+                    continue
+                actors.add(evt.actor_id)
+                terms = set(_COMMAND_TERM_RE.findall(evt.command.lower()))
+                off = {t for t in terms if t not in goal_vocab and t not in _STOPWORDS}
+                if off:
+                    evidence.append(str(evt.event_id))
+                    unknown |= off
+
+            if len(unknown) < _GOAL_DIVERGENT_TERMS:
+                continue
+            sample = ", ".join(sorted(unknown)[:6])
+            out.append(CollusionCandidate(
+                signal="goal_divergent",
+                session_ids=[str(sid)],
+                actors=sorted(a for a in actors if a and a not in _INFRA_ACTORS),
+                detail=(
+                    f"activity carries {len(unknown)} distinctive term(s) "
+                    f"absent from the declared contract goal (e.g. {sample})"
+                ),
+                confidence=ConfidenceLevel.LOW,
+                evidence_event_ids=sorted(evidence),
+                reasoning_gap=_GAPS["goal_divergent"],
             ))
         return out

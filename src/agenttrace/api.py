@@ -1181,6 +1181,58 @@ async def get_compliance_bundle(session_id: UUID) -> dict[str, Any]:
     )
 
 
+@app.get("/sessions/{session_id}/safety-case")
+async def get_safety_case(session_id: UUID) -> dict[str, Any]:
+    """One assembled, chain-anchored, signed deployment safety case.
+
+    Combines the signed forensic report, the retro-scan calibration with
+    its negative-result statement, the sealed environment attestation, and
+    the compliance manifest over the same verified chain — plus an explicit
+    coverage boundary so a reviewer knows exactly what the bundle does and
+    does not prove.
+    """
+    session_row = daemon._ledger.get_session(session_id)
+    if not session_row:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    from agenttrace.security.safety_case import build_safety_case
+
+    try:
+        config = json.loads(session_row.get("config_json") or "{}")
+    except json.JSONDecodeError:
+        config = {}
+    workspace_path = config.get("workspace_path", "")
+
+    # The signed forensic report is assembled by the same handler the
+    # dashboard's export uses — one envelope, one key derivation.
+    signed_report = await get_forensic_report(session_id)
+
+    # Retro-scan scoped to this session: the detector verdict over stored
+    # history plus the P2 #10 calibrated negative-result statement.
+    report = daemon.retro_scan(session_ids=[session_id], exhaustive=False)
+
+    # The attestation, if the session declared isolation, was recorded as a
+    # PolicyFindingEvent with finding_type="environment_attestation" and its
+    # sealed payload. Retrieve the latest; otherwise the safety case records
+    # the gap rather than fabricating a pass.
+    attestation_payload: dict[str, Any] | None = None
+    for f in daemon.get_findings(session_id):
+        if getattr(f, "finding_type", None) == "environment_attestation":
+            attestation_payload = getattr(f, "payload", None) or {}
+            break
+
+    return build_safety_case(
+        daemon._ledger,
+        session_id,
+        workspace_path,
+        signed_report=signed_report,
+        retro_report=report,
+        attestation_payload=attestation_payload,
+        get_findings=daemon.get_findings(session_id),
+        get_incidents=daemon.get_incidents(session_id),
+    )
+
+
 @app.get("/sessions/{session_id}/report")
 async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
     """Generate a verified, cryptographically sealed forensic audit report."""

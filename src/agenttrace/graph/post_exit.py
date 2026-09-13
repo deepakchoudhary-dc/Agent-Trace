@@ -32,6 +32,12 @@ The :class:`PostExitRegistry` closes all three gaps:
   treating post-existence infrastructure as a shared resource is the
   exact METR collective pattern.
 
+- **Self-reference persistence** -- when a process is later observed
+  whose command line references an artifact written by an *ended*
+  session, ``self_reference_persistence`` fires: the session's written
+  artifact keeps executing independently of the session that produced
+  it (the self-copy/compute-pool persistence shape).
+
 Incidents are hash-chained ``IncidentEvent`` s at MEDIUM confidence
 (structural correlation, not direct observation that a process
 survived).
@@ -51,6 +57,7 @@ from agenttrace.models.events import (
     EventBase,
     FileMutationEvent,
     IncidentEvent,
+    ProcessEvent,
 )
 
 if TYPE_CHECKING:
@@ -59,6 +66,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _GRACE_SECONDS = 30
+
+# Bound on tracked artifact paths for self-reference matching (memory +
+# per-process-event scan cost). Oldest-inserted entries are evicted.
+_MAX_TRACKED_ARTIFACTS = 1024
+# Artifacts with shorter normalized paths are too generic to substring-
+# match against command lines without false positives.
+_MIN_SELFREF_PATH_LEN = 6
 
 # Path fragments that mark persistence locations (normalized, lowercase,
 # forward slashes).
@@ -137,6 +151,9 @@ class PostExitRegistry:
         self._cooldown = cooldown if cooldown is not None else timedelta(minutes=10)
         # session -> fingerprints of persistence artifacts it installed
         self._persistence: dict[UUID, dict[str, str]] = {}
+        # normalized artifact path -> (creating session, creation event id);
+        # first creator wins. Bounded by _MAX_TRACKED_ARTIFACTS.
+        self._artifacts: dict[str, tuple[UUID, str]] = {}
         # session -> close time
         self._closed: dict[UUID, datetime] = {}
         # fingerprint -> sessions that installed it
@@ -150,16 +167,27 @@ class PostExitRegistry:
         if isinstance(event, IncidentEvent):
             return []
 
+        # Self-reference persistence first: a specific finding for process
+        # events whose command line executes an ended session's artifact
+        # takes precedence over the generic post-close signal.
+        if isinstance(event, ProcessEvent) and event.command_line:
+            incidents = self._check_self_reference(event)
+            if incidents:
+                return incidents
+
         sid = event.session_id
         if sid in self._closed:
             return self._observe_post_close(event)
 
-        if (
-            isinstance(event, FileMutationEvent)
-            and event.mutation_type in ("create", "modify")
-            and _is_persistence_path(event.file_path)
-        ):
-            return self._record_artifact(event)
+        if isinstance(event, FileMutationEvent):
+            if event.mutation_type == "delete":
+                self._untrack_artifact(event.file_path)
+                return []
+            if event.mutation_type in ("create", "modify"):
+                self._track_artifact(event)
+                if _is_persistence_path(event.file_path):
+                    return self._record_artifact(event)
+            return []
         if isinstance(event, CommandEvent):
             return self._record_command_artifacts(event)
         return []
@@ -250,6 +278,83 @@ class PostExitRegistry:
                 timestamp=event.timestamp,
             )
         ]
+
+    # -- Self-reference persistence --------------------------------------------
+
+    def _track_artifact(self, event: FileMutationEvent) -> None:
+        """Remember a file path a session wrote, for self-reference matching."""
+        if not event.file_path:
+            return
+        path = event.file_path.replace("\\", "/").lower()
+        # First creator wins: the originating session is the finding.
+        self._artifacts.setdefault(path, (event.session_id, str(event.event_id)))
+        while len(self._artifacts) > _MAX_TRACKED_ARTIFACTS:
+            oldest = next(iter(self._artifacts))
+            del self._artifacts[oldest]
+
+    def _untrack_artifact(self, file_path: str) -> None:
+        """A deleted artifact can no longer be executing persistence."""
+        if file_path:
+            self._artifacts.pop(file_path.replace("\\", "/").lower(), None)
+
+    def _check_self_reference(self, event: ProcessEvent) -> list[IncidentEvent]:
+        """A process command line references an ended session's artifact.
+
+        Structure only: the event model shows that a written artifact is
+        *referenced by an executing process* after its creating session
+        ended — not that the process is a copy of the agent, nor why it
+        runs. MEDIUM confidence, reasoning gap stated in the finding.
+        """
+        cmdline = event.command_line.replace("\\", "/").lower()
+        for path, (creator_sid, evidence_id) in self._artifacts.items():
+            if len(path) < _MIN_SELFREF_PATH_LEN or path not in cmdline:
+                continue
+            if creator_sid not in self._closed:
+                continue
+            # The creator's own in-flight events are not persistence.
+            if (
+                event.session_id == creator_sid
+                and event.timestamp - self._closed[creator_sid] <= self._grace
+            ):
+                continue
+            if not self._can_emit(f"selfref:{path}", event.timestamp):
+                return []
+            logger.warning(
+                "POST-EXIT: process cmdline references artifact '%s' from "
+                "ended session %s",
+                path,
+                creator_sid,
+            )
+            return [
+                IncidentEvent(
+                    session_id=event.session_id,
+                    actor_id="post_exit_registry",
+                    source_adapter="post_exit_registry",
+                    confidence=ConfidenceLevel.MEDIUM,
+                    incident_type="self_reference_persistence",
+                    severity="high",
+                    title="Ended session's artifact executing as a process",
+                    description=(
+                        f"A process (pid {event.pid}, command line "
+                        f"{event.command_line[:120]!r}) references artifact "
+                        f"'{path}', written by session {creator_sid}, which "
+                        "has already ended. The session's written artifact "
+                        "keeps executing independently of the session that "
+                        "produced it — the self-copy persistence shape seen "
+                        "when agents spread copies of themselves or their "
+                        "tooling across compute pools. Honest limits: the "
+                        "command line merely REFERENCES the artifact path; "
+                        "this event model does not capture process parentage "
+                        "beyond ppid, whether the process is a copy of the "
+                        "agent, or why it runs. Structural correlation only, "
+                        "not a finding of intent."
+                    ),
+                    related_events=[evidence_id, str(event.event_id)],
+                    causal_path=[evidence_id, str(event.event_id)],
+                    timestamp=event.timestamp,
+                )
+            ]
+        return []
 
     # -- Persistence bookkeeping -----------------------------------------------
 

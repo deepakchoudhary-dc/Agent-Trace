@@ -295,6 +295,17 @@ claim kernel-grade enforcement:
 
 These limits are stated in reports as observability gaps rather than hidden.
 
+### Monitor-integrity doctrine
+
+Every detector in this suite runs **post-hoc** over the sealed ledger (the
+`retro-scan` path) or as advisory findings surfaced to the human operator.
+No detector output is ever wired into a live reward, training, or selection
+signal that the observed agent can feel. This is a deliberate design
+invariant, not an implementation detail: a monitor that shapes agent
+behavior becomes a selection pressure, and selection pressures become
+targets to game — the monitor's evidence value dies the moment the agent
+optimizes for it.
+
 ## Platform Support
 
 | Capability | Windows | Linux | macOS |

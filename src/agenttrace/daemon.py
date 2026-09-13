@@ -26,6 +26,7 @@ from agenttrace.graph.actor_identity import ActorIdentityGraph
 from agenttrace.graph.attestation import ProcessAttestationEngine
 from agenttrace.graph.baseline import BaselineGenerator
 from agenttrace.graph.collusion import CollusionCandidate, CollusionCorrelationEngine
+from agenttrace.graph.containment_escape import ContainmentEscapeDetector
 from agenttrace.graph.context_graph import ContextGraph
 from agenttrace.graph.continuation_risk import ContinuationRiskTracker
 from agenttrace.graph.cot_realism import CoTRealismDivergenceDetector
@@ -213,6 +214,7 @@ class AgentTraceDaemon:
         self._cot_realism: dict[UUID, CoTRealismDivergenceDetector] = {}
         self._identity_chain: dict[UUID, IdentityBootstrapDetector] = {}
         self._continuation_risk: dict[UUID, ContinuationRiskTracker] = {}
+        self._containment_escape: dict[UUID, ContainmentEscapeDetector] = {}
         # Post-exit surveillance is daemon-wide: shared-infrastructure and
         # post-close detection only work across sessions.
         self._post_exit: PostExitRegistry = PostExitRegistry()
@@ -379,6 +381,20 @@ class AgentTraceDaemon:
                     self._cot_realism[sid] = CoTRealismDivergenceDetector(sid)
                     self._identity_chain[sid] = IdentityBootstrapDetector(sid)
                     self._continuation_risk[sid] = ContinuationRiskTracker(sid)
+                    # Containment-escape lineage (Bengio 2026): sim framing
+                    # chained to a mutation outside the declared boundary.
+                    # Rebuilds fresh on restore like its 5b-N siblings; the
+                    # boundary is the contract's allowed paths when declared,
+                    # otherwise the workspace root.
+                    self._containment_escape[sid] = ContainmentEscapeDetector(
+                        sid,
+                        workspace_root=config.workspace_path,
+                        allowed_paths=(
+                            contract.allowed_paths
+                            if contract is not None and contract.allowed_paths
+                            else None
+                        ),
+                    )
 
                     # Threat-detection rule engine
                     self._detectors[sid] = DetectionEngine(
@@ -1378,6 +1394,19 @@ class AgentTraceDaemon:
                 "continuation_risk",
                 event,
                 lambda: continuation_engine.observe(event),
+            ):
+                await self.ingest_event(incident)
+
+        # 5b-13. Containment-escape lineage (Bengio 2026): reasoning that
+        # asserts the simulation/sandbox framing chained to a filesystem
+        # mutation landing OUTSIDE the session's declared boundary
+        # (contract allowed paths, else workspace root).
+        escape_engine = self._containment_escape.get(event.session_id)
+        if escape_engine and not isinstance(event, IncidentEvent):
+            for incident in await self._safe_observe(
+                "containment_escape",
+                event,
+                lambda: escape_engine.observe(event),
             ):
                 await self.ingest_event(incident)
 

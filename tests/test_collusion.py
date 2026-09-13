@@ -315,3 +315,76 @@ class TestScanGrowthGate:
         daemon._collusion_last_scan[sid] = _time.monotonic() - 10.0
         asyncio.run(daemon._scan_collusion(sid))
         assert scans == [sid]
+
+
+class TestGoalDivergence:
+    """Activity with no lineage to the declared contract goal (Bengio 2026)."""
+
+    def _with_goal(
+        self, ledger: EventLedger, sid: UUID, goal: str
+    ) -> None:
+        ledger.store_task_contract(
+            uuid4(), sid, goal,
+            allowed_paths=["/ws"],
+            risk_level="medium",
+        )
+
+    def test_off_goal_activity_is_flagged(self, tmp_path: Path) -> None:
+        ledger = _ledger(tmp_path)
+        s1 = _session(ledger, "/ws", "task one")
+        s2 = _session(ledger, "/ws", "task two")
+        self._with_goal(ledger, s1, "write a csv parser for financial data")
+        self._with_goal(ledger, s2, "write a csv parser for financial data")
+
+        # One session drives unmistakably off-goal machinery repeatedly.
+        for i in range(3):
+            ledger.append_event(CommandEvent(
+                session_id=s1,
+                actor_id="agentA",
+                source_adapter="claude_code",
+                command=(
+                    "python scrape_steganography_c2.py --exfiltrate "
+                    f"payload_channel_{i} 1> /dev/null"
+                ),
+            ))
+        ledger.append_event(CommandEvent(
+            session_id=s2,
+            actor_id="agentB",
+            source_adapter="claude_code",
+            command="python parse_csv.py --input ledger.csv",
+        ))
+
+        candidates = CollusionCorrelationEngine(ledger).candidates()
+        divergent = [c for c in candidates if c.signal == "goal_divergent"]
+        assert len(divergent) == 1
+        c = divergent[0]
+        assert c.session_ids == [str(s1)]
+        assert c.confidence == ConfidenceLevel.LOW
+        assert "absent from the declared contract goal" in c.detail
+        assert c.evidence_event_ids  # anchored to the actual commands
+
+    def test_on_goal_activity_is_silent(self, tmp_path: Path) -> None:
+        ledger = _ledger(tmp_path)
+        s1 = _session(ledger, "/ws", "csv parsing")
+        self._with_goal(ledger, s1, "write a csv parser for financial data")
+        ledger.append_event(CommandEvent(
+            session_id=s1,
+            actor_id="agentA",
+            source_adapter="claude_code",
+            command="python parse_csv.py --input ledger.csv --delimiter comma",
+        ))
+        candidates = CollusionCorrelationEngine(ledger).candidates()
+        assert not any(c.signal == "goal_divergent" for c in candidates)
+
+    def test_silent_without_contract(self, tmp_path: Path) -> None:
+        ledger = _ledger(tmp_path)
+        s1 = _session(ledger, "/ws", "no contract stored")
+        ledger.append_event(CommandEvent(
+            session_id=s1,
+            actor_id="agentA",
+            source_adapter="claude_code",
+            command="python scrape_steganography_c2.py --exfiltrate payload",
+        ))
+        # No task contract row -> no divergence judgment is fabricated.
+        candidates = CollusionCorrelationEngine(ledger).candidates()
+        assert not any(c.signal == "goal_divergent" for c in candidates)

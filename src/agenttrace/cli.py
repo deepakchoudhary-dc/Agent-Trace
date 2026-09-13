@@ -707,6 +707,65 @@ def rescan(
 
 @main.command()
 @click.argument("session_id")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit the signed safety case in full as JSON.",
+)
+def safety_case(session_id: str, as_json: bool) -> None:
+    """Assemble the signed deployment safety case for a session.
+
+    One reviewer-readable document (ant.md P2 #8; Bengio 2026 "safety case
+    for deployments"): the signed forensic report, the retro-scan verdict
+    with calibration and negative-result statement, the sealed environment
+    attestation, and the compliance manifest — bound to the same chain tip
+    and HMAC-signed so a recipient can verify without trusting the sender.
+    """
+    try:
+        res = _call_api(f"/sessions/{UUID(session_id)}/safety-case", timeout=600.0)
+    except ApiError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not isinstance(res, dict):
+        console.print("[red]Unexpected API response[/red]")
+        return
+    if as_json:
+        console.print_json(json.dumps(res, indent=2))
+        return
+
+    chain = res.get("chain", {})
+    sig = res.get("report_signature", {})
+    body = (
+        f"Session:                    {res.get('session_id', '')}\n"
+        f"Chain integrity:            {chain.get('integrity_status', '')}\n"
+        f"Head event hash:            {(chain.get('head_event_hash') or '')[:16]}…\n"
+        f"Events covered:             {chain.get('event_count', 0)}\n"
+        f"Report signature:           {sig.get('algo', '')} "
+        f"{(sig.get('signature') or '')[:16]}…\n"
+        f"Retro incidents:            {res.get('retro_scan', {}).get('incident_count', 0)}\n"
+    )
+    attestation = res.get("environment_attestation") or {}
+    if "verdict" in attestation:
+        body += (
+            f"Environment attestation:    {attestation['verdict']}"
+            f" ({', '.join(attestation.get('reasons', []))})\n"
+        )
+    else:
+        body += "Environment attestation:    not declared (nothing fabricated)\n"
+    console.print(Panel(
+        body,
+        title="🧾 Deployment safety case (signed)",
+        border_style="green",
+    ))
+    console.print(
+        "\nCoverage boundary: "
+        + " ".join(res.get("coverage_boundary", {}).get("does_not_cover", []))
+    )
+
+
+@main.command()
+@click.argument("session_id")
 def brief(session_id: str) -> None:
     """Operator briefing: what happened and what needs your attention."""
     sid = UUID(session_id)
