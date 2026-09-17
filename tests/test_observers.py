@@ -156,6 +156,31 @@ class TestFilesystemObserver:
         assert observer._hash_cache["/ws/b.py"] == "baseline-b"
         assert "/ws/c.py" not in observer._hash_cache
 
+    def test_excluded_dir_is_never_recorded(self, tmp_path: Path) -> None:
+        """Absolute-path exclusions win over watch patterns: the daemon's
+        data dir inside the workspace must never feed the observer its own
+        ledger writes (self-audit noise that races live reads)."""
+        events, callback = _collector()
+        observer = FilesystemObserver(uuid4(), str(tmp_path), callback)
+        data_dir = tmp_path / ".agenttrace-data"
+        data_dir.mkdir()
+        observer.exclude_dir(data_dir)
+        inside = data_dir / "ledger.db-wal"
+        inside.write_text("journal", encoding="utf-8")
+        outside = tmp_path / "page.py"
+        outside.write_text("real work", encoding="utf-8")
+        assert observer._should_ignore(str(inside)) is True
+        assert observer._should_ignore(str(outside)) is False
+
+    def test_exclude_dir_resolves_relative_paths(self, tmp_path: Path) -> None:
+        """Relative exclusion paths are anchored to the current directory,
+        so the check is stable regardless of how the path was spelled."""
+        events, callback = _collector()
+        observer = FilesystemObserver(uuid4(), str(tmp_path), callback)
+        observer.exclude_dir("relative/nested")
+        assert observer._exclude_dirs, "relative path must be stored resolved"
+        assert observer._exclude_dirs[0].is_absolute()
+
 
 class TestNetworkObserver:
     class _FakeConn:

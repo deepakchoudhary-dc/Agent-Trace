@@ -62,14 +62,48 @@ class FilesystemObserver(BaseObserver):
             ".venv/**",
             "venv/**",
         ]
+        # Absolute-path exclusions: paths inside these trees are NEVER
+        # recorded, regardless of relative-pattern matching. Used for the
+        # daemon's own storage — an observer that audits its own ledger
+        # writes would feed itself events in a loop.
+        self._exclude_dirs: list[Path] = []
         self._stop_event = asyncio.Event()
         # Cache of file content hashes for before/after comparison
         self._hash_cache: dict[str, str] = {}
         # In-memory text cache for bounded diff generation
         self._content_cache: dict[str, str] = {}
 
+    def exclude_dir(self, path: str | Path) -> None:
+        """Never record mutations inside ``path`` (absolute-path exclusion).
+
+        Resolved to a canonical absolute form so the check is stable across
+        case and separator differences (Windows drive-letter case, \\ vs /).
+        """
+        try:
+            self._exclude_dirs.append(Path(path).resolve())
+        except OSError:
+            logger.warning("Could not resolve exclusion path %r; ignoring it", path)
+
+    def _is_excluded(self, path: str) -> bool:
+        """True when ``path`` sits inside an excluded directory tree."""
+        if not self._exclude_dirs:
+            return False
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            return False
+        for root in self._exclude_dirs:
+            try:
+                resolved.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
     def _should_ignore(self, path: str) -> bool:
-        """Check if a file path matches any ignore pattern."""
+        """Check if a file path matches any ignore pattern or exclusion."""
+        if self._is_excluded(path):
+            return True
         try:
             rel_path = str(Path(path).relative_to(self.workspace_path)).replace("\\", "/")
             return any(

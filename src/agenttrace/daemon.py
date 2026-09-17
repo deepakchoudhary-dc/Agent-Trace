@@ -2563,6 +2563,13 @@ class AgentTraceDaemon:
                 AuditdObserver(session.session_id, workspace, callback)
             )
 
+        # The ledger must never audit its own writes: when the daemon's
+        # data dir sits inside the watched workspace, its journal/commit
+        # churn feeds the observer its own events (observed live as a
+        # spurious extra diff between two reads on slow CI runners).
+        filesystem_observer = cast("FilesystemObserver", observers[0])
+        filesystem_observer.exclude_dir(self._data_dir)
+
         # Reconcile hash sources: seed the observer's hash cache from the
         # baseline graph's SOURCE_FILE content hashes so the first mutation
         # has a real before_hash (the baseline generator and the observer
@@ -2577,9 +2584,6 @@ class AgentTraceDaemon:
                 and node.data.get("path")
             }
             if baseline_hashes:
-                filesystem_observer = cast(
-                    "FilesystemObserver", observers[0]
-                )
                 filesystem_observer.seed_hashes(baseline_hashes)
 
         for observer in observers:
