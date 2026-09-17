@@ -1151,6 +1151,10 @@ def rescan_ledger(req: RescanRequest | None = None) -> dict[str, Any]:
         "retro_incidents": len(report.retro_incidents),
         "errors": list(report.errors),
         "summary": report.summary(),
+        # Which engines the stage-2 replay actually applied — the replay
+        # coverage statement, so "no incidents" is checkable against what
+        # ran (the same honesty the safeguard-context record provides live).
+        "graph_detectors_applied": list(report.graph_detectors_applied),
         # P2 #10: the calibrated verdict, so "nothing of similar or worse
         # severity" is checkable against one ordered scale and carries the
         # boundary of what was actually read.
