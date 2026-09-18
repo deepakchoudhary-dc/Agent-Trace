@@ -1,0 +1,12 @@
+
+> agenttrace-dashboard@0.1.0 dev
+> vite
+
+
+  [32m[1mVITE[22m v5.4.21[39m  [2mready in [0m[1m2649[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5173[22m/[39m
+[2m  [32m➜[39m  [1mNetwork[22m[2m: use [22m[1m--host[22m[2m to expose[22m
+[2m3:16:33 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/DiffPanel.tsx, /src/components/ForensicReportModal.tsx, /src/components/ReviewLoopView.tsx[22m
+[2m3:16:46 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/DiffPanel.tsx, /src/components/ForensicReportModal.tsx, /src/components/ReviewLoopView.tsx[22m
+[2m3:17:05 pm[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx[22m

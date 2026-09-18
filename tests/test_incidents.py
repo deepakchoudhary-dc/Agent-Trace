@@ -64,6 +64,48 @@ class TestIncidentCorrelationEngine:
         assert exfil[0].severity == "critical"
         assert len(exfil[0].related_events) == 2
 
+    def test_baseline_destination_downgrades_to_finding(self) -> None:
+        """Credential access → egress to an ESTABLISHED destination is a
+        medium, non-freezing finding (the operator already accepts this
+        contact — e.g. git push). Unseen destinations remain critical."""
+        engine = IncidentCorrelationEngine(
+            _SESSION, baseline_destinations={"140.82.112.3"}
+        )
+        assert engine.observe(_finding("credential_access", seconds_ago=30)) == []
+        incidents = engine.observe(
+            _network(ip="140.82.112.3", method="POST", seconds_ago=5)
+        )
+        use = [i for i in incidents if i.incident_type == "credential_use_with_network"]
+        exfil = [i for i in incidents if i.incident_type == "credential_exfiltration"]
+        assert len(use) == 1
+        assert use[0].severity == "medium"
+        assert exfil == []
+        # The observable half is still stated — reasoning gap intact.
+        assert "reasoning gap" in use[0].description.lower()
+
+    def test_unseen_destination_stays_critical(self) -> None:
+        """No baseline, no contract: the exfiltration chain stays critical."""
+        engine = IncidentCorrelationEngine(_SESSION)
+        engine.observe(_finding("credential_access", seconds_ago=30))
+        incidents = engine.observe(_network(method="POST", seconds_ago=5))
+        exfil = [i for i in incidents if i.incident_type == "credential_exfiltration"]
+        assert len(exfil) == 1
+        assert exfil[0].severity == "critical"
+
+    def test_declared_destination_downgrades_too(self) -> None:
+        """A session that DECLARES a destination at creation gets the same
+        non-freezing treatment as a learned baseline destination."""
+        engine = IncidentCorrelationEngine(
+            _SESSION, allowed_destinations=["140.82.112.3"]
+        )
+        engine.observe(_finding("credential_access", seconds_ago=30))
+        incidents = engine.observe(
+            _network(ip="140.82.112.3", method="POST", seconds_ago=5)
+        )
+        use = [i for i in incidents if i.incident_type == "credential_use_with_network"]
+        assert len(use) == 1
+        assert use[0].severity == "medium"
+
     def test_exfiltration_cooldown(self) -> None:
         engine = IncidentCorrelationEngine(_SESSION)
         engine.observe(_finding("credential_access", seconds_ago=30))
