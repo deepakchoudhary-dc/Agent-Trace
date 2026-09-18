@@ -7,6 +7,8 @@ import sys
 import sysconfig
 from pathlib import Path
 
+import pytest
+
 # Ensure src/ is on sys.path
 src_dir = str(Path(__file__).resolve().parent.parent / "src")
 if src_dir not in sys.path:
@@ -95,4 +97,24 @@ class HostIsolationStub:
             stderr=proc.stderr,
             duration_ms=1,
         )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_agent_log_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Redirect Path.home() to an empty temp dir for the duration of a test.
+
+    The agent adapters (codex/claude/copilot/universal) resolve their live
+    transcript sources via ``Path.home()`` at construction. On a developer
+    machine that really runs coding agents, a test-created daemon session
+    would otherwise ingest the DEVELOPER'S LIVE AGENT LOGS — thousands of
+    real events per minute — which breaks digest/count assertions and makes
+    the suite fail in ways CI never sees (2026-09-18: +64 context_boundary
+    events during a 3s idle window). Tests that exercise adapters build
+    their sources explicitly (see test_adapters.py); everything else gets a
+    hermetic home with no agent logs at all.
+    """
+    hermetic_home = tmp_path_factory.mktemp("hermetic_home")
+    monkeypatch.setattr("pathlib.Path.home", lambda: hermetic_home)
 

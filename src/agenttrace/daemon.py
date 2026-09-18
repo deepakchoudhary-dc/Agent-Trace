@@ -114,6 +114,17 @@ _DEFAULT_DATA_DIR = Path.home() / ".agenttrace"
 # Anti-forensic flood guard window/threshold (events per window)
 _FLOOD_WINDOW_SECONDS = 5.0
 _FLOOD_EVENT_THRESHOLD = 500
+# Collusion scan admission: candidates() re-reads, decrypts and verifies the
+# ENTIRE workspace ledger per pass, so a pass must not run inline on the
+# event loop (startup strangled before uvicorn could bind on a real ledger —
+# 2026-09-18) and must not re-admit on its own emitted findings.
+_COLLUSION_MIN_BATCH = 8
+# A pass costs O(total ledger rows) in crypto re-verification, so admission
+# scales with size: a pass runs after ≥ max(_COLLUSION_MIN_BATCH, total/64)
+# new events (amortized O(64) rows per ingested event). Ledgers at or below
+# this size are cheap enough to scan on every new event, keeping collusion
+# detection immediate for small/fresh workspaces (and their tests).
+_COLLUSION_SMALL_LEDGER = 256
 
 # Clock-jump tolerance and finding cooldown (seconds)
 _CLOCK_JUMP_TOLERANCE_SECONDS = 300.0
@@ -278,9 +289,14 @@ class AgentTraceDaemon:
         # stored history. Pull-based over the ledger, so it is constructed
         # once for the daemon rather than per session.
         self._retro_scan: RetroScan = RetroScan(self._ledger)
-        # Total ledger event count at the last collusion scan: a cheap O(1)
-        # gate so the scan runs only when the ledger actually grew.
+        # Total ledger event count at the last completed collusion pass: the
+        # admission basis — a new pass runs only after a meaningful batch of
+        # new events (see _COLLUSION_MIN_BATCH). Baselined at boot so no
+        # scan delays socket bind.
         self._collusion_last_count: int = -1
+        # Single-flight flag: a candidates() pass must never re-enter itself
+        # via the ingest cascade of its own emitted findings.
+        self._collusion_scanning: bool = False
 
         self._running = False
 
@@ -290,6 +306,16 @@ class AgentTraceDaemon:
             return
         self._running = True
         await self._restore_from_storage()
+        # Baseline the collusion growth gate at boot: the ledger's existing
+        # history is NOT new evidence, so the first live pass waits for real
+        # post-boot growth (small ledgers: any growth). Without this, the
+        # first ingested events would admit a whole-ledger pass inline during
+        # the busiest window — the very path that strangled startup before
+        # uvicorn could bind (2026-09-18).
+        try:
+            self._collusion_last_count = self._ledger.event_count()
+        except LedgerError:
+            self._collusion_last_count = -1
         logger.info("AgentTrace daemon started, data_dir=%s", self._data_dir)
 
     async def stop(self) -> None:
@@ -894,6 +920,14 @@ class AgentTraceDaemon:
                         session_id, adapter, event
                     ):
                         await self.ingest_event(event)
+                        # Cooperative yield: a large backlog (restart after an
+                        # unclean stop, or a long live session's transcripts)
+                        # is CPU-bound through the ingest pipeline, and plain
+                        # awaits on ready coroutines do not surrender the
+                        # loop — without this tick, the lifespan coroutine
+                        # starves and uvicorn never binds ("daemon running
+                        # but unreachable", 2026-09-18).
+                        await asyncio.sleep(0)
                 # Confirm the batch only after everything ingested cleanly;
                 # on failure the adapter rewinds so nothing is silently lost.
                 adapter.commit_cursor()
@@ -1826,8 +1860,39 @@ class AgentTraceDaemon:
             session_ids=session_ids, exhaustive=exhaustive
         )
 
+    def _collusion_admits(self, count: int) -> bool:
+        """Whether a whole-ledger collusion pass is worth running now.
+
+        A pass re-reads, decrypts and verifies every session row in the
+        workspace (O(total)), so admission must be amortized: ledgers at or
+        below _COLLUSION_SMALL_LEDGER scan on any growth; larger ones only
+        after max(_COLLUSION_MIN_BATCH, total // 64) new events. Emissions
+        made DURING a pass cannot self-admit the next one (the growth basis
+        is set after the pass completes).
+        """
+        if self._collusion_last_count < 0:
+            return True
+        growth = count - self._collusion_last_count
+        if growth <= 0:
+            return False
+        if count <= _COLLUSION_SMALL_LEDGER:
+            return True
+        return growth >= max(_COLLUSION_MIN_BATCH, count // 64)
+
     async def _scan_collusion(self, session_id: UUID) -> None:
         """Cross-session collusion scan (R3), throttled to every 5s per session.
+
+        Admission is layered so a whole-ledger pass can never starve the
+        event loop (startup livelock, 2026-09-18: every ingested event
+        re-admitted an unbounded nested O(ledger) pass, strangling uvicorn
+        before it could bind):
+
+        1. per-session 5s throttle (unchanged);
+        2. single in-flight pass — re-entrant calls from the projection
+           cascade return immediately instead of nesting;
+        3. amortized growth gate (see _collusion_admits) — with the basis
+           baselined at boot, no scan delays socket bind and steady-state
+           cost stays O(64) rows per ingested event.
 
         Newly detected candidates are surfaced as ledger-backed findings so
         the signal is auditable, not just visible in a dashboard pull.
@@ -1837,19 +1902,18 @@ class AgentTraceDaemon:
         if last is not None and now - last < 5.0:
             return
         self._collusion_last_scan[session_id] = now
+        if self._collusion_scanning:
+            return
         # Growth gate: candidates() re-reads, decrypts and verifies every
         # session in the workspace. It must only run when the ledger has
-        # actually grown since the last pass — in particular so re-entrant
-        # scans inside one event's projection cascade (derived findings nest
-        # ingest_event -> project_event -> _scan_collusion) never re-scan a
-        # ledger whose state provably has not changed.
+        # actually grown since the last completed pass.
         try:
             count = self._ledger.event_count()
         except LedgerError:
             return
-        if count == self._collusion_last_count:
+        if not self._collusion_admits(count):
             return
-        self._collusion_last_count = count
+        self._collusion_scanning = True
         try:
             for candidate in self._collusion.for_session(session_id):
                 key = (
@@ -1885,6 +1949,13 @@ class AgentTraceDaemon:
                         )
         except Exception:
             logger.warning("Collusion scan failed", exc_info=True)
+        finally:
+            # Basis is the pre-pass count: findings emitted during the pass
+            # cannot self-admit the next pass (the cache makes any forced
+            # re-pass emit nothing, so the cascade is bounded); only new
+            # external growth can admit.
+            self._collusion_last_count = count
+            self._collusion_scanning = False
 
     def _check_event_flood(self, event: EventBase) -> bool:
         """Return True while a session is under an event flood (anti-forensic).
