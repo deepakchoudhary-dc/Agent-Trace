@@ -79,14 +79,37 @@ class IncidentCorrelationEngine:
         session_id: UUID,
         internet_allowed: bool | None = None,
         allowed_destinations: list[str] | None = None,
+        baseline_destinations: set[str] | list[str] | None = None,
     ) -> None:
         self.session_id = session_id
         # Declared network boundary (sealed-eval detection)
         self._internet_allowed = internet_allowed
         self._allowed_destinations = set(allowed_destinations or [])
+        # Destinations already established for this workspace (approved
+        # egress baseline). Credential access followed by egress to one of
+        # these is recorded as a medium finding instead of a critical
+        # incident — the operator has already accepted this contact, and on
+        # a normal coding host (git push over 443) the old blanket rule
+        # froze every session the moment any agent read a credential
+        # (2026-09-18). First contact with an UNSEEN destination stays
+        # critical + freeze.
+        self._baseline_destinations = set(baseline_destinations or [])
         # Rolling log of recent events/findings within the correlation window
         self._recent: deque[EventBase] = deque(maxlen=256)
         self._last_emitted: dict[str, datetime] = {}
+
+    def note_destination(self, destination: str) -> None:
+        """Record a destination as observed, from the next evaluation on.
+
+        Called by the daemon AFTER the incident engine has evaluated the
+        event that carried the destination, so a destination's first-ever
+        contact is still judged against the pre-contact baseline (critical
+        for a credential pairing) while every later contact is treated as
+        established. Mirrors the ledger's destination_baseline row that the
+        daemon persists for the same event.
+        """
+        if destination:
+            self._baseline_destinations.add(destination)
 
     def observe(self, event: EventBase) -> list[IncidentEvent]:
         """Feed an event into the engine; return incidents it completes."""
@@ -172,6 +195,42 @@ class IncidentCorrelationEngine:
                     continue
                 delta = abs((n.timestamp - f.timestamp).total_seconds())
                 if delta <= _EXFILTRATION_WINDOW_SECONDS:
+                    # Established destination (learned baseline or declared
+                    # contract): record the pairing as a medium finding —
+                    # auditable, non-freezing. The observable half is real
+                    # (credential touched, network followed); only the
+                    # exfiltration interpretation is withheld because the
+                    # operator already accepts this contact.
+                    if (
+                        n.destination_ip in self._baseline_destinations
+                        or n.destination_ip in self._allowed_destinations
+                    ):
+                        if not self._can_emit("credential_use_with_network"):
+                            return []
+                        logger.info(
+                            "credential_use_with_network: finding %s + network %s "
+                            "(established destination)",
+                            f.event_id,
+                            n.event_id,
+                        )
+                        return [self._make_incident(
+                            "credential_use_with_network",
+                            "medium",
+                            "Credential access followed by egress to an "
+                            "established destination",
+                            (
+                                f"Credential access ({f.finding_type}) was followed by "
+                                f"a network connection to {n.destination_ip}:{n.destination_port} "
+                                "within the correlation window. The destination is in "
+                                "this workspace's approved egress baseline (or the "
+                                "session's declared destinations), so this is "
+                                "recorded for audit rather than flagged as "
+                                "exfiltration; the reasoning gap is that intent is "
+                                "not observable. First contact with an unseen "
+                                "destination would be a critical incident."
+                            ),
+                            [f, n],
+                        )]
                     if not self._can_emit("credential_exfiltration"):
                         return []
                     logger.warning(

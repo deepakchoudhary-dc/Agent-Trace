@@ -306,6 +306,7 @@ class AgentTraceDaemon:
             return
         self._running = True
         await self._restore_from_storage()
+        self._seed_destination_baseline_from_history()
         # Baseline the collusion growth gate at boot: the ledger's existing
         # history is NOT new evidence, so the first live pass waits for real
         # post-boot growth (small ledgers: any growth). Without this, the
@@ -393,11 +394,17 @@ class AgentTraceDaemon:
                     self._approvals[sid] = approvals
 
                     # Incident correlation engine (starts fresh; past incidents
-                    # remain persisted in the ledger)
+                    # remain persisted in the ledger). The workspace's approved
+                    # egress baseline feeds the exfiltration gate: credential
+                    # access → established destination is a medium finding,
+                    # not a session freeze.
                     self._incidents[sid] = IncidentCorrelationEngine(
                         sid,
                         internet_allowed=config.internet_access_allowed,
                         allowed_destinations=config.allowed_destinations,
+                        baseline_destinations=self._ledger.get_destination_baseline(
+                            config.workspace_path
+                        ),
                     )
                     self._covert[sid] = CovertChannelDetector(sid)
                     self._reconcilers[sid] = ToolClaimReconciler(sid)
@@ -587,6 +594,40 @@ class AgentTraceDaemon:
         except Exception as e:
             logger.warning("Error during daemon storage recovery: %s", e)
 
+    def _seed_destination_baseline_from_history(self) -> None:
+        """Seed workspace egress baselines from sealed history and sync them
+        into the live incident engines.
+
+        Destinations already observed in a workspace's history are
+        established contacts: a credential-access pairing to one is a medium
+        finding, while first contact with a genuinely UNSEEN destination
+        stays a critical freeze-once event (then establishes the baseline).
+        The full-history read runs only when a workspace has no baseline
+        rows yet (one-time migration for legacy ledgers); afterwards this
+        just syncs persisted rows into freshly constructed engines so a
+        restored ACTIVE session is judged against the same baseline the
+        ledger holds.
+        """
+        for sid, session in list(self._sessions.items()):
+            workspace = session.config.workspace_path
+            try:
+                known = self._ledger.get_destination_baseline(workspace)
+                if not known:
+                    for evt in self._ledger.query_events(sid, limit=None):
+                        if isinstance(evt, NetworkEvent) and evt.destination_ip:
+                            self._ledger.add_destination_baseline(
+                                workspace, evt.destination_ip
+                            )
+                engine = self._incidents.get(sid)
+                if engine is not None:
+                    for destination in self._ledger.get_destination_baseline(workspace):
+                        engine.note_destination(destination)
+            except LedgerError:
+                logger.warning(
+                    "Could not seed destination baseline for %s", workspace,
+                    exc_info=True,
+                )
+
     async def _resume_session(self, session: AuditSession) -> None:
         """Resume observers/adapters for a restored ACTIVE session.
 
@@ -769,6 +810,9 @@ class AgentTraceDaemon:
             session.session_id,
             internet_allowed=config.internet_access_allowed,
             allowed_destinations=config.allowed_destinations,
+            baseline_destinations=self._ledger.get_destination_baseline(
+                config.workspace_path
+            ),
         )
         self._covert[session.session_id] = CovertChannelDetector(session.session_id)
         self._reconcilers[session.session_id] = ToolClaimReconciler(session.session_id)
@@ -1493,6 +1537,30 @@ class AgentTraceDaemon:
         #     re-flag it as "new".
         if isinstance(event, ApprovalEvent) and event.approved:
             await self._learn_approved_egress(event)
+
+        # 5d-2. Establish network destinations AFTER incident evaluation:
+        # a destination's first-ever contact is judged against the
+        # pre-contact baseline (credential pairing → critical freeze once),
+        # then it becomes established for the workspace — every later
+        # credential pairing to it is a medium, auditable finding. Without
+        # the post-evaluation ordering, a chatty host's constant 443 traffic
+        # would make the baseline useless and re-freeze every session.
+        if isinstance(event, NetworkEvent) and event.destination_ip:
+            engine = self._incidents.get(event.session_id)
+            if engine is not None:
+                engine.note_destination(event.destination_ip)
+            try:
+                workspace = self._sessions.get(event.session_id)
+                if workspace is not None:
+                    self._ledger.add_destination_baseline(
+                        workspace.config.workspace_path, event.destination_ip
+                    )
+            except LedgerError:
+                logger.warning(
+                    "Could not persist destination baseline for %s",
+                    event.destination_ip,
+                    exc_info=True,
+                )
 
         # 5e. Cross-session collusion scan (throttled — the engine is
         #     pull-based over the ledger, so per-event cost must stay O(1)).
