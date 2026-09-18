@@ -61,6 +61,13 @@ export function setApiToken(token: string): void {
   }
 }
 
+export const MISSING_TOKEN_MESSAGE =
+  'API token required — paste it from ~/.agenttrace/api_token (gear icon, top right).';
+
+export function setApiTokenOverride(token: string): void {
+  (window as unknown as { __AGENTTRACE_TOKEN__?: string }).__AGENTTRACE_TOKEN__ = token;
+}
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -87,7 +94,11 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
 
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new ApiError(res.status, errBody.detail || `Request failed with status ${res.status}`);
+      const message =
+        res.status === 401 && !errBody.detail
+          ? MISSING_TOKEN_MESSAGE
+          : errBody.detail || `Request failed with status ${res.status}`;
+      throw new ApiError(res.status, message);
     }
 
     return (await res.json()) as T;
@@ -116,7 +127,11 @@ async function requestWithCount<T>(endpoint: string): Promise<{ items: T; total:
     const res = await fetch(url, { headers });
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new ApiError(res.status, errBody.detail || `Request failed with status ${res.status}`);
+      const message =
+        res.status === 401 && !errBody.detail
+          ? MISSING_TOKEN_MESSAGE
+          : errBody.detail || `Request failed with status ${res.status}`;
+      throw new ApiError(res.status, message);
     }
     const items = (await res.json()) as T;
     // Prefer the server's total count header; fall back to page length only

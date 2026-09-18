@@ -311,6 +311,22 @@ def test_cors_rejects_unknown_origin(client):
     assert "access-control-allow-origin" not in {k.lower() for k in res.headers}
 
 
+def test_401_carries_cors_headers_for_allowed_origin(client):
+    """A tokenless request from a dev UI gets 401 WITH CORS headers.
+
+    Regression (2026-09-18): with auth middleware registered outside CORS,
+    the headerless 401 was hard-blocked by the browser, and a missing-token
+    failure surfaced in the dashboard as "daemon unreachable" — masking an
+    auth problem as an outage. CORS must be outermost so 401s stay visible
+    to whitelisted origins.
+    """
+    c, _ = client
+    res = c.get("/sessions", headers={"Origin": "http://localhost:5173"})
+    assert res.status_code == 401
+    assert res.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert "detail" in res.json()
+
+
 @pytest.mark.parametrize(
     "origin",
     [

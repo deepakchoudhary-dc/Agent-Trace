@@ -68,19 +68,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Bind CORS to local loopback UI development servers only
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
-
 # Request body cap (plan2.md P2.3): every accepted body must fit in 1 MiB.
 # Starlette reads the stream only when a handler consumes it, so without this
 # cap a multi-gigabyte body would be buffered per request by FastAPI's JSON
@@ -113,6 +100,24 @@ async def require_token(request: Request, call_next: Any) -> Response:
     if not token_manager.verify(presented):
         return JSONResponse(status_code=401, content={"detail": "Missing or invalid API token"})
     return cast("Response", await call_next(request))
+
+
+# Bind CORS to local loopback UI development servers only. Registered LAST so
+# it sits OUTERMOST: a 401 from require_token must still carry
+# Access-Control-Allow-Origin for the whitelisted dev UIs. When auth ran
+# outside CORS, the browser blocked the headerless 401 body and an ordinary
+# missing-token failure masqueraded as "daemon unreachable" (2026-09-18).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")

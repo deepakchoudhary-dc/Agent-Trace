@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { api } from './api/client';
+import { api, ApiError, setApiTokenOverride } from './api/client';
 import {
   SessionInfo,
   ContextGraphData,
@@ -67,6 +67,18 @@ export const App: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(false);
   const [livePolling, setLivePolling] = useState<boolean>(true);
   const [connectionError, setConnectionError] = useState<string>('');
+  const [tokenDraft, setTokenDraft] = useState('');
+
+  // The daemon rejects unauthenticated requests; the token lives in
+  // ~/.agenttrace/api_token and is held in-page for this tab only.
+  const handleSaveToken = useCallback(() => {
+    const trimmed = tokenDraft.trim();
+    if (!trimmed) return;
+    setApiTokenOverride(trimmed);
+    setTokenDraft('');
+    setConnectionError('');
+    loadSessions();
+  }, [tokenDraft]);
   // False when the daemon could not be reached for session data — views must
   // render "UNVERIFIED" instead of treating missing data as compliance.
   const [dataVerified, setDataVerified] = useState<boolean>(true);
@@ -151,6 +163,11 @@ export const App: React.FC = () => {
       }
     } catch (err: unknown) {
       if (currentRequestId === requestIdRef.current) {
+        if (err instanceof ApiError && err.status === 401) {
+          setConnectionError(err.message);
+          setLoading(false);
+          return;
+        }
         // The daemon is unreachable: do NOT substitute empty data — an empty
         // timeline/findings view would be read as a clean audit.
         setDataVerified(false);
@@ -320,7 +337,7 @@ export const App: React.FC = () => {
         onToggleLivePolling={() => setLivePolling((prev) => !prev)}
       />
 
-      {/* Offline Alert Banner */}
+      {/* Offline / Auth Alert Banner */}
       {connectionError && (
         <div
           role="alert"
@@ -341,6 +358,30 @@ export const App: React.FC = () => {
             <span style={{ fontSize: '12px', color: '#ffffff' }}>{connectionError}</span>
           </div>
           <div className="flex" style={{ gap: '6px', flexShrink: 0 }}>
+            <input
+              type="password"
+              value={tokenDraft}
+              onChange={(e) => setTokenDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleSaveToken();
+              }}
+              placeholder="paste ~/.agenttrace/api_token"
+              aria-label="Daemon API token"
+              spellCheck={false}
+              autoComplete="off"
+              style={{
+                width: '230px',
+                padding: '4px 8px',
+                fontSize: '11px',
+                borderRadius: '6px',
+                border: '1px solid rgba(255,255,255,0.25)',
+                background: 'rgba(0,0,0,0.35)',
+                color: '#fff',
+              }}
+            />
+            <button onClick={handleSaveToken} className="btn btn-secondary btn-sm">
+              Save token
+            </button>
             <button onClick={loadSessions} className="btn btn-secondary btn-sm">
               <RefreshCw size={11} /> Retry
             </button>
