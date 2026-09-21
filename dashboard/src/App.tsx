@@ -344,19 +344,35 @@ export const App: React.FC = () => {
   // Start recording a new session (Navbar "New Audit"). The daemon boots its
   // observer stack in POST /sessions; on success the directory is re-fetched
   // and the fresh live session is selected so the operator lands on it.
+  // Every piece of state below belongs to ONE session. Leaving any of it in
+  // place across a session change is how one session's 500-event timeline was
+  // rendered — and exported — as another session's audit trail. Both entry
+  // points that change the current session (select and create) must clear the
+  // same set, so it lives here instead of being repeated in each and drifting.
+  const resetSessionState = useCallback(() => {
+    setGraphData(null);
+    setTimeline([]);
+    setFindings([]);
+    setBrief(null);
+    setIncidents([]);
+    setCollusion([]);
+    setProjection(null);
+    setCausalPaths([]);
+    setBlastRadius(null);
+    setCompliance(null);
+    setRetroScan(null);
+    setSelectedNode(null);
+  }, []);
+
   const handleCreateSession = useCallback(
     async (workspacePath: string, taskDescription: string) => {
       const created = await api.createSession(workspacePath, taskDescription);
       const list = await api.getSessions();
       setSessions(list);
       setCurrentSession(created);
-      setSelectedNode(null);
-      setCausalPaths([]);
-      setBlastRadius(null);
-      setCompliance(null);
-      setRetroScan(null);
+      resetSessionState();
     },
-    []
+    [resetSessionState]
   );
 
   // ant.md P2 #8: fetch the compliance evidence manifest from the real
@@ -394,14 +410,9 @@ export const App: React.FC = () => {
         currentSession={currentSession}
         onSelectSession={(s) => {
           setCurrentSession(s);
-          setSelectedNode(null);
-          // The previous session's causal analysis must not leak into the
-          // newly selected session's views.
-          setCausalPaths([]);
-          setBlastRadius(null);
-          // Stale compliance/retro-scan data must not leak into the new session.
-          setCompliance(null);
-          setRetroScan(null);
+          // Everything the previous session left behind is cleared here; see
+          // resetSessionState for why leaving any of it is not cosmetic.
+          resetSessionState();
         }}
         onCreateSession={handleCreateSession}
         activeTab={activeTab}
@@ -552,9 +563,6 @@ export const App: React.FC = () => {
       {showReportModal && (
         <ForensicReportModal
           session={currentSession}
-          graphData={graphData}
-          timeline={timeline}
-          findings={findings}
           onClose={() => setShowReportModal(false)}
         />
       )}

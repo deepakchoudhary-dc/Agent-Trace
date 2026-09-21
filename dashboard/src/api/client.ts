@@ -10,7 +10,7 @@ import {
   ContextGraphData,
   DiffItem,
   EvidencePath,
-  ForensicReport,
+  ForensicManifest,
   IncidentSummary,
   PolicyFinding,
   ProjectionVerdict,
@@ -19,7 +19,6 @@ import {
   ReviewRunRecord,
   SessionBrief,
   SessionInfo,
-  SignedForensicReport,
   TimelineEvent,
   VerificationResult,
 } from '../types';
@@ -337,10 +336,6 @@ export const api = {
     return request<VerificationResult>(`/sessions/${sessionId}/verify`);
   },
 
-  async getForensicReport(sessionId: string): Promise<ForensicReport> {
-    return request<ForensicReport>(`/sessions/${sessionId}/report`);
-  },
-
   // Causal analysis
   async explainNode(sessionId: string, nodeId: string): Promise<EvidencePath> {
     return request<EvidencePath>(`/sessions/${sessionId}/causal/${nodeId}`);
@@ -397,8 +392,8 @@ export const api = {
     return request<ProjectionVerdict>(`/sessions/${sessionId}/projection/verify`);
   },
 
-  // -- Sealed, chain-bound forensic report (incl. reasoning trail + incidents) --
-  async getSignedForensicReport(sessionId: string): Promise<SignedForensicReport> {
-    return request<SignedForensicReport>(`/sessions/${sessionId}/report`);
+  // -- Sealed, self-consistent, HMAC-signed forensic manifest --
+  async getSignedForensicReport(sessionId: string): Promise<ForensicManifest> {
+    return request<ForensicManifest>(`/sessions/${sessionId}/report`);
   },
 };

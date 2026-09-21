@@ -1,13 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
-import {
-  SessionInfo,
-  ContextGraphData,
-  TimelineEvent,
-  PolicyFinding,
-  SignedForensicReport,
-  VerificationResult,
-} from '../types';
+import { SessionInfo, ForensicManifest, VerificationResult } from '../types';
 import {
   ShieldCheck,
   ShieldAlert,
@@ -19,22 +12,16 @@ import {
 
 interface ForensicReportModalProps {
   session: SessionInfo | null;
-  graphData: ContextGraphData | null;
-  timeline: TimelineEvent[];
-  findings: PolicyFinding[];
   onClose: () => void;
 }
 
 export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
   session,
-  graphData,
-  timeline,
-  findings,
   onClose,
 }) => {
   const [downloading, setDownloading] = useState(false);
   const [verification, setVerification] = useState<VerificationResult | null>(null);
-  const [signedReport, setSignedReport] = useState<SignedForensicReport | null>(null);
+  const [manifest, setManifest] = useState<ForensicManifest | null>(null);
   const [verifying, setVerifying] = useState(true);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -51,110 +38,79 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
     let active = true;
     if (session?.session_id) {
       setVerifying(true);
-      setSignedReport(null);
-      api
-        .verifyChain(session.session_id)
-        .then((res) => {
+      setManifest(null);
+      setVerification(null);
+      void (async () => {
+        // The signed manifest is the single source of truth for this modal, so
+        // it is fetched first: the chain banner below then falls back to the
+        // manifest's own signed verdict rather than numbers read from client
+        // state. Failure leaves the state null — the modal renders the honest
+        // "unavailable" gap instead of a synthetic placeholder.
+        const loaded: ForensicManifest | null = await api
+          .getSignedForensicReport(session.session_id)
+          .catch(() => null);
+        if (active) setManifest(loaded);
+
+        try {
+          const res = await api.verifyChain(session.session_id);
           if (active) setVerification(res);
-        })
-        .catch(() => {
+        } catch {
           if (active) {
-            setVerification({
-              session_id: session.session_id,
-              verified: false,
-              error: 'Daemon verification endpoint unreachable',
-              event_count: timeline.length,
-              last_event_hash: timeline.length > 0 ? timeline[timeline.length - 1].event_hash : '',
-            });
+            // Live re-verification is unreachable. Never synthesise a head hash
+            // from client state — state the signed manifest's own verdict when
+            // it exists, otherwise leave the verdict absent so the banner shows
+            // the gap.
+            setVerification(
+              loaded
+                ? {
+                    session_id: session.session_id,
+                    verified: loaded.chain.integrity_status === 'TAMPER_VERIFIED',
+                    error:
+                      loaded.chain.integrity_error ??
+                      'Live chain re-verification unavailable',
+                    event_count: loaded.chain.chain_length,
+                    last_event_hash: loaded.chain.head_event_hash,
+                  }
+                : null
+            );
           }
-        })
-        // The signed envelope (reasoning trail + incidents) is part of the
-        // report contract; fetch it alongside the chain verdict. Failure leaves
-        // the state null — the modal renders the honest "unavailable" gap
-        // instead of a synthetic placeholder.
-        .then(async () => {
-          try {
-            const report = await api.getSignedForensicReport(session.session_id);
-            if (active) setSignedReport(report);
-          } catch {
-            if (active) setSignedReport(null);
-          }
-        })
-        .finally(() => {
-          if (active) setVerifying(false);
-        });
+        }
+        if (active) setVerifying(false);
+      })();
     }
     return () => {
       active = false;
     };
-  }, [session?.session_id, timeline.length]);
+  }, [session?.session_id]);
 
   if (!session) return null;
 
+  // The manifest is fetched per session, so one loaded for a previously
+  // selected session must never be rendered or exported under the current
+  // session's name. Requiring the ids to match is what keeps the export safe
+  // when the operator switches sessions with this modal still open — the
+  // browser no longer assembles a report, so there is no other guard between
+  // stale session state and the exported file.
+  const currentManifest =
+    manifest && manifest.session.session_id === session.session_id ? manifest : null;
+
   const isChainValid = verification ? verification.verified : false;
-  // Never fabricate a chain root: without a verified head hash the report
-  // shows an explicit gap instead of a fake all-zeros digest.
+  // Never fabricate a chain root: the live verification result first, then the
+  // signed manifest's own head hash, otherwise an explicit gap.
   const lastEventHash =
-    verification?.last_event_hash ||
-    (timeline.length > 0 ? timeline[timeline.length - 1].event_hash : '');
+    verification?.last_event_hash || currentManifest?.chain.head_event_hash || '';
 
   const handleExportJSON = () => {
+    // Nothing signed means nothing to export: emitting a file the server did
+    // not sign would hand the operator an unauthenticated document.
+    if (!currentManifest) return;
     setDownloading(true);
-    const reportData = {
-      manifest_version: '1.0.0',
-      generated_at: new Date().toISOString(),
-      session: {
-        session_id: session.session_id,
-        task_description: session.task_description,
-        workspace_path: session.workspace_path,
-        status: session.status,
-      },
-      cryptographic_verification: {
-        status: isChainValid ? 'VERIFIED' : 'UNVERIFIED',
-        head_event_hash: lastEventHash,
-        total_chained_events: timeline.length,
-        error_detail: verification?.error || null,
-      },
-      audit_statistics: {
-        total_events: timeline.length,
-        context_nodes: graphData?.nodes.length || 0,
-        context_edges: graphData?.edges.length || 0,
-        policy_findings: findings.length,
-      },
-      tamper_evident_timeline: timeline.map((e) => ({
-        seq: e.seq,
-        event_id: e.event_id,
-        event_type: e.event_type,
-        actor_id: e.actor_id,
-        source_adapter: e.source_adapter,
-        timestamp: e.timestamp,
-        event_hash: e.event_hash,
-        prev_hash: e.prev_hash,
-      })),
-      // Server-generated signed envelope: HMAC chain-anchored fields straight
-      // from GET /sessions/{id}/report. Null when the envelope could not be
-      // fetched — the export then honestly lacks the signature instead of
-      // carrying a fabricated one.
-      signed_report: signedReport
-        ? {
-            report_id: signedReport.report_id,
-            generated_at: signedReport.generated_at,
-            integrity_status: signedReport.integrity_status,
-            integrity_error: signedReport.integrity_error || null,
-            head_event_hash: signedReport.head_event_hash,
-            event_count: signedReport.event_count,
-            findings_count: signedReport.findings_count,
-            approvals_count: signedReport.approvals_count,
-            incidents_count: signedReport.incidents_count,
-            report_signature_sha256: signedReport.report_signature_sha256,
-            chain_binding: signedReport.chain_binding,
-            incidents_summary: signedReport.incidents_summary,
-            reasoning_trail: signedReport.reasoning_trail,
-          }
-        : null,
-    };
-
-    const blob = new Blob([JSON.stringify(reportData, null, 2)], { type: 'application/json' });
+    // The daemon builds, self-checks and HMAC-signs this document in one place.
+    // Download it verbatim — re-assembling it here is what produced a report
+    // whose own numbers contradicted each other and that carried no signature.
+    const blob = new Blob([JSON.stringify(currentManifest, null, 2)], {
+      type: 'application/json',
+    });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -209,13 +165,13 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
               <div className="live-dot" />
               <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Recomputing cryptographic hash chain…</span>
             </div>
-          ) : isChainValid ? (
+          ) : isChainValid && verification ? (
             <>
               <ShieldCheck size={26} color="#ffffff" style={{ flexShrink: 0 }} />
               <div>
                 <h4 style={{ fontSize: '13px', fontWeight: 650, color: '#ffffff' }}>Hash Chain: VERIFIED</h4>
                 <p style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                  All {verification?.event_count ?? timeline.length} event hashes recomputed from canonical JSON preimages — chain unbroken.
+                  All {verification.event_count} event hashes recomputed from canonical JSON preimages — chain unbroken.
                 </p>
               </div>
             </>
@@ -232,19 +188,20 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
           )}
         </div>
 
-        {/* Audit Metrics */}
+        {/* Audit Metrics — read from the signed manifest, never from client
+            state: those two sources were never reconciled. */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px' }}>
           <div className="stat">
             <div className="stat-label">SEALED EVENTS</div>
-            <div className="stat-value">{timeline.length}</div>
+            <div className="stat-value">{currentManifest ? currentManifest.audit_statistics.total_events : '—'}</div>
           </div>
           <div className="stat">
             <div className="stat-label">CONTEXT NODES</div>
-            <div className="stat-value">{graphData?.nodes.length || 0}</div>
+            <div className="stat-value">{currentManifest ? currentManifest.audit_statistics.context_nodes : '—'}</div>
           </div>
           <div className="stat">
             <div className="stat-label">POLICY GATES</div>
-            <div className="stat-value">{findings.length}</div>
+            <div className="stat-value">{currentManifest ? currentManifest.audit_statistics.findings : '—'}</div>
           </div>
         </div>
 
@@ -263,13 +220,96 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
           )}
         </div>
 
-        {/* Incidents summary — from the server's signed report, not client-side */}
-        {signedReport && signedReport.incidents_summary.length > 0 && (
+        {/* Signed manifest verdicts — the facts an operator needs and the old
+            browser-assembled export dropped entirely. */}
+        {currentManifest && (
           <div className="flex-col" style={{ gap: '6px' }}>
             <label style={{ fontSize: '11px', fontWeight: 550, color: 'var(--text-muted)' }}>
-              Incidents ({signedReport.incidents_count})
+              Signed Manifest Facts
             </label>
-            {signedReport.incidents_summary.map((inc) => (
+            <div className="flex" style={{ gap: '6px', flexWrap: 'wrap' }}>
+              <span
+                className={`badge ${
+                  currentManifest.chain.integrity_status === 'TAMPER_VERIFIED'
+                    ? 'badge-low'
+                    : 'badge-critical'
+                }`}
+              >
+                {currentManifest.chain.integrity_status}
+              </span>
+              <span className="badge badge-medium">
+                chain length {currentManifest.chain.chain_length}
+              </span>
+              <span
+                className={`badge ${
+                  currentManifest.chain.binding.operator_anchored ? 'badge-low' : 'badge-high'
+                }`}
+              >
+                operator anchor {currentManifest.chain.binding.operator_anchored ? 'present' : 'absent'}
+              </span>
+              <span
+                className={`badge ${currentManifest.task_contract.usable ? 'badge-low' : 'badge-high'}`}
+              >
+                task contract {currentManifest.task_contract.usable ? 'usable' : 'unusable'}
+              </span>
+              <span
+                className={`badge ${
+                  currentManifest.temporal_integrity.events_outside_session_window > 0
+                    ? 'badge-high'
+                    : 'badge-low'
+                }`}
+              >
+                {currentManifest.temporal_integrity.events_outside_session_window} event(s) outside
+                session window
+              </span>
+              <span className="badge badge-medium">
+                agent-scoped {currentManifest.agent_scope.agent_scoped} /{' '}
+                {currentManifest.agent_scope.total}
+              </span>
+            </div>
+            <div className="flex" style={{ gap: '6px', flexWrap: 'wrap' }}>
+              <span className="font-mono" style={{ fontSize: '9.5px', color: 'var(--text-dim)' }}>
+                severity (findings + incidents, {currentManifest.audit_statistics.by_severity.total}):
+              </span>
+              {Object.entries(currentManifest.audit_statistics.by_severity.counts).map(([sev, n]) => (
+                <span key={sev} className={`badge badge-${sev === 'info' ? 'low' : sev}`}>
+                  {sev}: {n}
+                </span>
+              ))}
+              {Object.entries(currentManifest.audit_statistics.by_severity.unknown_counts).map(
+                ([sev, n]) => (
+                  <span key={`unknown-${sev}`} className="badge badge-info">
+                    {sev}: {n}
+                  </span>
+                )
+              )}
+              {currentManifest.audit_statistics.by_severity.max_severity && (
+                <span
+                  className={`badge badge-${
+                    currentManifest.audit_statistics.by_severity.max_severity === 'info'
+                      ? 'low'
+                      : currentManifest.audit_statistics.by_severity.max_severity
+                  }`}
+                >
+                  max: {currentManifest.audit_statistics.by_severity.max_severity}
+                </span>
+              )}
+            </div>
+            {!currentManifest.task_contract.usable && (
+              <p style={{ fontSize: '10.5px', color: 'var(--text-dim)' }}>
+                {currentManifest.task_contract.note}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Incidents summary — from the server's signed report, not client-side */}
+        {currentManifest && currentManifest.incidents_summary.length > 0 && (
+          <div className="flex-col" style={{ gap: '6px' }}>
+            <label style={{ fontSize: '11px', fontWeight: 550, color: 'var(--text-muted)' }}>
+              Incidents ({currentManifest.audit_statistics.incidents})
+            </label>
+            {currentManifest.incidents_summary.map((inc) => (
               <div key={inc.incident_id} className="card" style={{ padding: '8px 10px', fontSize: '11px' }}>
                 <div className="flex-between">
                   <span className={`badge badge-${inc.severity === 'critical' ? 'critical' : inc.severity === 'high' ? 'high' : inc.severity === 'low' ? 'low' : 'medium'}`}>
@@ -288,12 +328,12 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
         {/* Reasoning trail — the model's own captured thinking around risky
             actions. Rendered verbatim from the signed envelope; the server
             already redacts excerpts through the write-boundary redactor. */}
-        {signedReport && signedReport.reasoning_trail.length > 0 && (
+        {currentManifest && currentManifest.reasoning_trail.length > 0 && (
           <div className="flex-col" style={{ gap: '6px' }}>
             <label style={{ fontSize: '11px', fontWeight: 550, color: 'var(--text-muted)' }}>
-              Reasoning Trail ({signedReport.reasoning_trail.length})
+              Reasoning Trail ({currentManifest.reasoning_trail.length})
             </label>
-            {signedReport.reasoning_trail.map((r) => (
+            {currentManifest.reasoning_trail.map((r) => (
               <div key={r.event_id} className="card" style={{ padding: '8px 10px' }}>
                 <div className="flex-between" style={{ marginBottom: '3px' }}>
                   <span className="badge badge-medium">{r.kind}</span>
@@ -309,17 +349,28 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
           </div>
         )}
 
-        {signedReport && signedReport.reasoning_trail.length === 0 && (
+        {currentManifest && currentManifest.reasoning_trail.length === 0 && (
           <p style={{ fontSize: '10.5px', color: 'var(--text-dim)' }}>
             No context-boundary reasoning was captured for this session — the gap is stated, not filled.
           </p>
         )}
 
-        {signedReport && (
+        {currentManifest && (
           <p className="font-mono" style={{ fontSize: '9.5px', color: 'var(--text-dim)', wordBreak: 'break-all' }}>
-            signature: {signedReport.report_signature_sha256}
+            signature: {currentManifest.report_signature.signature}
             <br />
-            chain binding: tip {signedReport.chain_binding.chain_tip.slice(0, 24)}… · len {signedReport.chain_binding.chain_length}
+            chain binding: {currentManifest.chain.integrity_status} · tip{' '}
+            {currentManifest.chain.binding.chain_tip.slice(0, 24)}… · len{' '}
+            {currentManifest.chain.binding.chain_length} · operator-anchored{' '}
+            {currentManifest.chain.binding.operator_anchored ? 'yes' : 'no'}
+          </p>
+        )}
+
+        {!verifying && !currentManifest && (
+          <p style={{ fontSize: '10.5px', color: 'var(--text-dim)' }}>
+            The signed manifest could not be loaded for this session, so there is nothing to export.
+            An unsigned or partly assembled file would not be evidence — the daemon must be
+            reachable to issue one.
           </p>
         )}
 
@@ -328,7 +379,11 @@ export const ForensicReportModal: React.FC<ForensicReportModalProps> = ({
           <button onClick={onClose} className="btn btn-secondary">
             Close
           </button>
-          <button onClick={handleExportJSON} className="btn btn-primary" disabled={downloading}>
+          <button
+            onClick={handleExportJSON}
+            className="btn btn-primary"
+            disabled={downloading || !currentManifest}
+          >
             {downloading ? <Check size={14} /> : <Download size={14} />}
             {downloading ? 'Exported!' : 'Export Report (JSON)'}
           </button>

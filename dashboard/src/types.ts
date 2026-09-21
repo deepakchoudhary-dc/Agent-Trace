@@ -129,25 +129,6 @@ export interface VerificationResult {
   last_event_hash: string;
 }
 
-export interface ForensicReport {
-  report_id: string;
-  session_id: string;
-  generated_at: string;
-  integrity_status: string;
-  integrity_error: string;
-  head_event_hash: string;
-  event_count: number;
-  findings_count: number;
-  approvals_count: number;
-  report_signature_sha256: string;
-  findings_summary?: Array<{
-    finding_id: string;
-    type: string;
-    severity: string;
-    description: string;
-  }>;
-}
-
 export interface EvidencePath {
   path_id: string;
   nodes: string[];
@@ -282,22 +263,38 @@ export interface ReviewRunRecord {
 
 // -- ant.md P2 #8: compliance evidence manifest (EU AI Act / ISO 42001 / SOC 2) --
 
+// Wire format note: build_compliance_bundle (security/compliance.py) returns
+// `chain`, `artifacts`, `standards`, `note` and `bundle_hash`. The previous
+// declaration invented `integrity`, `workspace_path`, `frameworks` and four
+// top-level counts, none of which the server emits — so AuditPanel threw on
+// `compliance.integrity.chain_verified` as soon as a bundle was present.
+
+export interface ComplianceDigest {
+  count: number;
+  sha256: string;
+}
+
 export interface ComplianceBundle {
   bundle_id: string;
   session_id: string;
-  workspace_path: string;
   generated_at: string;
-  event_count: number;
-  findings_count: number;
-  incidents_count: number;
-  approvals_count: number;
-  integrity: {
-    chain_verified: boolean;
-    chain_error: string;
-    head_event_hash: string;
+  chain: {
+    verified: boolean;
+    error: string;
+    last_hash: string;
+    event_count: number;
   };
-  frameworks: Record<string, unknown>;
-  report_signature_sha256: string;
+  artifacts: {
+    events: ComplianceDigest;
+    findings: ComplianceDigest;
+    incidents: ComplianceDigest;
+    approvals: ComplianceDigest;
+    graph: { nodes: number; edges: number; sha256: string };
+    baseline: { count: number; sha256: string };
+  };
+  standards: Record<string, string[]>;
+  note: string;
+  bundle_hash: string;
 }
 
 // -- ant.md P1 #4: retro-scan report (two-stage wide-net re-scan) --
@@ -408,32 +405,158 @@ export type RetroScanResult = RetroScanResponse;
 export type CalibrationPayload = RetroScanResponse['calibration'];
 export type NegativeResultPayload = RetroScanResponse['negative_result'];
 
-// -- Sealed forensic report envelope (real GET /sessions/{id}/report) --
-// The signed manifest also carries the reasoning trail and incidents summary;
-// both are surfaced in the dashboard instead of being dropped.
+// -- Sealed forensic manifest (real GET /sessions/{id}/report) --
+// One document, built and HMAC-signed by the daemon from a single set of
+// inputs (security.forensic_manifest), which refuses to sign a manifest whose
+// own numbers disagree. The dashboard downloads it verbatim instead of
+// re-assembling it from unreconciled client state.
 
-export interface ReasoningTrailEntry {
+export interface ForensicManifestSession {
+  session_id: string;
+  task_description: string;
+  workspace_path: string;
+  status: string;
+  started_at: string | null;
+  stopped_at: string | null;
+}
+
+export interface ForensicTaskContract {
+  description: string;
+  usable: boolean;
+  note: string;
+}
+
+export interface ForensicChainBinding {
+  chain_tip: string;
+  chain_length: number;
+  operator_anchor: string | null;
+  chain_anchored: boolean;
+  operator_anchored: boolean;
+  anchored: boolean;
+}
+
+export interface ForensicChain {
+  integrity_status: 'TAMPER_VERIFIED' | 'TAMPER_DETECTED';
+  integrity_error: string | null;
+  head_event_hash: string;
+  chain_length: number;
+  genesis_present: boolean;
+  binding: ForensicChainBinding;
+}
+
+export interface ForensicTemporalIntegrity {
+  ordering_basis: string;
+  note: string;
+  session_window: {
+    started_at: string | null;
+    stopped_at: string | null;
+  };
+  observation_time: {
+    captured: number;
+    missing: number;
+  };
+  events_outside_session_window: number;
+}
+
+export interface ForensicSeverityBreakdown {
+  counts: Record<string, number>;
+  unknown_counts: Record<string, number>;
+  total: number;
+  max_severity: string | null;
+}
+
+export interface ForensicAuditStatistics {
+  total_events: number;
+  findings: number;
+  incidents: number;
+  approvals: number;
+  context_nodes: number;
+  context_edges: number;
+  by_severity: ForensicSeverityBreakdown;
+  by_actor_class: Record<string, number>;
+}
+
+export interface ForensicAgentScope {
+  counts: Record<string, number>;
+  total: number;
+  agent_scoped: number;
+  ambient: number;
+  agent_scoped_classes: string[];
+}
+
+export interface ForensicTimelineEntry {
+  seq: number;
+  event_id: string;
+  event_type: string;
+  actor_id: string;
+  actor_class: string;
+  source_adapter: string;
+  timestamp: string;
+  observed_at: string | null;
+  time_basis: 'observed' | 'backfilled' | 'unknown';
+  confidence: ConfidenceLevel;
+  severity: string | null;
+  event_hash: string;
+  prev_hash: string;
+}
+
+export interface ForensicFindingsSummaryEntry {
+  finding_id: string;
+  type: string;
+  severity: string | null;
+  confidence: string;
+  description: string;
+}
+
+export interface ForensicIncidentsSummaryEntry {
+  incident_id: string;
+  incident_type: string;
+  severity: string | null;
+  confidence: string;
+  title: string;
+  related_events: string[];
+}
+
+export interface ForensicReasoningTrailEntry {
   event_id: string;
   timestamp: string;
   kind: string;
   excerpt: string;
 }
 
-export interface IncidentSummaryEntry {
-  incident_id: string;
-  incident_type: string;
-  severity: string;
-  title: string;
-  related_events: string[];
+export interface ForensicReportSignature {
+  algo: 'hmac-sha256';
+  key_id: 'report-key-v1';
+  signature: string;
 }
 
-export interface SignedForensicReport extends ForensicReport {
-  incidents_count: number;
-  reasoning_trail: ReasoningTrailEntry[];
-  incidents_summary: IncidentSummaryEntry[];
-  chain_binding: {
-    chain_tip: string;
-    chain_length: number;
-  };
-  report_signature: string;
+// The timeline is embedded in full unless the session is enormous, in which
+// case the most recent window is embedded and the omission is stated here.
+// `total_events` and the audit statistics still describe the whole session.
+export interface ForensicTimelineBlock {
+  returned: number;
+  total_events: number;
+  truncated: boolean;
+  first_seq: number | null;
+  last_seq: number | null;
+  tail_hash: string | null;
+  note: string;
+}
+
+export interface ForensicManifest {
+  manifest_version: string;
+  report_id: string;
+  generated_at: string;
+  session: ForensicManifestSession;
+  task_contract: ForensicTaskContract;
+  chain: ForensicChain;
+  temporal_integrity: ForensicTemporalIntegrity;
+  audit_statistics: ForensicAuditStatistics;
+  agent_scope: ForensicAgentScope;
+  timeline: ForensicTimelineBlock;
+  tamper_evident_timeline: ForensicTimelineEntry[];
+  findings_summary: ForensicFindingsSummaryEntry[];
+  incidents_summary: ForensicIncidentsSummaryEntry[];
+  reasoning_trail: ForensicReasoningTrailEntry[];
+  report_signature: ForensicReportSignature;
 }

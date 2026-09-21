@@ -352,18 +352,19 @@ export const AuditPanel: React.FC<AuditPanelProps> = ({
                     Compliance Manifest (EU AI Act / ISO 42001 / SOC 2)
                   </span>
                   <span
-                    className={`badge ${compliance.integrity.chain_verified ? 'badge-low' : 'badge-critical'}`}
+                    className={`badge ${compliance.chain.verified ? 'badge-low' : 'badge-critical'}`}
                   >
-                    {compliance.integrity.chain_verified ? 'chain verified' : 'CHAIN FAILED'}
+                    {compliance.chain.verified ? 'chain verified' : 'CHAIN FAILED'}
                   </span>
                 </div>
                 <div style={{ fontSize: '10.5px', color: 'var(--text-dim)' }}>
-                  {compliance.event_count} events · {compliance.findings_count} findings ·{' '}
-                  {compliance.incidents_count} incidents · {compliance.approvals_count} approvals
+                  {compliance.chain.event_count} events · {compliance.artifacts.findings.count}{' '}
+                  findings · {compliance.artifacts.incidents.count} incidents ·{' '}
+                  {compliance.artifacts.approvals.count} approvals
                 </div>
                 <div className="font-mono" style={{ fontSize: '9.5px', color: 'var(--text-dim)' }}>
-                  head: {compliance.integrity.head_event_hash.slice(0, 24)}… · sig:{' '}
-                  {compliance.report_signature_sha256.slice(0, 24)}…
+                  head: {compliance.chain.last_hash.slice(0, 24)}… · hash:{' '}
+                  {compliance.bundle_hash.slice(0, 24)}…
                 </div>
               </div>
             ) : (
