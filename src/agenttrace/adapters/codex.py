@@ -104,6 +104,11 @@ class CodexAdapter(AdapterBase):
         # filter this adapter would ingest other projects' transcripts and
         # stamp them with this session's workspace as provenance.
         self._rollout_cwd: dict[str, str] = {}
+        # Session identity, also declared only in session_meta. The per-line
+        # payloads (user_message / response_item / event_msg) carry neither
+        # session_id nor thread_id, so reading identity off them produced
+        # `codex:unknown` for every event and destroyed actor attribution.
+        self._rollout_session_id: dict[str, str] = {}
 
     @staticmethod
     def _is_shell_tool(name: str) -> bool:
@@ -116,6 +121,7 @@ class CodexAdapter(AdapterBase):
             "positions": dict(self._positions),
             "invoked": sorted(self._invoked),
             "rollout_cwd": dict(self._rollout_cwd),
+            "rollout_session_id": dict(self._rollout_session_id),
         }
 
     def restore_cursor(self, state: dict[str, Any]) -> None:
@@ -128,6 +134,13 @@ class CodexAdapter(AdapterBase):
         rollout_cwd = state.get("rollout_cwd", {})
         if isinstance(rollout_cwd, dict):
             self._rollout_cwd = {str(k): str(v) for k, v in rollout_cwd.items()}
+        # Identity is restored with the cursor so events ingested after a daemon
+        # restart keep their actor instead of degrading to `codex:unknown`.
+        rollout_session_id = state.get("rollout_session_id", {})
+        if isinstance(rollout_session_id, dict):
+            self._rollout_session_id = {
+                str(k): str(v) for k, v in rollout_session_id.items()
+            }
 
     def commit_cursor(self) -> None:
         """The ingest batch succeeded: staged cursor state becomes durable."""
@@ -217,6 +230,11 @@ class CodexAdapter(AdapterBase):
             cwd = payload.get("cwd")
             if isinstance(cwd, str) and cwd:
                 self._rollout_cwd[path_key] = cwd
+            # session_meta is the only line that names the session; cache it so
+            # later lines can be attributed to it.
+            identity = payload.get("id") or payload.get("session_id") or payload.get("thread_id")
+            if isinstance(identity, str) and identity:
+                self._rollout_session_id[path_key] = identity
         declared = self._rollout_cwd.get(path_key)
         if declared is None:
             # Stated assumption: Codex writes session_meta as the first line
@@ -291,7 +309,17 @@ class CodexAdapter(AdapterBase):
             return events
 
         ptype = payload.get("type", "")
-        actor = f"codex:{payload.get('session_id') or payload.get('thread_id') or 'unknown'}"
+        # Identity is cached from the rollout's session_meta line. Reading it
+        # off THIS line's payload always yielded None, because user_message /
+        # response_item / event_msg do not carry session_id or thread_id — so
+        # every event was attributed to `codex:unknown`.
+        identity = (
+            self._rollout_session_id.get(str(rollout))
+            or payload.get("session_id")
+            or payload.get("thread_id")
+            or "unknown"
+        )
+        actor = f"codex:{identity}"
         common: dict[str, Any] = {
             "rollout": str(rollout),
             "ts": envelope.get("timestamp", ""),
