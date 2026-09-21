@@ -81,7 +81,17 @@ def test_pg_never_crashes_on_arbitrary_bytes(data: bytes) -> None:
         return
     assert isinstance(queries, list)
     assert isinstance(remainder, bytes)
-    assert len(remainder) < max(5, len(data))
+    assert len(remainder) <= len(data)  # never fabricates or grows the stream
+    # Holding the whole input back is legitimate ONLY when the first message is
+    # genuinely incomplete (its declared length exceeds the bytes that have
+    # arrived). The previous assertion here demanded strict progress on any
+    # input of >=5 bytes, which contradicted the parser's documented streaming
+    # contract: a 5-byte header declaring a payload that has not arrived yet
+    # (e.g. b"e\x00\x00\x00\x05") is a valid remainder, not a stall. A stall on
+    # a COMPLETE message is still caught, which is the livelock this guards.
+    if len(remainder) >= 5:
+        declared = int.from_bytes(remainder[1:5], "big")
+        assert 1 + declared > len(remainder), "no progress on a complete message"
     assert all(isinstance(q, str) and q for q in queries)
 
 
