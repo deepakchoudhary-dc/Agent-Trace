@@ -1,9 +1,13 @@
 """Tests for canonical event models and hash-chain integrity."""
 
+import hashlib
+import json
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from agenttrace.models.events import (
     ApprovalEvent,
+    CommandEvent,
     ConfidenceLevel,
     EventBase,
     EventType,
@@ -13,6 +17,7 @@ from agenttrace.models.events import (
     PolicyFindingEvent,
     ProcessEvent,
     ToolRequestEvent,
+    event_from_dict,
 )
 
 
@@ -176,3 +181,69 @@ class TestSpecificEvents:
         )
         assert event.event_type == EventType.POLICY_FINDING
         assert event.severity == "critical"
+
+
+class TestCanonicalEnvelopeBackwardCompatibility:
+    """Adding a field to the hash preimage must not invalidate sealed history.
+
+    The verifier rebuilds the event from its stored envelope and RECOMPUTES the
+    hash from the model, so a field added to `canonical_dict` after events were
+    already sealed would recompute every historical row to a different digest —
+    the whole ledger would read as "cryptographic tamper detected". `observed_at`
+    is therefore omitted from the preimage while unset, and committed once set.
+    """
+
+    def _seal_as_legacy(self, event: EventBase) -> str:
+        """Hash the event the way it was hashed BEFORE observed_at existed."""
+        envelope = event.model_dump(mode="json")
+        envelope.pop("observed_at", None)
+        envelope.pop("event_hash", None)
+        canonical = json.dumps(
+            envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def test_envelope_without_observed_at_still_verifies(self) -> None:
+        event = CommandEvent(
+            session_id=uuid4(),
+            actor_id="codex:abc",
+            source_adapter="codex_cli",
+            command="ls",
+        )
+        legacy_hash = self._seal_as_legacy(event)
+
+        # Exactly what the ledger does on read: rebuild from the stored envelope.
+        stored = event.model_dump(mode="json")
+        stored.pop("observed_at", None)
+        rebuilt = event_from_dict(stored)
+
+        assert rebuilt.compute_hash() == legacy_hash
+        assert rebuilt.observed_at is None
+
+    def test_observed_at_is_committed_once_set(self) -> None:
+        event = CommandEvent(
+            session_id=uuid4(),
+            actor_id="codex:abc",
+            source_adapter="codex_cli",
+            command="ls",
+        )
+        event.observed_at = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
+
+        assert "observed_at" in event.canonical_dict()
+        assert event_from_dict(event.canonical_dict()).compute_hash() == event.compute_hash()
+
+    def test_backdating_the_observation_clock_is_detected(self) -> None:
+        """The value is genuinely protected, not merely present."""
+        event = CommandEvent(
+            session_id=uuid4(),
+            actor_id="codex:abc",
+            source_adapter="codex_cli",
+            command="ls",
+        )
+        event.observed_at = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
+        original = event.compute_hash()
+
+        tampered = event_from_dict(event.canonical_dict())
+        tampered.observed_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        assert tampered.compute_hash() != original

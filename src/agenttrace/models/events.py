@@ -89,6 +89,15 @@ class EventBase(BaseModel):
         data = self.model_dump(mode="json")
         # Exclude event_hash itself from the preimage to avoid recursion
         data.pop("event_hash", None)
+        # `observed_at` is omitted from the preimage while it is unset, so that
+        # events sealed BEFORE the field existed hash exactly as they did then.
+        # This is not tidiness: the verifier rebuilds the model from the stored
+        # envelope and RECOMPUTES the hash from it, so an old envelope without
+        # the key would recompute to a different digest and every historical
+        # event would read as "cryptographic tamper detected". Once the field is
+        # set, its value is committed to the chain like any other field.
+        if data.get("observed_at") is None:
+            data.pop("observed_at", None)
         return data
 
     def canonical_bytes(self) -> bytes:
