@@ -1,4 +1,4 @@
-﻿"""Tests for the self-improving review loop â€” real artifacts & evidence.
+"""Tests for the self-improving review loop — real artifacts & evidence.
 
 The review loop must judge REAL evidence: actual file content from the
 audited workspace and actual exit codes from allowlisted verification
@@ -177,7 +177,7 @@ class TestPlanner:
 
 
 class TestWorker:
-    """Tests for the Worker component â€” real file and verification artifacts."""
+    """Tests for the Worker component — real file and verification artifacts."""
 
     def test_worker_reads_real_file_content(self, tmp_path: Path) -> None:
         ws = _make_workspace(tmp_path)
@@ -266,7 +266,7 @@ class TestWorker:
 
 
 class TestReviewers:
-    """Tests for the reviewer components â€” verdicts from real evidence."""
+    """Tests for the reviewer components — verdicts from real evidence."""
 
     def test_spec_compliance_passes_on_real_evidence(self, tmp_path: Path) -> None:
         ws = _make_workspace(tmp_path)

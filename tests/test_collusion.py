@@ -1,4 +1,4 @@
-﻿"""S5-4: multi-agent collusion correlation - observable half only."""
+"""S5-4: multi-agent collusion correlation - observable half only."""
 
 import asyncio
 from pathlib import Path

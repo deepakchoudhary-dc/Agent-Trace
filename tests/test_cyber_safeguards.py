@@ -1,4 +1,4 @@
-﻿"""Tests for cybersecurity safeguards and vulnerability remediations (cyber.md)."""
+"""Tests for cybersecurity safeguards and vulnerability remediations (cyber.md)."""
 
 from __future__ import annotations
 

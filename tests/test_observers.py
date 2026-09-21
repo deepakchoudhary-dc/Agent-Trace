@@ -1,4 +1,4 @@
-﻿"""Tests for observer hygiene fixes (P1-5):
+"""Tests for observer hygiene fixes (P1-5):
 
 - GitMonitor: read-only index check (never ``git write-tree``)
 - TerminalObserver: post-rotation history capture, bounded seen-set
@@ -254,11 +254,11 @@ class TestNetworkObserver:
         patched = self._patch_connections([conn])
         try:
             _run(observer._scan_connections())
-            # Same connection still alive â†’ suppressed
+            # Same connection still alive → suppressed
             _run(observer._scan_connections())
             assert len([e for e in events if isinstance(e, NetworkEvent)]) == 1
 
-            # Window expires â†’ a fresh connection to the same destination is
+            # Window expires → a fresh connection to the same destination is
             # a NEW egress
             patched.time = type(
                 "_FakeTime",

@@ -1,7 +1,7 @@
-﻿"""Tests for the transcript-based adapters (Claude Code, Codex CLI).
+"""Tests for the transcript-based adapters (Claude Code, Codex CLI).
 
 These adapters turn real on-disk agent transcripts into canonical events,
-including the model's *reasoning* â€” the evidence the case-study incidents
+including the model's *reasoning* — the evidence the case-study incidents
 show is essential to understanding why an agent acted.
 """
 
@@ -296,7 +296,7 @@ class TestClaudeAdapter:
         first_line_end = transcript.read_bytes().find(b"\n") + 1
         assert adapter._positions[str(transcript)] == first_line_end
 
-        # The rest of the line arrives â€” it is parsed exactly once
+        # The rest of the line arrives — it is parsed exactly once
         with open(transcript, "a", encoding="utf-8") as f:
             f.write(pending[cut:] + "\n")
         events = await adapter.poll()
@@ -464,7 +464,7 @@ class TestCodexAdapter:
         first_line_end = rollout.read_bytes().find(b"\n") + 1
         assert adapter._positions[str(rollout)] == first_line_end
 
-        # The rest of the line arrives â€” it is parsed exactly once
+        # The rest of the line arrives — it is parsed exactly once
         with open(rollout, "a", encoding="utf-8") as f:
             f.write(pending[cut:] + "\n")
         events = await adapter.poll()
@@ -599,7 +599,7 @@ class TestCopilotAdapter:
         assert cursor["positions"][str(log_path)] > 0
         assert cursor["seen_prompts"]
 
-        # Resumed adapter keeps the persisted offsets â€” start() must not
+        # Resumed adapter keeps the persisted offsets — start() must not
         # clobber them with the current EOF.
         resumed = self._adapter(log_path, workspace, monkeypatch)
         resumed.restore_cursor(cursor)
