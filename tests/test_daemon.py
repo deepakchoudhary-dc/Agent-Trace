@@ -1337,3 +1337,32 @@ async def test_failed_resume_leaves_session_unadopted(
         )
     finally:
         await daemon2.stop()
+
+
+# -- Truthful stop: unknown sessions must fail, not fake-success. The UI
+# flips LIVE to SEALED based on this verdict; a silent no-op lies to the
+# operator about whether the ledger was actually sealed. --
+
+
+@pytest.mark.asyncio
+async def test_stop_unknown_session_returns_false(tmp_path: Path) -> None:
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    try:
+        assert await daemon.stop_session(uuid4()) is False
+    finally:
+        await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_known_session_returns_true(tmp_path: Path) -> None:
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    try:
+        session = await daemon.create_session(
+            workspace_path=str(tmp_path),
+            task_description="stop-truth",
+        )
+        assert await daemon.stop_session(session.session_id) is True
+    finally:
+        await daemon.stop()

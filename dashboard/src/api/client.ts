@@ -54,15 +54,23 @@ export function getApiToken(): string | null {
 
 export function setApiToken(token: string): void {
   if (typeof window !== 'undefined') {
-    // Session-scoped only. A daemon token must not outlive the tab it was
-    // issued for; localStorage persistence would leave a live credential
-    // readable by any same-origin script after the operator walks away.
+    // Persisted for the tab session only (sessionStorage clears on tab close):
+    // a token that vanished on every refresh caused a 401 request storm and
+    // made the dashboard look broken. The window override is kept in sync so
+    // the in-memory view and storage never disagree.
     sessionStorage.setItem('agenttrace_token', token);
+    (window as unknown as { __AGENTTRACE_TOKEN__?: string }).__AGENTTRACE_TOKEN__ = token;
   }
 }
 
 export const MISSING_TOKEN_MESSAGE =
-  'API token required — paste it from ~/.agenttrace/api_token (gear icon, top right).';
+  'API token required - paste it from ~/.agenttrace/api_token (gear icon, top right).';
+
+// How many of the most recent events the timeline view loads. The daemon
+// serves one ascending page per request and defaults to the FIRST 500 events
+// of a session; a long-running live session would therefore show only its
+// oldest (days-old) activity unless the client explicitly walks to the tail.
+export const TIMELINE_TAIL_EVENTS = 500;
 
 export function setApiTokenOverride(token: string): void {
   (window as unknown as { __AGENTTRACE_TOKEN__?: string }).__AGENTTRACE_TOKEN__ = token;
@@ -156,6 +164,80 @@ async function requestWithCount<T>(endpoint: string): Promise<{ items: T; total:
   }
 }
 
+// Total collection size without pulling the whole page: the daemon echoes the
+// item count in X-Total-Count on every list endpoint, so a limit=1 probe is
+// enough to discover the offset needed to reach the collection's tail.
+async function getCollectionCount(endpoint: string): Promise<number> {
+  const apiBase = getApiBase();
+  const token = getApiToken();
+  const url = `${apiBase}${endpoint}?limit=1&offset=0`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(token ? { 'X-AgentTrace-Token': token } : {}),
+  };
+
+  try {
+    const res = await fetch(url, { headers });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+      const message =
+        res.status === 401 && !errBody.detail
+          ? MISSING_TOKEN_MESSAGE
+          : errBody.detail || `Request failed with status ${res.status}`;
+      throw new ApiError(res.status, message);
+    }
+    const totalHeader = res.headers.get('X-Total-Count');
+    if (totalHeader !== null) {
+      const total = Number(totalHeader);
+      return Number.isFinite(total) ? total : 0;
+    }
+    const body = (await res.json()) as unknown[];
+    return Array.isArray(body) ? body.length : 0;
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      throw err;
+    }
+    throw new Error(
+      `AgentTrace daemon unreachable at ${apiBase}. Ensure daemon is running.`,
+      { cause: err }
+    );
+  }
+}
+
+// Fetch one explicit offset/limit page of a collection endpoint.
+async function requestWithPage<T>(endpoint: string, offset: number, limit: number): Promise<T> {
+  const apiBase = getApiBase();
+  const token = getApiToken();
+  const url = `${apiBase}${endpoint}?offset=${offset}&limit=${limit}`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(token ? { 'X-AgentTrace-Token': token } : {}),
+  };
+
+  try {
+    const res = await fetch(url, { headers });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+      const message =
+        res.status === 401 && !errBody.detail
+          ? MISSING_TOKEN_MESSAGE
+          : errBody.detail || `Request failed with status ${res.status}`;
+      throw new ApiError(res.status, message);
+    }
+    return (await res.json()) as T;
+  } catch (err: unknown) {
+    if (err instanceof ApiError) {
+      throw err;
+    }
+    throw new Error(
+      `AgentTrace daemon unreachable at ${apiBase}. Ensure daemon is running.`,
+      { cause: err }
+    );
+  }
+}
+
 export const api = {
   // Session management
   async getSessions(): Promise<SessionInfo[]> {
@@ -191,6 +273,16 @@ export const api = {
   // Timeline & Diffs
   async getTimeline(sessionId: string): Promise<TimelineEvent[]> {
     return request<TimelineEvent[]>(`/sessions/${sessionId}/timeline`);
+  },
+
+  // The most recent window of a session's events. The daemon serves ascending
+  // pages and defaults to the FIRST page, so an unparameterized fetch freezes
+  // a long session's "live" view on its oldest events. Walking to the tail
+  // keeps the operator watching what the agent is doing *now*.
+  async getTimelineTail(sessionId: string, count: number): Promise<TimelineEvent[]> {
+    const total = await getCollectionCount(`/sessions/${sessionId}/timeline`);
+    const offset = Math.max(0, total - count);
+    return requestWithPage<TimelineEvent[]>(`/sessions/${sessionId}/timeline`, offset, count);
   },
 
   async getDiffs(sessionId: string): Promise<DiffItem[]> {

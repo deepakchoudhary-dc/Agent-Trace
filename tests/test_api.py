@@ -367,6 +367,16 @@ def test_review_run_missing_record_returns_404(client, tmp_path):
     res = c.get(f"/sessions/{sid}/review", headers=_auth_headers(tokens))
     assert res.status_code == 404
 
+
+def test_stop_unknown_session_returns_404(client):
+    c, (_, tokens) = client
+    res = c.post(
+        f"/sessions/{UUID(int=999)}/stop",
+        headers=_auth_headers(tokens),
+    )
+    assert res.status_code == 404
+
+
 # -- Brokered execution endpoints (plan2.md P0.2) -----------------------------
 
 

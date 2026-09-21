@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { api, ApiError, setApiTokenOverride } from './api/client';
+import { api, ApiError, setApiTokenOverride, setApiToken, TIMELINE_TAIL_EVENTS } from './api/client';
 import {
   SessionInfo,
   ContextGraphData,
@@ -70,11 +70,16 @@ export const App: React.FC = () => {
   const [tokenDraft, setTokenDraft] = useState('');
 
   // The daemon rejects unauthenticated requests; the token lives in
-  // ~/.agenttrace/api_token and is held in-page for this tab only.
+  // ~/.agenttrace/api_token and is held for this tab session. Persisting to
+  // sessionStorage matters: keeping it only in a window variable meant every
+  // refresh silently dropped the token and each 2.5s live poll re-errored
+  // with 401s. sessionStorage survives refresh but dies with the tab, so the
+  // credential still never outlives the operator's session.
   const handleSaveToken = useCallback(() => {
     const trimmed = tokenDraft.trim();
     if (!trimmed) return;
     setApiTokenOverride(trimmed);
+    setApiToken(trimmed);
     setTokenDraft('');
     setConnectionError('');
     loadSessions();
@@ -84,8 +89,14 @@ export const App: React.FC = () => {
   const [dataVerified, setDataVerified] = useState<boolean>(true);
 
   const requestIdRef = useRef<number>(0);
+  const pollInFlightRef = useRef<boolean>(false);
   const currentSessionIdRef = useRef<string | null>(null);
   currentSessionIdRef.current = currentSession?.session_id || null;
+
+  // Surface the live session first: an operator opening the dashboard while an
+  // agent works should land on the active recording, not the newest sealed one.
+  const pickInitialSession = (list: SessionInfo[]): SessionInfo =>
+    list.find((s) => s.status === 'active') ?? list[0];
 
   // Load Sessions on Mount
   useEffect(() => {
@@ -106,7 +117,7 @@ export const App: React.FC = () => {
       const list = await api.getSessions();
       setSessions(list);
       if (list.length > 0 && !currentSessionIdRef.current) {
-        setCurrentSession(list[0]);
+        setCurrentSession(pickInitialSession(list));
       }
     } catch (err: unknown) {
       setConnectionError(
@@ -117,7 +128,8 @@ export const App: React.FC = () => {
     }
   };
 
-  const loadSessionData = useCallback(async (sessionId: string, showSpinner: boolean = false) => {
+  const loadSessionData = useCallback(
+    async (sessionId: string, showSpinner: boolean = false, isLightPoll: boolean = false) => {
     const currentRequestId = ++requestIdRef.current;
     if (showSpinner) {
       setLoading(true);
@@ -125,13 +137,22 @@ export const App: React.FC = () => {
     setConnectionError('');
 
     try {
+      // Load-shedding for long sessions: the heavy payloads (graph, collusion)
+      // and the O(n) analysis enrichment only refresh on initial load or the
+      // slow 30s cadence; the fast 2.5s live poll refreshes only the cheap
+      // tail endpoints. Refetching the whole graph + blast radius every 2.5s
+      // is what made the dashboard lag and the tab's memory balloon.
+      const heavy = !isLightPoll;
       const [graph, time, fnd, briefData, incData, colData, projData] = await Promise.all([
-        api.getGraph(sessionId),
-        api.getTimeline(sessionId),
+        heavy ? api.getGraph(sessionId) : Promise.resolve(null),
+        // The most recent window, not the daemon's default FIRST page: an
+        // unparameterized fetch leaves a multi-thousand-event live session
+        // pinned to its oldest (days-old) events, which read as "live".
+        api.getTimelineTail(sessionId, TIMELINE_TAIL_EVENTS),
         api.getFindings(sessionId),
         api.getSessionBrief(sessionId),
         api.getIncidents(sessionId),
-        api.getCollusion(sessionId),
+        heavy ? api.getCollusion(sessionId) : Promise.resolve(null),
         api.getProjectionVerdict(sessionId),
       ]);
 
@@ -139,26 +160,31 @@ export const App: React.FC = () => {
       if (currentRequestId !== requestIdRef.current) return;
 
       setDataVerified(true);
-      setGraphData(graph);
+      if (graph) setGraphData(graph);
       setTimeline(time);
       setFindings(fnd);
       setBrief(briefData);
       setIncidents(incData);
-      setCollusion(colData);
+      if (colData) setCollusion(colData);
       setProjection(projData);
 
-      // Causal & blast radius for selected or first node
-      const targetNodeId = selectedNode?.node_id || (graph.nodes.length > 0 ? graph.nodes[0].node_id : null);
-      if (targetNodeId) {
-        try {
-          const path = await api.explainNode(sessionId, targetNodeId);
-          const br = await api.analyzeBlastRadius(sessionId, targetNodeId);
-          if (currentRequestId === requestIdRef.current) {
-            setCausalPaths(path ? [path] : []);
-            setBlastRadius(br);
+      // Causal & blast radius for selected or first node — O(n) analysis, so
+      // it belongs to the heavy cadence only, never the 2.5s live poll.
+      if (heavy) {
+        const targetNodeId =
+          selectedNode?.node_id ||
+          (graph && graph.nodes.length > 0 ? graph.nodes[0].node_id : null);
+        if (targetNodeId) {
+          try {
+            const path = await api.explainNode(sessionId, targetNodeId);
+            const br = await api.analyzeBlastRadius(sessionId, targetNodeId);
+            if (currentRequestId === requestIdRef.current) {
+              setCausalPaths(path ? [path] : []);
+              setBlastRadius(br);
+            }
+          } catch {
+            // Optional causal enrichment
           }
-        } catch {
-          // Optional causal enrichment
         }
       }
     } catch (err: unknown) {
@@ -189,27 +215,39 @@ export const App: React.FC = () => {
         setLoading(false);
       }
     }
-  }, [selectedNode]);
+    },
+    [selectedNode]
+  );
 
-  // Live Auto-Polling Loop (Polls every 2.5 seconds when active)
+  // Live Auto-Polling Loop (Polls every 2.5 seconds when active). The in-flight
+  // guard matters: when the daemon is slow or unreachable, a 2.5s interval
+  // stacks overlapping request storms (every pending fetch re-throws the same
+  // CSP/network error) and floods the console with duplicated failures.
   useEffect(() => {
     if (!livePolling) return;
 
     const interval = setInterval(async () => {
-      // 1. Refresh sessions list in background
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
       try {
-        const list = await api.getSessions();
-        setSessions(list);
-        if (list.length > 0 && !currentSessionIdRef.current) {
-          setCurrentSession(list[0]);
+        // 1. Refresh sessions list in background
+        try {
+          const list = await api.getSessions();
+          setSessions(list);
+          if (list.length > 0 && !currentSessionIdRef.current) {
+            setCurrentSession(pickInitialSession(list));
+          }
+        } catch {
+          // Daemon offline
         }
-      } catch {
-        // Daemon offline
-      }
 
-      // 2. Refresh active session data
-      if (currentSessionIdRef.current) {
-        loadSessionData(currentSessionIdRef.current, false);
+        // 2. Refresh active session data — light cadence: only the cheap tail
+        // endpoints, so a long session stays responsive without ballooning.
+        if (currentSessionIdRef.current) {
+          loadSessionData(currentSessionIdRef.current, false, true);
+        }
+      } finally {
+        pollInFlightRef.current = false;
       }
     }, 2500);
 
@@ -274,6 +312,20 @@ export const App: React.FC = () => {
     }
   };
 
+  // Stop recording: POST /sessions/{id}/stop seals the ledger, then the
+  // session record is refetched so the LIVE badge flips to SEALED without
+  // a manual refresh.
+  const handleStopSession = async (sessionId: string): Promise<void> => {
+    try {
+      await api.stopSession(sessionId);
+      const fresh = await api.getSession(sessionId).catch(() => null);
+      if (fresh) setCurrentSession(fresh);
+      await loadSessions();
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to stop session');
+    }
+  };
+
   // Retro-scan (ant.md P1 #4): re-run the two-stage wide-net detector sweep
   // over stored history. Real POST /rescan — never client-side synthesis.
   const handleRunRetroScan = useCallback(async () => {
@@ -288,6 +340,24 @@ export const App: React.FC = () => {
       setRetroScanning(false);
     }
   }, [currentSession, retroScanning]);
+
+  // Start recording a new session (Navbar "New Audit"). The daemon boots its
+  // observer stack in POST /sessions; on success the directory is re-fetched
+  // and the fresh live session is selected so the operator lands on it.
+  const handleCreateSession = useCallback(
+    async (workspacePath: string, taskDescription: string) => {
+      const created = await api.createSession(workspacePath, taskDescription);
+      const list = await api.getSessions();
+      setSessions(list);
+      setCurrentSession(created);
+      setSelectedNode(null);
+      setCausalPaths([]);
+      setBlastRadius(null);
+      setCompliance(null);
+      setRetroScan(null);
+    },
+    []
+  );
 
   // ant.md P2 #8: fetch the compliance evidence manifest from the real
   // GET /sessions/{id}/compliance route. Failure surfaces as "null" (panel
@@ -309,7 +379,12 @@ export const App: React.FC = () => {
     };
   }, [currentSession?.session_id]);
 
-  const showInitialSkeleton = loading && sessions.length === 0 && !connectionError;
+  // Skeleton when there is nothing to show yet OR a fresh heavy load is still
+  // in flight: after saving the token the graph/collusion/brief bundle can
+  // take seconds (server-side), and without this the operator stares at a
+  // blank shell — which read as "the app did nothing". Light polls never set
+  // `loading`, so the skeleton cannot flash during normal live updates.
+  const showInitialSkeleton = loading && !connectionError && !graphData;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', background: '#000000' }}>
@@ -328,6 +403,7 @@ export const App: React.FC = () => {
           setCompliance(null);
           setRetroScan(null);
         }}
+        onCreateSession={handleCreateSession}
         activeTab={activeTab}
         onTabChange={setActiveTab}
         onOpenReport={() => setShowReportModal(true)}
@@ -335,6 +411,7 @@ export const App: React.FC = () => {
         loading={loading}
         livePolling={livePolling}
         onToggleLivePolling={() => setLivePolling((prev) => !prev)}
+        onStopSession={handleStopSession}
       />
 
       {/* Offline / Auth Alert Banner */}

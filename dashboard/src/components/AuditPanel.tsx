@@ -7,6 +7,8 @@ import {
   ProjectionVerdict,
   RetroScanResponse,
   SessionBrief,
+  incidentKey,
+  incidentEvidenceCount,
 } from '../types';
 import {
   BadgeCheck,
@@ -216,10 +218,10 @@ export const AuditPanel: React.FC<AuditPanelProps> = ({
           ) : (
             <div className="flex-col" style={{ gap: '10px' }}>
               {incidents.map((inc) => (
-                <div key={inc.incident_id} style={card} className="card">
+                <div key={incidentKey(inc)} style={card} className="card">
                   <div className="flex-between">
                     <span className={`badge badge-${inc.severity === 'info' ? 'low' : inc.severity}`}>
-                      {inc.incident_type}
+                      {inc.title || inc.incident_type}
                     </span>
                     <span style={{ fontSize: '10px', color: 'var(--text-dim)' }}>
                       {new Date(inc.timestamp).toLocaleString()}
@@ -227,7 +229,7 @@ export const AuditPanel: React.FC<AuditPanelProps> = ({
                   </div>
                   <div style={{ fontSize: '11.5px' }}>{inc.description}</div>
                   <div style={{ fontSize: '10px', color: 'var(--text-dim)' }}>
-                    evidence: {inc.evidence_event_ids.length} sealed event(s)
+                    evidence: {incidentEvidenceCount(inc)} sealed event(s)
                   </div>
                 </div>
               ))}

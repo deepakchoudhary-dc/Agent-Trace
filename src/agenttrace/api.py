@@ -420,8 +420,9 @@ async def get_session(session_id: UUID) -> dict[str, Any]:
 
 @app.post("/sessions/{session_id}/stop")
 async def stop_session(session_id: UUID) -> dict[str, str]:
-    """Stop an active session."""
-    await daemon.stop_session(session_id)
+    """Stop an active session. Unknown sessions are a 404, never a fake stop."""
+    if not await daemon.stop_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
     return {"status": "stopped", "session_id": str(session_id)}
 
 

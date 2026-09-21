@@ -316,16 +316,36 @@ export interface RetroScanResponse {
 }
 
 // -- Correlated multi-stage incidents --
+// Wire format note: GET /sessions/{id}/incidents returns raw sealed IncidentEvent
+// ledgers (event_id/event_hash/seq/related_events/title), not the narrower
+// IncidentSummary the UI originally assumed. The mismatch crashed AuditPanel
+// (reading `evidence_event_ids.length` of undefined). The extra raw-ledger
+// fields are optional here so both shapes stay representable.
 
 export interface IncidentSummary {
-  incident_id: string;
-  session_id: string;
+  incident_id?: string;
+  session_id?: string;
   incident_type: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
   description: string;
-  evidence_event_ids: string[];
+  evidence_event_ids?: string[];
+  /** Raw-ledger fields from the daemon's IncidentEvent serialization. */
+  event_id?: string;
+  event_hash?: string;
+  seq?: number;
+  title?: string;
+  related_events?: string[];
+  causal_path?: string[];
   timestamp: string;
 }
+
+/** Stable incident identifier across both wire shapes. */
+export const incidentKey = (inc: IncidentSummary): string =>
+  inc.incident_id ?? inc.event_id ?? inc.event_hash ?? `${inc.incident_type}-${inc.timestamp}`;
+
+/** Evidence count across both wire shapes (related_events on the raw ledger). */
+export const incidentEvidenceCount = (inc: IncidentSummary): number =>
+  inc.evidence_event_ids?.length ?? inc.related_events?.length ?? 0;
 
 // -- Operator briefing (real GET /sessions/{id}/brief payload) --
 

@@ -1048,11 +1048,11 @@ class AgentTraceDaemon:
             return False
         return True
 
-    async def stop_session(self, session_id: UUID) -> None:
-        """Stop an active session."""
+    async def stop_session(self, session_id: UUID) -> bool:
+        """Stop an active session. Returns False if it does not exist."""
         session = self._sessions.get(session_id)
         if not session:
-            return
+            return False
 
         # Cancel adapter polling
         poll_task = self._adapter_tasks.pop(session_id, None)
@@ -1122,6 +1122,7 @@ class AgentTraceDaemon:
         self._identity_chain.pop(session_id, None)
         self._continuation_risk.pop(session_id, None)
         logger.info("Session %s stopped", session_id)
+        return True
 
     def register_session_pid(self, session_id: UUID, pid: int) -> bool:
         """Register an agent launcher PID into the session's containment unit.

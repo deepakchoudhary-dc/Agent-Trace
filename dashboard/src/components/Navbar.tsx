@@ -13,6 +13,8 @@ import {
   Repeat,
   Radio,
   ChevronDown,
+  Play,
+  Square,
 } from 'lucide-react';
 import { SessionInfo } from '../types';
 import { SessionPickerModal } from './SessionPickerModal';
@@ -21,6 +23,7 @@ interface NavbarProps {
   sessions: SessionInfo[];
   currentSession: SessionInfo | null;
   onSelectSession: (session: SessionInfo) => void;
+  onCreateSession: (workspacePath: string, taskDescription: string) => Promise<void>;
   activeTab: string;
   onTabChange: (tab: string) => void;
   onOpenReport: () => void;
@@ -28,6 +31,8 @@ interface NavbarProps {
   loading?: boolean;
   livePolling?: boolean;
   onToggleLivePolling?: () => void;
+  /** Stop recording the active session (seals the ledger). Omit to hide the control. */
+  onStopSession?: (sessionId: string) => void;
 }
 
 const TABS = [
@@ -51,6 +56,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   sessions,
   currentSession,
   onSelectSession,
+  onCreateSession,
   activeTab,
   onTabChange,
   onOpenReport,
@@ -58,8 +64,10 @@ export const Navbar: React.FC<NavbarProps> = ({
   loading = false,
   livePolling = true,
   onToggleLivePolling,
+  onStopSession,
 }) => {
   const [showPicker, setShowPicker] = useState(false);
+  const [showNewSession, setShowNewSession] = useState(false);
   const isSessionLive = currentSession?.status === 'active';
 
   return (
@@ -178,6 +186,26 @@ export const Navbar: React.FC<NavbarProps> = ({
               <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
             </button>
 
+            <button
+              onClick={() => setShowNewSession(true)}
+              className="btn btn-secondary btn-sm"
+              title="Start recording a new audit session (must start before the agent works)"
+            >
+              <Play size={13} />
+              Start Session
+            </button>
+
+            {isSessionLive && onStopSession && currentSession && (
+              <button
+                onClick={() => onStopSession(currentSession.session_id)}
+                className="btn btn-secondary btn-sm"
+                title="Stop recording the live session (seals the ledger)"
+              >
+                <Square size={13} />
+                End Session
+              </button>
+            )}
+
             <button onClick={onOpenReport} className="btn btn-primary btn-sm">
               <FileCheck size={13} />
               Forensic Report
@@ -185,6 +213,13 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
         </div>
       </header>
+
+      {showNewSession && (
+        <NewSessionModal
+          onCreate={onCreateSession}
+          onClose={() => setShowNewSession(false)}
+        />
+      )}
 
       {showPicker && (
         <SessionPickerModal
@@ -195,5 +230,108 @@ export const Navbar: React.FC<NavbarProps> = ({
         />
       )}
     </>
+  );
+};
+
+
+// -- Inline start-recording flow: agents cannot be traced retroactively --
+// a session must be recording BEFORE the agent starts working. POST /sessions
+// boots the observer stack, so a stray record without a live workspace is a
+// real state (policy engine flags the gap) -- the UI does not block it, the
+// operator just sees zero events until something writes to the watched path.
+
+interface NewSessionModalProps {
+  onCreate: (workspacePath: string, taskDescription: string) => Promise<void>;
+  onClose: () => void;
+}
+
+export const NewSessionModal: React.FC<NewSessionModalProps> = ({ onCreate, onClose }) => {
+  const [workspacePath, setWorkspacePath] = useState('');
+  const [taskDescription, setTaskDescription] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    if (!workspacePath.trim() || submitting) {
+      setError('A workspace path is required -- the daemon observes files, not intentions.');
+      return;
+    }
+    setSubmitting(true);
+    setError('');
+    try {
+      await onCreate(workspacePath.trim(), taskDescription.trim());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create session');
+      setSubmitting(false);
+      return;
+    }
+    // Success: the App re-selected the new live session; dismiss the form.
+    onClose();
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-labelledby="new-session-title">
+      <div
+        className="glass-panel"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: '100%',
+          maxWidth: '560px',
+          padding: '24px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '14px',
+          boxShadow: 'var(--shadow-pop)',
+        }}
+      >
+        <div>
+          <h2 id="new-session-title" className="font-heading" style={{ fontSize: '16px', fontWeight: 650 }}>
+            Start New Audit Session
+          </h2>
+          <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+            POST /sessions boots the observer stack. Recording must start BEFORE the agent works.
+          </p>
+        </div>
+
+        <div className="flex-col" style={{ gap: '10px' }}>
+          <div className="flex-col" style={{ gap: '4px' }}>
+            <label htmlFor="ns-workspace" className="stat-label">Workspace path (required)</label>
+            <input
+              id="ns-workspace"
+              value={workspacePath}
+              onChange={(e) => setWorkspacePath(e.target.value)}
+              placeholder="E:\projects\my-app"
+              spellCheck={false}
+              autoComplete="off"
+              className="code-block"
+              style={{ padding: '8px 10px', fontSize: '12px', background: 'rgba(0,0,0,0.35)' }}
+            />
+          </div>
+          <div className="flex-col" style={{ gap: '4px' }}>
+            <label htmlFor="ns-task" className="stat-label">Task description (optional)</label>
+            <input
+              id="ns-task"
+              value={taskDescription}
+              onChange={(e) => setTaskDescription(e.target.value)}
+              placeholder="What is the agent about to do?"
+              spellCheck={false}
+              autoComplete="off"
+              className="code-block"
+              style={{ padding: '8px 10px', fontSize: '12px', background: 'rgba(0,0,0,0.35)' }}
+            />
+          </div>
+          {error && <div style={{ fontSize: '11px', color: '#dc2626' }}>{error}</div>}
+        </div>
+
+        <div className="flex" style={{ justifyContent: 'flex-end', gap: '8px', paddingTop: '4px' }}>
+          <button onClick={onClose} className="btn btn-secondary btn-sm" disabled={submitting}>
+            Cancel
+          </button>
+          <button onClick={submit} className="btn btn-primary btn-sm" disabled={submitting}>
+            {submitting ? 'Starting…' : 'Start Recording'}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 };
