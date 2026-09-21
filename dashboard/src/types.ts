@@ -416,6 +416,7 @@ export interface ForensicManifestSession {
   task_description: string;
   workspace_path: string;
   status: string;
+  agent_type: string;
   started_at: string | null;
   stopped_at: string | null;
 }

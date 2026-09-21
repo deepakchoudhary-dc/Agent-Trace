@@ -96,6 +96,10 @@ class ManifestInputs:
     master_key: bytes
     reasoning_trail: list[dict[str, Any]] = field(default_factory=list)
     operator_anchor: str | None = None
+    #: The session's declared agent type ("codex" / "claude" / "copilot" /
+    #: "auto" / "generic"). Used only to tell the audited agent apart from a
+    #: different assistant on the same host; it never decides containment.
+    agent_type: str = ""
 
 
 def _task_contract_block(description: str) -> dict[str, Any]:
@@ -200,7 +204,7 @@ def _timeline_entry(event: EventBase, inputs: ManifestInputs) -> dict[str, Any]:
         "event_id": str(event.event_id),
         "event_type": event.event_type.value,
         "actor_id": event.actor_id,
-        "actor_class": classify_event(event).value,
+        "actor_class": classify_event(event, inputs.agent_type).value,
         "source_adapter": event.source_adapter,
         "timestamp": event.timestamp.isoformat(),
         "observed_at": event.observed_at.isoformat() if event.observed_at else None,
@@ -307,7 +311,7 @@ def build_forensic_manifest(inputs: ManifestInputs) -> dict[str, Any]:
             f"{len(events)} were supplied"
         )
 
-    scope = summarize_scope(events)
+    scope = summarize_scope(events, inputs.agent_type)
     total_events = len(events)
     truncated = total_events > MAX_TIMELINE_EVENTS
     window = events[-MAX_TIMELINE_EVENTS:] if truncated else events
@@ -331,6 +335,7 @@ def build_forensic_manifest(inputs: ManifestInputs) -> dict[str, Any]:
             "task_description": inputs.task_description,
             "workspace_path": inputs.workspace_path,
             "status": inputs.status,
+            "agent_type": inputs.agent_type,
             "started_at": inputs.started_at.isoformat() if inputs.started_at else None,
             "stopped_at": inputs.stopped_at.isoformat() if inputs.stopped_at else None,
         },

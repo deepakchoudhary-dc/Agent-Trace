@@ -1331,10 +1331,19 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
     # from three unreconciled sources, which is how an exported report came to
     # claim both 31 and 500 events and to carry no signature at all.
     session = daemon._sessions.get(session_id)
+    ledger_event_count = daemon._ledger.count_events(session_id)
+    if session is None and ledger_event_count == 0:
+        # An empty chain verifies vacuously, so without this the endpoint would
+        # attest "TAMPER_VERIFIED" for a session that does not exist. Fail
+        # closed rather than issue a signed report about nothing.
+        raise HTTPException(status_code=404, detail="Session not found")
+
     graph = daemon.get_graph(session_id)
     started_at, stopped_at = daemon._ledger.get_session_window(session_id)
     raw_status = getattr(session, "status", "") or ""
     status_value = getattr(raw_status, "value", None) or str(raw_status)
+    raw_agent = getattr(session, "agent_type", "") or ""
+    agent_type_value = getattr(raw_agent, "value", None) or str(raw_agent)
 
     try:
         return build_forensic_manifest(
@@ -1343,6 +1352,7 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
                 task_description=str(getattr(session, "task_description", "") or ""),
                 workspace_path=str(getattr(session, "workspace_path", "") or ""),
                 status=status_value,
+                agent_type=agent_type_value,
                 started_at=started_at,
                 stopped_at=stopped_at,
                 events=events,
@@ -1354,7 +1364,7 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
                 chain_valid=is_valid,
                 chain_error=error,
                 chain_tip=daemon._ledger.get_last_hash(session_id),
-                ledger_event_count=daemon._ledger.count_events(session_id),
+                ledger_event_count=ledger_event_count,
                 master_key=daemon._ledger.encryption.key_bytes,
                 reasoning_trail=reasoning_trail,
             )

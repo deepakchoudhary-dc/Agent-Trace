@@ -575,3 +575,12 @@ async def test_forensic_report_classifies_the_agent_apart_from_the_host(client, 
     assert classes["detector_engine"] == "detector"
     assert manifest["agent_scope"]["agent_scoped"] >= 1
     assert manifest["agent_scope"]["ambient"] >= 1
+
+
+def test_forensic_report_404s_for_an_unknown_session(client):
+    """An empty chain verifies vacuously, so without an explicit check the
+    endpoint would sign a manifest attesting TAMPER_VERIFIED for a session that
+    does not exist."""
+    c, (_, tokens) = client
+    res = c.get(f"/sessions/{UUID(int=4242)}/report", headers=_auth_headers(tokens))
+    assert res.status_code == 404

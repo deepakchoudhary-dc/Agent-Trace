@@ -33,6 +33,7 @@ class ActorClass(str, Enum):
     """Whose action an event records."""
 
     AGENT = "agent"  # the audited agent itself
+    OTHER_AGENT = "other_agent"  # a different AI assistant / IDE extension on the host
     AGENT_TOOL = "agent_tool"  # a process/tool inside the agent's containment unit
     OPERATOR = "operator"  # the human developer
     DETECTOR = "detector"  # AgentTrace's own analysis engines
@@ -42,11 +43,44 @@ class ActorClass(str, Enum):
 
 
 #: Classes that describe the agent's own conduct. Everything else is either the
-#: machine, the operator, or our own instrumentation.
+#: machine, the operator, another assistant, or our own instrumentation.
 AGENT_SCOPED: frozenset[ActorClass] = frozenset({ActorClass.AGENT, ActorClass.AGENT_TOOL})
 
 #: Agent identifiers as the adapters emit them.
 _AGENT_PREFIXES = ("codex:", "claude:", "copilot", "agent:")
+
+#: Maps a session's DECLARED agent type to the actor-id tokens that identify it.
+#: The `agent:` prefix is overloaded — the process observer emits it both for a
+#: known assistant (`agent:codex_cli`) and for ANY VS Code extension directory
+#: (`agent:json-language-features`), which is the editor's language server, not
+#: the audited agent. Without the session's declaration the two cannot be told
+#: apart, so they are only separated when the session says what it is auditing.
+_AGENT_ALIASES: dict[str, tuple[str, ...]] = {
+    "codex": ("codex",),
+    "claude": ("claude",),
+    "copilot": ("copilot",),
+}
+
+#: Declared types that identify no specific agent, so no split is possible.
+_UNDECLARED_AGENT_TYPES = frozenset({"", "auto", "generic"})
+
+#: Process names that are an AI assistant rather than an ambient application.
+_KNOWN_AGENT_PROCESS_NAMES = frozenset(
+    {
+        "codex",
+        "claude",
+        "copilot",
+        "cursor",
+        "windsurf",
+        "aider",
+        "goose",
+        "continue",
+        "cline",
+        "roo",
+        "kilo",
+        "ollama",
+    }
+)
 
 #: AgentTrace's own engines. These are analysis OF the session, not conduct IN
 #: it, and must never be counted as agent activity.
@@ -79,55 +113,11 @@ _KERNEL_PREFIXES = (
 )
 _KERNEL_ADAPTERS = frozenset({"kernel_observer", "auditd"})
 
-#: Operating-system and other-application processes. An agent may legitimately
-#: spawn some of these; the containment signal decides that, not this list.
-_OS_PROCESS_NAMES = frozenset(
-    {
-        "system",
-        "idle",
-        "registry",
-        "memory compression",
-        "secure system",
-        "smss",
-        "csrss",
-        "wininit",
-        "winlogon",
-        "services",
-        "lsass",
-        "svchost",
-        "fontdrvhost",
-        "dwm",
-        "explorer",
-        "sihost",
-        "ctfmon",
-        "taskhostw",
-        "runtimebroker",
-        "searchindexer",
-        "searchhost",
-        "startmenuexperiencehost",
-        "shellexperiencehost",
-        "textinputhost",
-        "conhost",
-        "conhost.exe",
-        "tasklist",
-        "taskmgr",
-        "wmiprvse",
-        "wudfhost",
-        "spoolsv",
-        "audiodg",
-        "widgets",
-        "widgetservice",
-        "msmpeng",
-        "nissrv",
-        "securityhealthservice",
-        "crashpad_handler",
-        "gitbash",
-        "msedge",
-        "chrome",
-        "firefox",
-        "code",
-        "devenv",
-    }
+#: Events only the agent can produce. A tool request IS the agent acting,
+#: whatever the adapter chose to call the actor, so this outranks a guess made
+#: from the adapter's name.
+_AGENT_ONLY_EVENT_TYPES = frozenset(
+    {"tool_request", "tool_result", "invocation", "context_boundary"}
 )
 
 #: Observers that watch the workspace itself. A file or git change is a real
@@ -139,17 +129,40 @@ _WORKSPACE_ACTORS = frozenset({"filesystem", "git", "workspace", "blob_store"})
 _AGENT_ADAPTERS = frozenset({"codex_cli", "claude_code", "copilot_chat", "sdk", "universal"})
 
 
+def _matches_declared_agent(actor_lower: str, declared_agent: str | None) -> bool | None:
+    """Whether the session's declared agent identifies this actor.
+
+    None means the declaration cannot decide — either there is none, or it names
+    no specific agent (`auto` / `generic`), in which case guessing would be worse
+    than not splitting.
+    """
+    declared = (declared_agent or "").strip().lower()
+    if declared in _UNDECLARED_AGENT_TYPES:
+        return None
+    aliases = _AGENT_ALIASES.get(declared)
+    if not aliases:
+        return None
+    return any(token in actor_lower for token in aliases)
+
+
 def classify_actor(
     actor_id: str,
     source_adapter: str = "",
     event_type: str = "",
     *,
     contained: bool = False,
+    declared_agent: str | None = None,
 ) -> ActorClass:
     """Classify one event's actor.
 
     ``contained`` is the kernel's answer to "is this process inside the agent's
-    containment unit" and wins over every name-based heuristic.
+    containment unit" and wins over every name-based heuristic. ``declared_agent``
+    is the session's own ``agent_type``, used only to tell the audited agent
+    apart from a different assistant on the same host.
+
+    Order matters. An explicit actor identity is resolved BEFORE any
+    adapter-based guess, so a workspace observer cannot be promoted to the agent
+    merely because it arrived through an agent-facing adapter.
     """
     actor = (actor_id or "").strip()
     lowered = actor.lower()
@@ -168,29 +181,39 @@ def classify_actor(
     if lowered.startswith(_KERNEL_PREFIXES) or adapter in _KERNEL_ADAPTERS:
         return ActorClass.KERNEL
 
-    # 4. The agent, by its adapter-assigned identity.
-    if lowered.startswith(_AGENT_PREFIXES):
-        return ActorClass.AGENT
-    if adapter in _AGENT_ADAPTERS and not lowered.startswith("tool:"):
-        return ActorClass.AGENT
-
-    # 5. Operator tooling and shells.
+    # 4. Explicit operator and tooling identities.
     if lowered.startswith("tool:"):
         return ActorClass.AGENT_TOOL
     if lowered.startswith("terminal:"):
         return ActorClass.OPERATOR
 
-    # 6. Workspace observers — consequences without an attributable actor.
+    # 5. Workspace observers — a real consequence with no attributable actor.
     if lowered in _WORKSPACE_ACTORS:
         return ActorClass.UNATTRIBUTED
 
-    # 7. Ambient OS / other-application processes.
+    # 6. The agent, by its adapter-assigned identity. An assistant that is not
+    #    the one this session audits is real activity, but it is not this
+    #    agent's conduct.
+    if lowered.startswith(_AGENT_PREFIXES):
+        if _matches_declared_agent(lowered, declared_agent) is False:
+            return ActorClass.OTHER_AGENT
+        return ActorClass.AGENT
+
+    # 7. Ambient OS / other-application processes. A process named after a known
+    #    assistant is the assistant, not the machine.
     if lowered.startswith("process:"):
-        name = lowered.split(":", 1)[1]
-        if name in _OS_PROCESS_NAMES:
-            return ActorClass.SYSTEM
-        # A process we cannot place is still a process on this host.
+        if lowered.split(":", 1)[1] in _KNOWN_AGENT_PROCESS_NAMES:
+            return ActorClass.AGENT
         return ActorClass.SYSTEM
+
+    # 8. Events only an agent can produce. A tool request IS the agent acting,
+    #    whatever the adapter chose to call the actor.
+    if event_type in _AGENT_ONLY_EVENT_TYPES:
+        return ActorClass.AGENT
+
+    # 9. Last resort: the provenance itself is agent-facing.
+    if adapter in _AGENT_ADAPTERS:
+        return ActorClass.AGENT
 
     return ActorClass.UNATTRIBUTED
 
@@ -200,7 +223,7 @@ def is_agent_scoped(actor_class: ActorClass) -> bool:
     return actor_class in AGENT_SCOPED
 
 
-def classify_event(event: Any) -> ActorClass:
+def classify_event(event: Any, declared_agent: str | None = None) -> ActorClass:
     """Classify an event object or a serialized event mapping."""
     if isinstance(event, dict):
         actor_id = event.get("actor_id", "")
@@ -224,16 +247,21 @@ def classify_event(event: Any) -> ActorClass:
         str(source_adapter),
         str(event_type),
         contained=contained,
+        declared_agent=declared_agent,
     )
 
 
 @dataclass(frozen=True)
 class ActorScopeSummary:
-    """How a session's events divide between the agent and its machine.
+    """How a session's events divide between the agent and everything else.
 
     Every event lands in exactly one class, so the counts always sum to the
-    number of events considered — an auditor can see that nothing was dropped
-    to make the agent look busier or cleaner than it was.
+    number of events considered — an auditor can see that nothing was dropped to
+    make the agent look busier or cleaner than it was. `agent_scoped` and
+    `ambient` deliberately do not account for every class: `other_agent` is
+    neither this agent's conduct nor the machine's, and `detector` is our own
+    analysis, so each is reported on its own rather than folded into a total
+    that would misrepresent it.
     """
 
     counts: dict[str, int] = field(default_factory=dict)
@@ -259,7 +287,15 @@ class ActorScopeSummary:
         }
 
 
-def summarize_scope(events: Iterable[Any]) -> ActorScopeSummary:
-    """Classify every event and count the result per class."""
-    counts = Counter(classify_event(event).value for event in events)
+def summarize_scope(
+    events: Iterable[Any], declared_agent: str | None = None
+) -> ActorScopeSummary:
+    """Classify every event and count the result per class.
+
+    ``declared_agent`` is the session's own ``agent_type``; without it a
+    different assistant on the host cannot be told from the audited one.
+    """
+    counts = Counter(
+        classify_event(event, declared_agent).value for event in events
+    )
     return ActorScopeSummary(counts=dict(counts), total=sum(counts.values()))
