@@ -1197,6 +1197,10 @@ class AgentTraceDaemon:
 
     async def ingest_event(self, event: EventBase, raw_payload: bytes | None = None) -> str:
         """Process event: Redact → Encrypt → Hash-Chain → Store → Graph Projection → Policy."""
+        # `observed_at` (the audit clock, distinct from the event's own possibly
+        # back-filled `timestamp`) is stamped by the ledger on append — the one
+        # point every event passes through, including direct ledger appends.
+
         # 0. Anti-forensic guards (bounded work before append; the ledger
         #    always keeps full integrity even when projection is degraded).
         flooded = self._check_event_flood(event)

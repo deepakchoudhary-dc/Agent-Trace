@@ -585,6 +585,48 @@ class EventLedger:
         ).fetchone()
         return int(row["next_seq"])
 
+    @_locked
+    def count_events(self, session_id: UUID) -> int:
+        """Count the sealed events belonging to ONE session.
+
+        This is the authoritative chain length for a session. `event_count()`
+        counts the whole ledger across every session, so it must never be used
+        where a per-session total is meant; and a page of query_events is not a
+        total either. Reports must use this.
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        return int(row["n"])
+
+    @_locked
+    def get_session_window(self, session_id: UUID) -> tuple[datetime | None, datetime | None]:
+        """Return (started_at, stopped_at) for a session, parsed from the row.
+
+        Used to decide whether an event's own `timestamp` is consistent with the
+        session it was sealed into. A back-filled transcript event carries the
+        source file's time and will fall outside this window; that is a fact to
+        report, not to silently rewrite.
+        """
+        row = self._conn.execute(
+            "SELECT started_at, stopped_at FROM sessions WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        if row is None:
+            return None, None
+
+        def _parse(value: Any) -> datetime | None:
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+        return _parse(row["started_at"]), _parse(row["stopped_at"])
+
     @property
     def encryption(self) -> EncryptionManager:
         """The encryption manager (for domain-separated key derivation)."""
@@ -650,6 +692,18 @@ class EventLedger:
                 f"{self._max_storage_bytes} bytes; session marked "
                 f"evidence_incomplete"
             )
+
+        # Stamp the observation clock HERE, at the single point every event
+        # passes through on its way into the chain. `event.timestamp` is the
+        # event's own claim about when it happened and an adapter replaying a
+        # transcript overwrites it with the SOURCE file's time; `observed_at` is
+        # when this ledger recorded it, and it is set before the redact/dump
+        # below so the chain hash commits to it like any other field. Owning the
+        # stamp here rather than in the daemon also covers the events that are
+        # appended straight to the ledger (gap and coverage findings), which an
+        # ingest-level stamp would have missed.
+        if event.observed_at is None:
+            event.observed_at = datetime.now(timezone.utc)
 
         # Redact any sensitive content in the event dictionary
         raw_dict = event.model_dump(mode="json")

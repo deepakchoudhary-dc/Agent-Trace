@@ -59,6 +59,21 @@ class EventBase(BaseModel):
     event_id: UUID = Field(default_factory=uuid4)
     event_type: EventType
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Two clocks, deliberately separate.
+    #
+    # `timestamp` is when the event claims to have HAPPENED. For live telemetry
+    # that is the observer's clock, but an adapter replaying an existing
+    # transcript overwrites it with the SOURCE file's own time — which can be
+    # weeks older than the audit, and is not comparable to a live event's clock.
+    #
+    # `observed_at` is when this daemon actually INGESTED the event. It is set
+    # exactly once, in Daemon.ingest_event, and never by an adapter, so it
+    # cannot be back-dated. Ordering an audit by `observed_at` is therefore
+    # sound even when `timestamp` values are not comparable to each other.
+    #
+    # None means "sealed before this field existed". The report states that gap
+    # rather than inventing a time (invariant #3).
+    observed_at: datetime | None = None
     actor_id: str
     session_id: UUID
     source_adapter: str
