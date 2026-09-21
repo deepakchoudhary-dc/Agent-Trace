@@ -77,11 +77,21 @@ def chain_binding_block(
     chain_length: int | None = None,
     operator_anchor: str | None = None,
 ) -> dict[str, Any]:
-    """The root-of-trust block embedded (and signed) inside a report."""
+    """The root-of-trust block embedded (and signed) inside a report.
+
+    ``anchored`` alone was ambiguous: a reader seeing ``anchored: true`` next to
+    ``operator_anchor: null`` cannot tell WHICH root of trust applies, and the
+    two are not equivalent. The chain anchor is self-certifying but local to the
+    recorder; only the operator anchor defeats a compromised recorder. Both
+    facts are therefore stated separately, and ``anchored`` is retained as their
+    disjunction for existing consumers.
+    """
     return {
         "chain_tip": chain_tip,
         "chain_length": chain_length,
         "operator_anchor": operator_anchor,
+        "chain_anchored": chain_tip is not None,
+        "operator_anchored": operator_anchor is not None,
         "anchored": chain_tip is not None or operator_anchor is not None,
     }
 

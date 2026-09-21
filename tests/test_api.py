@@ -480,3 +480,98 @@ def test_broker_rejects_argv_bait_and_switch(client, tmp_path, monkeypatch):
     )
     assert res.status_code == 400
     assert res.json()["detail"]["error"] == "challenge_invalid"
+
+
+# -- Forensic report: one source of truth, complete timeline, real signature --
+
+
+@pytest.mark.asyncio
+async def test_forensic_report_is_complete_and_self_consistent(client, tmp_path):
+    """The export contract.
+
+    The first exported manifest claimed 31 events in one field and 500 in
+    another, carried a chain tip its own timeline could not reach, showed no
+    severity or confidence anywhere, and shipped with no signature. These
+    assertions are what stops that recurring.
+    """
+    c, (test_daemon, tokens) = client
+    sid = _create_session(c, tokens, str(tmp_path))
+    session = test_daemon.get_session(UUID(sid))
+    assert session is not None
+
+    for index in range(3):
+        await test_daemon.ingest_event(
+            CommandEvent(
+                session_id=session.session_id,
+                actor_id="codex:rollout-42",
+                source_adapter="codex_cli",
+                command=f"echo {index}",
+                working_dir=str(tmp_path),
+            )
+        )
+
+    res = c.get(f"/sessions/{sid}/report", headers=_auth_headers(tokens))
+    assert res.status_code == 200, res.text
+    manifest = res.json()
+
+    assert manifest["manifest_version"] == "2.0.0"
+
+    # Every count is derived from the same event list and must reconcile.
+    stats = manifest["audit_statistics"]
+    timeline = manifest["tamper_evident_timeline"]
+    assert stats["total_events"] == len(timeline)
+    assert stats["total_events"] == manifest["chain"]["chain_length"]
+    assert sum(manifest["agent_scope"]["counts"].values()) == stats["total_events"]
+    assert stats["findings"] == len(manifest["findings_summary"])
+    assert stats["incidents"] == len(manifest["incidents_summary"])
+
+    # A chain tip the timeline cannot reach means the timeline is truncated.
+    assert timeline
+    assert manifest["chain"]["head_event_hash"] == timeline[-1]["event_hash"]
+    assert [row["seq"] for row in timeline] == list(range(len(timeline)))
+    assert timeline[0]["prev_hash"] == ""
+
+    # The facts the old export dropped are present and populated.
+    assert manifest["report_signature"]["signature"]
+    assert manifest["task_contract"]["usable"] is True
+    assert manifest["temporal_integrity"]["ordering_basis"]
+    for row in timeline:
+        assert row["confidence"] in {"high", "medium", "low"}
+        assert row["actor_class"]
+        assert row["observed_at"] is not None
+        assert row["time_basis"] in {"observed", "backfilled", "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_forensic_report_classifies_the_agent_apart_from_the_host(client, tmp_path):
+    """The report must be evidence about the agent, not about the machine."""
+    c, (test_daemon, tokens) = client
+    sid = _create_session(c, tokens, str(tmp_path))
+    session = test_daemon.get_session(UUID(sid))
+    assert session is not None
+
+    for actor, adapter in (
+        ("codex:rollout-42", "codex_cli"),
+        ("process:tasklist", "process_tree_observer"),
+        ("detector_engine", "detector_engine"),
+    ):
+        await test_daemon.ingest_event(
+            CommandEvent(
+                session_id=session.session_id,
+                actor_id=actor,
+                source_adapter=adapter,
+                command="echo x",
+                working_dir=str(tmp_path),
+            )
+        )
+
+    manifest = c.get(
+        f"/sessions/{sid}/report", headers=_auth_headers(tokens)
+    ).json()
+    classes = {row["actor_id"]: row["actor_class"] for row in manifest["tamper_evident_timeline"]}
+
+    assert classes["codex:rollout-42"] == "agent"
+    assert classes["process:tasklist"] == "system"
+    assert classes["detector_engine"] == "detector"
+    assert manifest["agent_scope"]["agent_scoped"] >= 1
+    assert manifest["agent_scope"]["ambient"] >= 1

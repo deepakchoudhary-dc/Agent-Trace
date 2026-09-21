@@ -7,7 +7,6 @@ via a strictly local loopback HTTP API.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -41,6 +40,11 @@ from agenttrace.security.approval import (
     ApprovalError,
 )
 from agenttrace.security.broker import BrokerError, ExecutionBroker
+from agenttrace.security.forensic_manifest import (
+    ManifestInconsistencyError,
+    ManifestInputs,
+    build_forensic_manifest,
+)
 from agenttrace.security.isolation import IsolationRunner
 from agenttrace.security.policy import PolicyEngine
 from agenttrace.security.token import ApiTokenManager
@@ -1285,14 +1289,18 @@ async def get_affected_parties(
 
 @app.get("/sessions/{session_id}/report")
 async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
-    """Generate a verified, cryptographically sealed forensic audit report."""
+    """Generate a verified, cryptographically sealed forensic audit report.
+
+    The complete, self-consistent, signed manifest is built by
+    ``security.forensic_manifest`` from the whole session — never from a page,
+    and never re-assembled by the caller.
+    """
     is_valid, error = daemon._ledger.verify_chain(session_id)
     # No truncation: the report must cover every sealed event.
     events = daemon._ledger.query_events(session_id, limit=None)
     findings = daemon.get_findings(session_id)
     approvals = daemon._ledger.get_approvals(session_id)
     incidents = daemon.get_incidents(session_id)
-    last_hash = daemon._ledger.get_last_hash(session_id)
 
     # Reasoning trail — the model's own thinking around risky actions, from
     # adapter-captured context-boundary events. This is the "why" evidence
@@ -1317,64 +1325,48 @@ async def get_forensic_report(session_id: UUID) -> dict[str, Any]:
                     "excerpt": redacted_excerpt[:500],
                 })
 
-    manifest: dict[str, Any] = {
-        "report_id": str(UUID(int=int.from_bytes(
-            hashlib.sha256(f"{session_id}:{last_hash}".encode()).digest()[:16], "big"
-        ))),
-        "session_id": str(session_id),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "integrity_status": "TAMPER_VERIFIED" if is_valid else "TAMPER_DETECTED",
-        "integrity_error": error,
-        "head_event_hash": last_hash,
-        "event_count": len(events),
-        "findings_count": len(findings),
-        "approvals_count": len(approvals),
-        "incidents_count": len(incidents),
-        "reasoning_trail": reasoning_trail,
-        "findings_summary": [
-            {
-                "finding_id": str(f.event_id),
-                "type": getattr(f, "finding_type", "policy_finding"),
-                "severity": getattr(f, "severity", "medium"),
-                "description": getattr(f, "description", ""),
-            }
-            for f in findings
-        ],
-        "incidents_summary": [
-            {
-                "incident_id": str(i.event_id),
-                "incident_type": getattr(i, "incident_type", "incident"),
-                "severity": getattr(i, "severity", "medium"),
-                "title": getattr(i, "title", ""),
-                "related_events": getattr(i, "related_events", []),
-            }
-            for i in incidents
-        ],
-    }
+    # One builder, one set of inputs, on the daemon side — and it refuses to
+    # sign a manifest whose own numbers disagree (security.forensic_manifest).
+    # The manifest used to be assembled here but re-assembled in the browser
+    # from three unreconciled sources, which is how an exported report came to
+    # claim both 31 and 500 events and to carry no signature at all.
+    session = daemon._sessions.get(session_id)
+    graph = daemon.get_graph(session_id)
+    started_at, stopped_at = daemon._ledger.get_session_window(session_id)
+    raw_status = getattr(session, "status", "") or ""
+    status_value = getattr(raw_status, "value", None) or str(raw_status)
 
-    # Cryptographic report signature (plan2.md P0.4, root of trust per
-    # shortcoming #10): keyed HMAC over the canonical manifest, with the key
-    # folded together with the session's hash-chain tip and length. The
-    # signature therefore attests "this report describes the ledger exactly
-    # up to this tip" — a forged report cannot restate a different history
-    # and still verify, because the tip participates in key derivation.
-    from agenttrace.security.report_auth import (
-        chain_binding_block,
-        derive_report_key,
-        sign_report,
-    )
-
-    chain_tip = daemon._ledger.get_last_hash(session_id)
-    chain_length = daemon._ledger.get_next_seq(session_id)
-    manifest["chain_binding"] = chain_binding_block(chain_tip, chain_length)
-    return sign_report(
-        manifest,
-        derive_report_key(
-            daemon._ledger.encryption.key_bytes,
-            chain_tip=chain_tip,
-            chain_length=chain_length,
-        ),
-    )
+    try:
+        return build_forensic_manifest(
+            ManifestInputs(
+                session_id=session_id,
+                task_description=str(getattr(session, "task_description", "") or ""),
+                workspace_path=str(getattr(session, "workspace_path", "") or ""),
+                status=status_value,
+                started_at=started_at,
+                stopped_at=stopped_at,
+                events=events,
+                findings=findings,
+                incidents=incidents,
+                approvals_count=len(approvals),
+                context_nodes=graph.node_count if graph is not None else 0,
+                context_edges=graph.edge_count if graph is not None else 0,
+                chain_valid=is_valid,
+                chain_error=error,
+                chain_tip=daemon._ledger.get_last_hash(session_id),
+                ledger_event_count=daemon._ledger.count_events(session_id),
+                master_key=daemon._ledger.encryption.key_bytes,
+                reasoning_trail=reasoning_trail,
+            )
+        )
+    except ManifestInconsistencyError as exc:
+        # Fail closed. An internally contradictory forensic document is
+        # indistinguishable from a tampered one, so issuing it would hand an
+        # adversary a reason to discredit a sound ledger.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Forensic manifest failed self-consistency check: {exc}",
+        ) from exc
 
 
 # -- Simulation & Causal Analysis --
