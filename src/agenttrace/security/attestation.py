@@ -31,7 +31,7 @@ The result is sealed with the same HMAC report key material as
 ``report_auth`` (local-only; no network) and bound to the session id,
 so a session's ledger carries *why* isolation was believed at start.
 Honest limits: a same-user malware process can spoof probe results
-(the no-out-of-band-witness ceiling, plan2 architectural #10); the
+(the no-out-of-band-witness ceiling, plan.md architectural #10); the
 attestation records what the host measured, not an independent truth.
 """
 from __future__ import annotations

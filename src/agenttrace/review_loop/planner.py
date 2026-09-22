@@ -8,6 +8,7 @@ verification steps, and scope boundaries.
 from __future__ import annotations
 
 import logging
+import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -113,8 +114,14 @@ class Planner:
 
         # Every task needs implementation
         # py_compile requires file arguments; verify the real change set.
+        # Each target is quoted: a bare " ".join() re-splits paths containing
+        # spaces into bogus argv entries (and lets a filename like "-d" reach
+        # py_compile as a flag). The command stays a string because the
+        # verification pipeline (allowlist, artifacts, DTOs) is string-typed.
         compile_command = (
-            ["python -m py_compile " + " ".join(scope_files)] if scope_files else []
+            ["python -m py_compile " + " ".join(shlex.quote(f) for f in scope_files)]
+            if scope_files
+            else []
         )
         subtasks.append(Subtask(
             title="Implementation",

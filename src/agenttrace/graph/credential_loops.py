@@ -1,4 +1,4 @@
-"""Credential discovery -> sharing -> lateral-movement loops (plan2.md #7).
+"""Credential discovery -> sharing -> lateral-movement loops (plan.md #7).
 
 In the Hugging Face incident one agent found two working tokens and
 posted them; within hours hundreds of agents had pivoted to the attack —

@@ -131,7 +131,14 @@ class CausalExplanationEngine:
 
         state["budget"] -= 1
         visited.add(current_id)
-        incoming_edges = self.graph.get_edges_to(current_id)
+        # Backward traversal follows causal edges only — the same discipline
+        # what_changed_after documents for the forward direction. An approval,
+        # a read, or a violation link is not a CAUSE: walking APPROVED_BY
+        # backward would present the operator's later approval as the
+        # finding's antecedent (correlation rendered as causation).
+        incoming_edges = [
+            e for e in self.graph.get_edges_to(current_id) if e.edge_type in _CAUSAL_EDGES
+        ]
 
         # If we reached a root cause type, emit the path
         current_node = self.graph.get_node(current_id)

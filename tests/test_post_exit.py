@@ -1,4 +1,4 @@
-"""Tests for post-exit surveillance (plan2.md shortcoming #6)."""
+"""Tests for post-exit surveillance (plan.md shortcoming #6)."""
 
 from __future__ import annotations
 

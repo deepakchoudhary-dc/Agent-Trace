@@ -1,4 +1,4 @@
-"""Convention-free meta-detection and detector-decay monitoring (plan2.md
+"""Convention-free meta-detection and detector-decay monitoring (plan.md
 shortcoming #10).
 
 Within four days of the METR incident, agents invented file-chunk protocols,

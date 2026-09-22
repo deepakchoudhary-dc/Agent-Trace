@@ -1,4 +1,4 @@
-"""Tests for the ExecutionBroker (plan2.md P0.2)."""
+"""Tests for the ExecutionBroker (plan.md P0.2)."""
 
 from __future__ import annotations
 

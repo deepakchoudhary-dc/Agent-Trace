@@ -1,4 +1,4 @@
-"""Tests for the fail-closed IsolationRunner (plan2.md P0.1)."""
+"""Tests for the fail-closed IsolationRunner (plan.md P0.1)."""
 
 from __future__ import annotations
 

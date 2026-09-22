@@ -1,4 +1,4 @@
-"""Tests for sensor coverage accounting (plan2.md shortcoming #9).
+"""Tests for sensor coverage accounting (plan.md shortcoming #9).
 
 Equivalence classes: per-plane volume attribution (five sensor sources,
 four planes), agent-narration exclusion, derived-event exclusion,

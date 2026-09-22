@@ -1,4 +1,4 @@
-"""Tests for Unicode canonicalization in redaction (plan2.md P1.8)."""
+"""Tests for Unicode canonicalization in redaction (plan.md P1.8)."""
 
 from __future__ import annotations
 

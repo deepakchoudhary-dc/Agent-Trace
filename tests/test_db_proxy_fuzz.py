@@ -1,6 +1,6 @@
 """Property-based and fuzz tests for the database wire-protocol parsers.
 
-plan2.md P2.5: the wire parsers are a trust boundary — arbitrary TCP bytes
+plan.md P2.5: the wire parsers are a trust boundary — arbitrary TCP bytes
 must never crash them, split messages must reassemble identically regardless
 of chunk boundaries, and the fail-closed length cap must hold for any input.
 """

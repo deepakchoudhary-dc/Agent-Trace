@@ -53,7 +53,7 @@ Three documents define the standards your PR will be reviewed against. They
 are part of this repository's working set; ask in a discussion if a referenced
 document is not public yet and a maintainer will paste the relevant rules.
 
-1. **The spec** (`plan2.md` conventions section in the project wiki) — what
+1. **The spec** (`plan.md` conventions section in the project wiki) — what
    the tool promises, the threat model, the honesty invariants.
 2. **The review standard** (`review.md` conventions) — the anti-slop
    checklist reviewers actually apply.

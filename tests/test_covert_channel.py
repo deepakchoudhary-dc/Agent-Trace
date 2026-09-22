@@ -1,4 +1,4 @@
-"""Tests for the covert-channel structural detector (plan2.md shortcoming #1)."""
+"""Tests for the covert-channel structural detector (plan.md shortcoming #1)."""
 
 from __future__ import annotations
 

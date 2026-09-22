@@ -1,4 +1,4 @@
-"""Tests for hesitation-divergence detection (plan2.md shortcoming #8)."""
+"""Tests for hesitation-divergence detection (plan.md shortcoming #8)."""
 
 from __future__ import annotations
 

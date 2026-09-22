@@ -1,5 +1,5 @@
 """Tests for credential discovery -> sharing -> lateral movement loops
-(plan2.md shortcoming #7 — the Hugging Face shared-currency pattern)."""
+(plan.md shortcoming #7 — the Hugging Face shared-currency pattern)."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 """Tests for evidence-boundary classification and tool-claim reconciliation
-(plan2.md shortcoming #4 — chain of custody starts at the wrong boundary)."""
+(plan.md shortcoming #4 — chain of custody starts at the wrong boundary)."""
 
 from __future__ import annotations
 

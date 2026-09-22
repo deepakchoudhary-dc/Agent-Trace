@@ -180,15 +180,28 @@ class ReviewLoop:
                     synthesis.failed_criteria,
                 )
 
-            # Check convergence
-            metrics = self._worker.get_convergence_metrics()
-            if metrics.get("feedback_trend") == "stalled" and iteration_num >= 2:
-                logger.warning("Convergence stalled at iteration %d", iteration_num)
-                result.escalation_reason = (
-                    f"Convergence stalled after {iteration_num} iterations. "
-                    "Consider fundamentally different approach."
-                )
-                break
+            # Check convergence. Judge from the syntheses themselves: the
+            # worker's feedback_trend can only become "stalled" once its
+            # history holds two entries, which first happens on the FINAL
+            # iteration (feedback is appended at execute() start) — so it
+            # never actually shortened the loop, it only rewrote the
+            # escalation message the finalize step would have written anyway.
+            if len(result.iterations) >= 2:
+                prev_synthesis = result.iterations[-2].synthesis
+                if (
+                    prev_synthesis is not None
+                    and not prev_synthesis.passed
+                    and len(synthesis.failed_criteria)
+                    >= len(prev_synthesis.failed_criteria)
+                    and len(synthesis.partial_criteria)
+                    >= len(prev_synthesis.partial_criteria)
+                ):
+                    logger.warning("Convergence stalled at iteration %d", iteration_num)
+                    result.escalation_reason = (
+                        f"Convergence stalled after {iteration_num} iterations. "
+                        "Consider fundamentally different approach."
+                    )
+                    break
 
         # Finalize
         result.total_iterations = len(result.iterations)

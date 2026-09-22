@@ -175,6 +175,27 @@ class TestPlanner:
         plan = planner.amend_plan(plan, "Need more tests", ["Tests missing"])
         assert len(plan.subtasks) > original_count
 
+    def test_compile_command_quotes_scope_files(self) -> None:
+        """A scope path containing a space must survive the string → argv
+        round-trip (the verification runner shlex.splits the command)."""
+        import shlex
+
+        planner = Planner()
+        plan = planner.create_plan(
+            "Fix parser",
+            context={"scope_files": ["src/my parser.py", "src/plain.py"]},
+        )
+        compile_cmds = [
+            cmd
+            for s in plan.subtasks
+            for cmd in s.verification_commands
+            if "py_compile" in cmd
+        ]
+        assert compile_cmds, "a scope with files must emit a compile command"
+        parts = shlex.split(compile_cmds[0])
+        assert "src/my parser.py" in parts
+        assert "src/plain.py" in parts
+
 
 class TestWorker:
     """Tests for the Worker component — real file and verification artifacts."""
@@ -230,6 +251,21 @@ class TestWorker:
         assert verification[0].evidence["allowed"] is False
         assert verification[0].exit_code is None
         assert "allowlist" in verification[0].evidence["rejection_reason"]
+
+    def test_uncached_verification_command_is_incomplete_not_keyerror(
+        self, tmp_path: Path
+    ) -> None:
+        """A subtask whose command never entered the run-set (added mid-loop)
+        has no cached result; completion must report incomplete, not raise."""
+        worker = Worker(str(tmp_path))
+        subtask = Subtask(
+            title="Testing",
+            description="runs pytest",
+            verification_commands=["pytest -v"],
+        )
+        _, complete, note = worker._execute_subtask(subtask, set())
+        assert not complete
+        assert "No verification ran" in note
 
     def test_feedback_iteration_reruns_only_failed_commands(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -342,6 +378,51 @@ class TestReviewers:
         assert review.partial_count >= 1
         assert any("100 chars" in r.notes for r in review.results)
 
+    def test_naming_check_ignores_pascalcase_classes(self, tmp_path: Path) -> None:
+        """The old "[a-z][A-Z] anywhere" pattern fired on every Python file
+        with a class and any snake_case name — i.e. essentially all of them,
+        which would hold the spec review at PARTIAL forever. Naming
+        conventions govern def names, not PascalCase class names."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "mod.py").write_text(
+            "class HttpServer:\n    def handle_request(self):\n        pass\n",
+            encoding="utf-8",
+        )
+        worker = Worker(str(ws))
+        worker.set_review_context(scope_files=["mod.py"])
+        worker_result = worker.execute(_full_plan())
+
+        review = SpecComplianceReviewer().review(_full_plan(), worker_result)
+        assert not any("Mixed naming" in s for s in review.slop_findings)
+
+    def test_naming_check_flags_mixed_def_conventions(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "mod.py").write_text(
+            "def fetchData():\n    pass\n\ndef parse_config():\n    pass\n",
+            encoding="utf-8",
+        )
+        worker = Worker(str(ws))
+        worker.set_review_context(scope_files=["mod.py"])
+        worker_result = worker.execute(_full_plan())
+
+        review = SpecComplianceReviewer().review(_full_plan(), worker_result)
+        assert any("Mixed naming" in s for s in review.slop_findings)
+
+    def test_empty_init_is_not_called_fabricated(self, tmp_path: Path) -> None:
+        """An empty __init__.py is a legitimate artifact, not a placeholder."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "__init__.py").write_text("", encoding="utf-8")
+        (ws / "mod.py").write_text("x = 1\n", encoding="utf-8")
+        worker = Worker(str(ws))
+        worker.set_review_context(scope_files=["__init__.py", "mod.py"])
+        worker_result = worker.execute(_full_plan())
+
+        review = SpecComplianceReviewer().review(_full_plan(), worker_result)
+        assert not any("__init__.py" in s for s in review.slop_findings)
+
 
 class TestSynthesizer:
     """Tests for the Synthesizer component."""
@@ -403,6 +484,25 @@ class TestSynthesizer:
         assert not result.passed
         assert result.partial_criteria, "failing tests must surface as partial criteria"
 
+    def test_synthesize_reviewer_partial_blocks_pass(self) -> None:
+        """A mandatory reviewer whose OVERALL verdict is PARTIAL — every
+        criterion passed but slop found — must block convergence exactly
+        like FAILED. The per-criterion block left this reviewer-level hole:
+        a fabricated artifact shipped with a passing synthesis."""
+        from agenttrace.review_loop.reviewer import CriterionResult, ReviewResult
+
+        spec = ReviewResult(reviewer_name="spec_compliance", reviewer_type="resident")
+        spec.results.append(
+            CriterionResult(criterion="Code compiles", verdict=ReviewVerdict.PASSED)
+        )
+        spec.slop_findings.append("Placeholder or fabricated artifact: stub.py")
+        spec.overall_verdict = ReviewVerdict.PARTIAL
+        security = ReviewResult(reviewer_name="security", reviewer_type="ephemeral")
+        security.overall_verdict = ReviewVerdict.PASSED
+
+        result = Synthesizer().synthesize([spec, security])
+        assert result.passed is False
+
 
 class TestReviewLoop:
     """Tests for the ReviewLoop orchestrator."""
@@ -435,6 +535,22 @@ class TestReviewLoop:
         loop = ReviewLoop(str(ws), max_iterations=2)
         result = loop.run("Complex task", context={"scope_files": ["math_utils.py"]})
         assert result.total_iterations <= 2
+
+    def test_loop_breaks_early_when_syntheses_stop_improving(self, tmp_path: Path) -> None:
+        """Identical back-to-back failures mean no progress: with
+        max_iterations=3 the loop must stop at 2 rather than burn the final
+        iteration. The worker's own feedback_trend could only reach
+        'stalled' on the final iteration (history grows at execute() start),
+        so it never actually shortened the loop."""
+        ws = _make_workspace(tmp_path, test_content=BAD_TEST)
+        loop = ReviewLoop(str(ws), max_iterations=3)
+        result = loop.run(
+            "Add math utilities",
+            context={"scope_files": ["math_utils.py"]},
+        )
+        assert not result.final_passed
+        assert result.total_iterations == 2
+        assert "stalled" in result.escalation_reason.lower()
 
     def test_loop_tracks_convergence(self, tmp_path: Path) -> None:
         ws = _make_workspace(tmp_path)

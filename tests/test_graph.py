@@ -186,7 +186,7 @@ class TestContextGraph:
         assert len(after_2hrs) == 3
 
 
-# -- Sprint 2: enforced evidence rules (plan2 P1.4) ------------------------------
+# -- Sprint 2: enforced evidence rules (plan.md P1.4) ------------------------------
 
 
 class TestEvidenceRules:

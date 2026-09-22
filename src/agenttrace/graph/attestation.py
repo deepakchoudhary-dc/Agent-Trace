@@ -1,5 +1,5 @@
 """Process attestation — kernel-bound attribution vs the narrative's claims
-(plan2 P1.2 residual, architectural debt #2, METR #2's attribution half).
+(plan.md P1.2 residual, architectural debt #2, METR #2's attribution half).
 
 Every honest assessment of this product has flagged the same weakest link:
 "which agent did it" rests on harness-provided actor_id strings — claim-class

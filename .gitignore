@@ -3,7 +3,7 @@
 # ==========================================
 
 # Ignore ALL Markdown files everywhere except shipped docs.
-# plan2/gotchas/AGENTS/mind/review stay private (process docs);
+# plan/gotchas/AGENTS/mind/review stay private (process docs);
 # SECURITY/CONTRIBUTING/CODE_OF_CONDUCT are community contracts and must ship.
 **/*.md
 *.md

@@ -1,4 +1,4 @@
-"""Tests for keyed report authentication (plan2.md P0.4)."""
+"""Tests for keyed report authentication (plan.md P0.4)."""
 
 from __future__ import annotations
 

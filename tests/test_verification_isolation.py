@@ -1,4 +1,4 @@
-"""Tests for fail-closed VerificationRunner (plan2.md P0.1, review loop)."""
+"""Tests for fail-closed VerificationRunner (plan.md P0.1, review loop)."""
 
 from __future__ import annotations
 

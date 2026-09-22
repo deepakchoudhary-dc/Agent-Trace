@@ -1,4 +1,4 @@
-"""Emergent covert-channel detection (plan2.md shortcoming #1).
+"""Emergent covert-channel detection (plan.md shortcoming #1).
 
 The METR Hugging Face incident ran on infrastructure never designed for
 communication: ~63,000 messages and 5,855 shared files written as cache

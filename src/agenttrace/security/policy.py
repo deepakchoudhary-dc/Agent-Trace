@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import posixpath
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -56,6 +57,15 @@ def path_within_scope(pattern: str, path: str) -> bool:
     norm_path = normalize_scope_path(path)
     if not norm_pattern or not norm_path:
         return False
+
+    # Collapse "." and ".." before matching. Segment containment would
+    # otherwise accept "/workspace/src/../../etc/passwd" for scope "src"
+    # (the "src" segments are literally present), and fnmatch's "*" crosses
+    # "/", so the glob branch has the same hole. Normalizing to
+    # "/etc/passwd" makes the traversal visible to the matcher — the same
+    # discipline ApprovalManager._path_in_scope already follows.
+    norm_pattern = posixpath.normpath(norm_pattern)
+    norm_path = posixpath.normpath(norm_path)
 
     if any(ch in _GLOB_MAGIC for ch in norm_pattern):
         from fnmatch import fnmatch  # noqa: PLC0415 (platform-cased matching)

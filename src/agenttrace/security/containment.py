@@ -1,4 +1,4 @@
-"""Daemon-owned containment lifecycle (plan2.md P0.3, METR shortcoming #2).
+"""Daemon-owned containment lifecycle (plan.md P0.3, METR shortcoming #2).
 
 Before this module the containment providers existed but were never owned by
 the daemon lifecycle: Windows PIDs were assigned **post-attach** by the
@@ -30,7 +30,7 @@ The :class:`ContainmentManager` closes that with three properties:
 Honest ceiling, unchanged and documented: on a same-user host an agent that
 never leaves the job can still do everything its user can -- containment
 constrains *process lifetime*, not permissions. That is the same-user trust
-boundary plan2 records as unsolved; this module does not pretend otherwise.
+boundary plan.md records as unsolved; this module does not pretend otherwise.
 """
 from __future__ import annotations
 

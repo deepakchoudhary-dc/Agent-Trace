@@ -35,7 +35,7 @@ class VerificationResult:
 class VerificationRunner:
     """Runs allowlisted verification commands inside isolated containment.
 
-    Per plan2.md P0.1 the runner is fail-closed: with no ``IsolationRunner``
+    Per plan.md P0.1 the runner is fail-closed: with no ``IsolationRunner``
     configured (or when the container runtime/image is unavailable) the
     command is never executed — not on the host, not with a scrubbed
     environment. Host project configuration (pytest plugins, hooks, make,

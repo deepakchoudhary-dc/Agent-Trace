@@ -95,7 +95,7 @@ class ContextGraph:
     def add_edge(self, edge: GraphEdge) -> bool:
         """Add a directed edge; returns False when the edge is refused.
 
-        Evidence rule (plan2 P1.4): an edge with confidence below HIGH is an
+        Evidence rule (plan.md P1.4): an edge with confidence below HIGH is an
         INFERENCE — a claim about the graph — and every claim must carry the
         inputs it was derived from (``data["inputs"]``). Without this check
         the graph quietly grows assertions that look like observations.

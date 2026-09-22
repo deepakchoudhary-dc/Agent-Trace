@@ -2171,7 +2171,7 @@ class AgentTraceDaemon:
             confidence=event.confidence,
             session_id=event.session_id,
             data={
-                # Chain-of-custody class (plan2 #4): agent_claimed narrative
+                # Chain-of-custody class (plan.md #4): agent_claimed narrative
                 # vs os_observed ground truth vs derived, from the
                 # hash-committed source_adapter — the graph layer's answer
                 # to "what did the agent SAY vs what did the MACHINE do".
@@ -2181,8 +2181,23 @@ class AgentTraceDaemon:
         )
         graph.add_node(node)
 
-        # Index the most recent node per (session, type, actor) for correlation
-        self._latest[(event.session_id, node.node_type, event.actor_id)] = node.node_id
+        # Index the most recent node per (session, type, actor) for correlation.
+        # "Most recent" is by EVENT TIMESTAMP, not ingest order: replayed
+        # transcripts arrive back-dated, and an ingest-ordered index attaches
+        # edges to an antecedent newer than the event itself — disagreeing
+        # with the fallback scan below, which takes max by timestamp.
+        latest_key = (event.session_id, node.node_type, event.actor_id)
+        existing_id = self._latest.get(latest_key)
+        existing = graph.get_node(existing_id) if existing_id is not None else None
+        if existing is None:
+            self._latest[latest_key] = node.node_id
+        else:
+            try:
+                is_newer = node.timestamp >= existing.timestamp
+            except TypeError:  # mixed naive/aware timestamps — last writer wins
+                is_newer = True
+            if is_newer:
+                self._latest[latest_key] = node.node_id
 
         # Persist node to SQLite
         self._ledger.store_graph_node(

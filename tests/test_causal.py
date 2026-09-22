@@ -107,6 +107,25 @@ class TestCausalExplanationEngine:
         engine = CausalExplanationEngine(graph)
         assert engine.explain(uuid4()) == []
 
+    def test_explain_does_not_walk_approval_edges_backward(self) -> None:
+        """An approval is not a cause. APPROVED_BY points from the finding to
+        the operator's LATER approval; walking it backward presented the
+        approval as the finding's antecedent — correlation as causation.
+        what_changed_after already filters; explain() must too."""
+        graph = ContextGraph(uuid4())
+        intent = _node(graph, NodeType.TASK_INTENT, "clean the logs")
+        target = _node(graph, NodeType.POLICY_FINDING, "destructive op")
+        approval = _node(graph, NodeType.APPROVAL, "operator approval")
+        _edge(graph, intent, target, EdgeType.CAUSES)
+        _edge(graph, approval, target, EdgeType.APPROVED_BY)
+
+        engine = CausalExplanationEngine(graph)
+        paths = engine.explain(target.node_id, max_depth=5, max_paths=5)
+
+        assert paths, "the causal path intent -> target must still be found"
+        for path in paths:
+            assert approval.node_id not in path.nodes
+
     def test_what_changed_after_follows_only_causal_edges(self) -> None:
         graph = ContextGraph(uuid4())
         origin = _node(graph, NodeType.COMMAND, "origin")

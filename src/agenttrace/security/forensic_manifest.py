@@ -179,10 +179,15 @@ def _temporal_block(events: list[EventBase], inputs: ManifestInputs) -> dict[str
         "ordering_basis": ordering,
         "note": (
             "The timeline is ordered by the ledger's append sequence, which is "
-            "the order this daemon OBSERVED the events. `timestamp` is the "
-            "event's own claim about when it happened and is not comparable "
-            "across events when some were back-filled from a replayed "
-            "transcript; `observed_at` is the daemon clock at ingest."
+            "the order this daemon OBSERVED the events — never by `timestamp`. "
+            "`ordering_basis` states whether that append order can be "
+            "independently re-derived: `observed_at` when every event carries "
+            "the daemon's ingest clock, `observed_at with seq fallback` when "
+            "some do, `seq` when only the append sequence orders the events. "
+            "`timestamp` is the event's own claim about when it happened and "
+            "is not comparable across events when some were back-filled from "
+            "a replayed transcript; `observed_at` is the daemon clock at "
+            "ingest."
         ),
         "session_window": {
             "started_at": inputs.started_at.isoformat() if inputs.started_at else None,

@@ -98,7 +98,6 @@ _DETECTOR_ACTORS = frozenset(
         "safeguard_context",
         "shield_gate",
         "gate",
-        "user",
     }
 )
 
@@ -181,10 +180,12 @@ def classify_actor(
     if lowered.startswith(_KERNEL_PREFIXES) or adapter in _KERNEL_ADAPTERS:
         return ActorClass.KERNEL
 
-    # 4. Explicit operator and tooling identities.
+    # 4. Explicit operator and tooling identities. "user" is the operator's
+    #    own actor id (the session's task intent, human approvals) — conduct
+    #    BY the human, not analysis BY AgentTrace.
     if lowered.startswith("tool:"):
         return ActorClass.AGENT_TOOL
-    if lowered.startswith("terminal:"):
+    if lowered == "user" or lowered.startswith("terminal:"):
         return ActorClass.OPERATOR
 
     # 5. Workspace observers — a real consequence with no attributable actor.
@@ -236,8 +237,13 @@ def classify_event(event: Any, declared_agent: str | None = None) -> ActorClass:
         event_type = getattr(event, "event_type", "")
         payload = getattr(event, "payload", None) or {}
 
+    # Unwrap enum members to their wire value BEFORE stringifying: on
+    # Python 3.10, str(EventType.TOOL_REQUEST) is "EventType.TOOL_REQUEST",
+    # which matches nothing in _AGENT_ONLY_EVENT_TYPES — a ToolRequestEvent
+    # object passed directly would never classify as the agent acting.
+    event_type = getattr(event_type, "value", event_type)
     if not isinstance(event_type, str):
-        event_type = str(getattr(event_type, "value", event_type))
+        event_type = str(event_type)
 
     contained = isinstance(payload, dict) and bool(
         payload.get("contained_descendant", False)

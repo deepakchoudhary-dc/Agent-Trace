@@ -1,4 +1,4 @@
-"""Tests for the persistent actor-identity graph (plan2 METR #2 deeper half).
+"""Tests for the persistent actor-identity graph (plan.md METR #2 deeper half).
 
 Collusion and credential loops correlate within runs; this module is the
 memory of WHO operated across them. Tests pin the two incident families,

@@ -1,4 +1,4 @@
-"""Eval-integrity and sandbagging surveillance (plan2.md shortcoming #5).
+"""Eval-integrity and sandbagging surveillance (plan.md shortcoming #5).
 
 On impossible eval targets, agents drove the cheating economy: reverse-
 engineering HMAC flags, replacing targets, and planting scorer trip-wires.

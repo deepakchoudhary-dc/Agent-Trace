@@ -101,6 +101,20 @@ class TestPolicyEngine:
         assert path_within_scope("/workspace/src/*", "/workspace/src/a.py")
         assert not path_within_scope("/workspace/src/*", "/workspace/config/x.yaml")
 
+    def test_scope_dotdot_traversal_does_not_borrow_allowed_segments(self) -> None:
+        """`/workspace/src/../../etc/passwd` literally contains the segments
+        of scope "src" — containment must be decided AFTER collapsing "..",
+        the same discipline ApprovalManager._path_in_scope follows."""
+        from agenttrace.security.policy import path_within_scope
+
+        assert not path_within_scope("src", "/workspace/src/../../etc/passwd")
+        assert not path_within_scope("src", "src/../../etc/passwd")
+        # The glob branch had the same hole: fnmatch's "*" crosses "/".
+        assert not path_within_scope("/workspace/src/*", "/workspace/src/../config/x.yaml")
+        # Legitimate nested paths still match after normalization.
+        assert path_within_scope("src", "src/auth/login.py")
+        assert path_within_scope("/workspace/src/*", "/workspace/src/a.py")
+
     def test_block_privilege_escalation(self) -> None:
         engine = self._make_engine()
         event = CommandEvent(

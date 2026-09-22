@@ -8,7 +8,7 @@ tail catches up on everything that happened while we were not reading.
 Polling an OS event log is not lossy; polling a process list is.
 
 This is the Linux counterpart of the Windows Security-log observer
-(events 4688/4689) and closes the same polling blind spot (plan2 P1.2,
+(events 4688/4689) and closes the same polling blind spot (plan.md P1.2,
 architectural debt #2). Model-agnostic by construction: auditd records every
 execve on the machine — Claude, Codex, a shell loop, a compiled dropper —
 with no adapter cooperation.

@@ -970,7 +970,7 @@ async def test_restore_without_task_contract_is_safe(tmp_path: Path) -> None:
 async def test_graph_nodes_carry_evidence_class(tmp_path: Path) -> None:
     """The graph layer's answer to 'what did the agent SAY vs what did the
     MACHINE do': every event-derived node carries its chain-of-custody class
-    (plan2 #4 machinery, applied to the causal graph)."""
+    (plan.md #4 machinery, applied to the causal graph)."""
     daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
     await daemon.start()
     session = await daemon.create_session(
@@ -1364,5 +1364,50 @@ async def test_stop_known_session_returns_true(tmp_path: Path) -> None:
             task_description="stop-truth",
         )
         assert await daemon.stop_session(session.session_id) is True
+    finally:
+        await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_latest_index_tracks_event_timestamp_not_ingest_order(tmp_path: Path) -> None:
+    """Replayed transcripts arrive back-dated, so the second ingested event
+    can be OLDER than the first. The correlation index must keep the node
+    with the newest timestamp — otherwise edges attach to an antecedent
+    from the event's own future, disagreeing with the timestamp-ordered
+    fallback scan in _latest_matching."""
+    from agenttrace.models.graph import NodeType
+
+    daemon = AgentTraceDaemon(tmp_path / ".agenttrace")
+    await daemon.start()
+    try:
+        session = await daemon.create_session(
+            workspace_path=str(tmp_path),
+            task_description="out-of-order ingest",
+        )
+        now = datetime.now(timezone.utc)
+        newer = CommandEvent(
+            session_id=session.session_id,
+            actor_id="codex:1",
+            source_adapter="codex",
+            command="newer",
+            timestamp=now,
+        )
+        older = CommandEvent(
+            session_id=session.session_id,
+            actor_id="codex:1",
+            source_adapter="codex",
+            command="older",
+            timestamp=now - timedelta(days=30),
+        )
+        await daemon.ingest_event(newer)
+        await daemon.ingest_event(older)
+
+        graph = daemon.get_graph(session.session_id)
+        assert graph is not None
+        indexed = daemon._latest.get((session.session_id, NodeType.COMMAND, "codex:1"))
+        assert indexed is not None
+        node = graph.get_node(indexed)
+        assert node is not None
+        assert node.label == "cmd: newer"
     finally:
         await daemon.stop()

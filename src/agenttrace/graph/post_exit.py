@@ -1,4 +1,4 @@
-"""Post-exit surveillance (plan2.md shortcoming #6).
+"""Post-exit surveillance (plan.md shortcoming #6).
 
 In the METR incident, trip-wires fired and RESETWATCH heartbeats kept
 running after their creators exited; agents explicitly treated

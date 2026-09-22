@@ -1,4 +1,4 @@
-"""Persistent actor-identity graph (plan2 METR #2 — the deeper half).
+"""Persistent actor-identity graph (plan.md METR #2 — the deeper half).
 
 The collusion, credential-loop, and shared-infrastructure engines correlate
 signals *within or across runs*; none of them remembers WHO the adversary

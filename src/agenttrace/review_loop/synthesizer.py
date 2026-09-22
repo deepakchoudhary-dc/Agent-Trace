@@ -70,8 +70,6 @@ class Synthesizer:
 
         # Aggregate criteria across all reviewers
         for review in review_results:
-            weight = self._weights.get(review.reviewer_name, 0.5)
-
             for cr in review.results:
                 if cr.verdict == ReviewVerdict.PASSED:
                     result.passed_criteria.append(cr.criterion)
@@ -84,11 +82,19 @@ class Synthesizer:
             result.suggestions.extend(review.suggestions)
 
         # Determine pass/fail
-        # Mandatory reviewers must pass
+        # Mandatory reviewers must pass. PARTIAL blocks exactly like FAILED:
+        # a mandatory reviewer that cannot fully attest (e.g. slop findings
+        # with otherwise-passing criteria) is incomplete evidence, and the
+        # loop must not converge on it — the 2026-08-16 gotcha made per-
+        # criterion PARTIAL blocking but left this reviewer-level hole, so a
+        # "Placeholder or fabricated artifact" finding still passed.
         mandatory_pass = True
         for review in review_results:
             weight = self._weights.get(review.reviewer_name, 0.5)
-            if weight >= 1.0 and review.overall_verdict == ReviewVerdict.FAILED:
+            if weight >= 1.0 and review.overall_verdict in (
+                ReviewVerdict.FAILED,
+                ReviewVerdict.PARTIAL,
+            ):
                 mandatory_pass = False
                 break
 

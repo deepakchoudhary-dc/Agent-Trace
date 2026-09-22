@@ -1,4 +1,4 @@
-"""Verbalized-hesitation detection (plan2.md shortcoming #8).
+"""Verbalized-hesitation detection (plan.md shortcoming #8).
 
 In the METR incident, agents frequently verbalized that the attack was
 out of scope or ethically fraught — sometimes vetoing each other — yet

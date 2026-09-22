@@ -22,6 +22,12 @@ def _mysql_packet(query: str) -> bytes:
     return header + query_bytes
 
 
+def _pg_startup_packet(protocol: int = 196608, params: bytes = b"user\x00db\x00\x00") -> bytes:
+    """A Postgres StartupMessage: [Int32 length][Int32 protocol][params] — NO type byte."""
+    payload = struct.pack("!I", protocol) + params
+    return struct.pack("!I", len(payload) + 4) + payload
+
+
 def test_postgres_wire_parser_extracts_simple_query() -> None:
     """DatabaseWireParser decodes PostgreSQL simple query messages."""
     queries, remainder = DatabaseWireParser.parse_postgres(_pg_packet("SELECT * FROM users;"))
@@ -36,6 +42,49 @@ def test_postgres_wire_parser_detects_destructive_drop() -> None:
     is_destructive, matched = DatabaseWireParser.is_destructive(queries[0])
     assert is_destructive is True
     assert "DROP TABLE" in matched
+
+
+def test_postgres_startup_packet_is_skipped_then_queries_parsed() -> None:
+    """The startup message has NO type byte. Reading its length's high byte
+    as the message type desynced the parser for the entire connection: no
+    query was ever inspected (DROP TABLE passed through) and the buffer
+    grew without bound."""
+    stream = _pg_startup_packet() + _pg_packet("SELECT 1") + _pg_packet("DROP TABLE users")
+    queries, remainder = DatabaseWireParser.parse_postgres(stream)
+    assert queries == ["SELECT 1", "DROP TABLE users"]
+    assert remainder == b""
+
+
+def test_postgres_ssl_and_cancel_requests_carry_no_sql() -> None:
+    """SSLRequest (8 bytes) and CancelRequest (16 bytes) are also untagged."""
+    ssl_request = struct.pack("!II", 8, 80877103)
+    cancel = struct.pack("!IIII", 16, 80877102, 1234, 5678)
+    queries, remainder = DatabaseWireParser.parse_postgres(
+        ssl_request + cancel + _pg_packet("SELECT 1")
+    )
+    assert queries == ["SELECT 1"]
+    assert remainder == b""
+
+
+def test_postgres_straddled_startup_packet_is_held_then_skipped() -> None:
+    """A startup packet split across TCP chunks is buffered, then skipped."""
+    packet = _pg_startup_packet() + _pg_packet("SELECT 1")
+    cut = 3  # inside the startup packet's own length field
+    q1, rem1 = DatabaseWireParser.parse_postgres(packet[:cut])
+    assert q1 == []
+    assert rem1 == packet[:cut]
+
+    q2, rem2 = DatabaseWireParser.parse_postgres(packet[cut:], rem1)
+    assert q2 == ["SELECT 1"]
+    assert rem2 == b""
+
+
+def test_postgres_truncated_startup_length_is_a_violation_not_a_hang() -> None:
+    """A NUL-led packet whose declared length is absurd fails closed."""
+    import pytest
+
+    with pytest.raises(WireProtocolViolationError):
+        DatabaseWireParser.parse_postgres(struct.pack("!I", 4))  # length < 8
 
 
 def test_mysql_wire_parser_extracts_com_query() -> None:

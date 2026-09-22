@@ -72,6 +72,10 @@ class DatabaseWireParser:
           - 'Q' (0x51): Simple query string (null-terminated)
           - 'P' (0x50): Parse statement string
 
+        The startup phase (StartupMessage / SSLRequest / GSSENCRequest /
+        CancelRequest) is the exception: those packets have no type byte,
+        just [Int32 length][payload], and are skipped — they carry no SQL.
+
         Returns ``(queries, remainder)``; ``remainder`` holds an incomplete
         trailing message for the next call. A message whose declared length
         exceeds the fail-closed sanity cap is treated as a protocol
@@ -80,7 +84,29 @@ class DatabaseWireParser:
         """
         buf = buffer + data
         queries: list[str] = []
-        while len(buf) >= 5:
+        while True:
+            if len(buf) < 4:
+                break
+            if buf[0] == 0x00:
+                # Startup-phase packets (StartupMessage, SSLRequest,
+                # GSSENCRequest, CancelRequest) have NO type byte:
+                # [Int32 length][payload], the length including its own
+                # 4 bytes. A tagged message type is always an ASCII letter,
+                # so a NUL first byte can only be this untagged form. The
+                # previous loop read the length's high byte as the type and
+                # desynced permanently: every query went unseen and the
+                # connection buffer grew without bound.
+                pkt_len = struct.unpack("!I", buf[0:4])[0]
+                if pkt_len < 8 or pkt_len - 4 > _MAX_MESSAGE_BYTES:
+                    raise WireProtocolViolationError(
+                        f"postgres startup length {pkt_len} violates protocol bounds"
+                    )
+                if pkt_len > len(buf):
+                    break  # incomplete startup packet — hold it in the remainder
+                buf = buf[pkt_len:]  # negotiation packets carry no SQL
+                continue
+            if len(buf) < 5:
+                break  # incomplete tagged header — hold it
             msg_type = chr(buf[0])
             msg_len = struct.unpack("!I", buf[1:5])[0]
             if msg_len < 4 or msg_len - 4 > _MAX_MESSAGE_BYTES:

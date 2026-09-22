@@ -809,7 +809,7 @@ class EventLedger:
             raise
         return clean_event.event_hash
 
-    # -- AAD binding (plan2 P1.1): event ciphertexts are authenticated
+    # -- AAD binding (plan.md P1.1): event ciphertexts are authenticated
     # against their row identity, so a payload encrypted for one event fails
     # GCM verification if moved to any other row, column, or session. The
     # payload-replay that P1.1 named is structurally impossible for bound rows.
@@ -996,6 +996,14 @@ class EventLedger:
         and verifies strict monotonic sequence numbers.
 
         Returns (is_valid, error_message).
+
+        Trust boundary: this detects INCONSISTENT tampering — edited rows,
+        sequence gaps, broken links, a session anchor that disagrees with
+        the rows, or a tail deleted with the anchor cleared. An attacker
+        with write access to the database file who rewrites the rows AND
+        the session anchor consistently can only be caught by an anchor
+        held outside the database; the signed forensic manifest
+        (security/report_auth.py) exists for that.
         """
         rows = self._conn.execute(
             "SELECT * FROM events WHERE session_id = ? ORDER BY seq ASC",
@@ -1041,7 +1049,17 @@ class EventLedger:
             "SELECT event_count, last_event_hash FROM sessions WHERE session_id = ?",
             (str(session_id),),
         ).fetchone()
-        if session_row and session_row["last_event_hash"]:
+        if session_row:
+            # Rows exist (the empty chain returned above), so the head anchor
+            # must exist too. A blank last_event_hash beside live rows means
+            # the tail was deleted and the column cleared — a chain that
+            # stops early is internally consistent and would otherwise verify.
+            if not session_row["last_event_hash"]:
+                return False, (
+                    "Session head missing: ledger contains "
+                    f"{expected_seq} events but sessions.last_event_hash is "
+                    "empty — the chain tail cannot be accounted for"
+                )
             if session_row["last_event_hash"] != expected_prev_hash:
                 return False, (
                     "Session head mismatch: ledger chain ends at "
@@ -1656,7 +1674,7 @@ class EventLedger:
         ).fetchall()
         return {row[0] for row in rows}
 
-    # -- Keyed projection snapshots (plan2.md P0.4 residual) ----------------
+    # -- Keyed projection snapshots (plan.md P0.4 residual) ----------------
 
     @staticmethod
     def _projection_key(encryption: EncryptionManager) -> bytes:

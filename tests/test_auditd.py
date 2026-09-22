@@ -1,4 +1,4 @@
-"""Tests for the Linux auditd process-execution observer (plan2 P1.2).
+"""Tests for the Linux auditd process-execution observer (plan.md P1.2).
 
 The kernel writes an execve record for EVERY process creation — including
 processes whose whole lifetime fits inside a poll interval. These tests pin

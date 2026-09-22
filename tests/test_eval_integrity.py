@@ -1,4 +1,4 @@
-"""Tests for eval-integrity and sandbagging detection (plan2.md #5)."""
+"""Tests for eval-integrity and sandbagging detection (plan.md #5)."""
 
 from __future__ import annotations
 

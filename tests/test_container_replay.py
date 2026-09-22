@@ -1,4 +1,4 @@
-"""Tests for Containerized Replay Isolation (plan2.md P0.1: fail closed)."""
+"""Tests for Containerized Replay Isolation (plan.md P0.1: fail closed)."""
 
 from __future__ import annotations
 

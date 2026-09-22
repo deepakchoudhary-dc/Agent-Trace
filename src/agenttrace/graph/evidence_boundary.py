@@ -1,4 +1,4 @@
-"""Evidence provenance classification (plan2.md shortcoming #4).
+"""Evidence provenance classification (plan.md shortcoming #4).
 
 The METR Hugging Face incident documented >=96 successful tool-call
 spoofing attempts: agents intercepting tool output, suppressing it, or

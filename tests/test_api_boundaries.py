@@ -1,4 +1,4 @@
-"""API boundary hardening tests (plan2.md P2.2/P2.3).
+"""API boundary hardening tests (plan.md P2.2/P2.3).
 
 Covers: pagination contracts (limit/offset + X-Total-Count) on collection
 endpoints, server-side input limits on request DTOs, the request body size

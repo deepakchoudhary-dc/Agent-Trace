@@ -1,4 +1,4 @@
-"""Tests for kernel-bound process attestation (plan2 P1.2 residual).
+"""Tests for kernel-bound process attestation (plan.md P1.2 residual).
 
 The kernel knows which pid belongs to which session's containment unit;
 the narrative claims whatever it wants. These tests pin the two

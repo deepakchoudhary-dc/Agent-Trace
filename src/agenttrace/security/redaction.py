@@ -154,7 +154,7 @@ class SecretRedactor:
             for match in pattern.finditer(text):
                 spans.append((match.start(), match.end(), pattern_name))
 
-        # 1b. Defeat Unicode obfuscation (P1.14 / plan2.md P1.8): strip
+        # 1b. Defeat Unicode obfuscation (P1.14 / plan.md P1.8): strip
         # zero-width and BiDi control characters (including the U+2066-2069
         # isolate set), then fold every remaining character through NFKC so
         # fullwidth-form confusables ("ｐａｓｓｗｏｒｄ＝...") still match

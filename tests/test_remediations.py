@@ -1,4 +1,4 @@
-"""Tests for plan2.md security, containment, and wiring remediations."""
+"""Tests for plan.md security, containment, and wiring remediations."""
 
 from __future__ import annotations
 

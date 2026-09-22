@@ -1,4 +1,4 @@
-"""Sensor coverage accounting (plan2.md METR shortcoming #9, architectural item 5).
+"""Sensor coverage accounting (plan.md METR shortcoming #9, architectural item 5).
 
 In the METR incident, the first dataset covered roughly 30% of relevant agent
 activity and materially misled early analysis; only ~90% coverage was ever

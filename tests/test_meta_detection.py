@@ -1,5 +1,5 @@
 """Tests for convention-free meta-detection and detector-decay monitoring
-(plan2.md shortcoming #10)."""
+(plan.md shortcoming #10)."""
 
 from __future__ import annotations
 

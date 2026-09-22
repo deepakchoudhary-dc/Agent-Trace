@@ -244,27 +244,41 @@ class SpecComplianceReviewer(BaseReviewer):
                 continue
             content = artifact.content
 
-            # Check 0: placeholder / fabricated content
+            # Check 0: placeholder / fabricated content. An EMPTY file is not
+            # fabrication when the file is meant to be empty (__init__.py).
             if (
-                not content.strip()
-                or "# Implementation for:" in content
+                "# Implementation for:" in content
                 or "# The actual work would be done here" in content
+                or (
+                    not content.strip()
+                    and not artifact.file_path.endswith("__init__.py")
+                )
             ):
                 findings.append(
                     f"Placeholder or fabricated artifact: {artifact.file_path}"
                 )
 
             # Check 2: Over-engineering (long files with simple tasks)
-            if len(content.split("\n")) > 200:
+            line_count = len(content.split("\n"))
+            if line_count > 200:
                 findings.append(
                     f"Over-engineering risk: {artifact.file_path} has "
-                    f"{len(content.split(chr(10)))} lines"
+                    f"{line_count} lines"
                 )
 
-            # Check 3: Convention blindness (basic checks)
-            if re.search(r"[a-z][A-Z]", content) and re.search(r"_[a-z]", content):
+            # Check 3: Convention blindness — camelCase AND snake_case
+            # function definitions in the same file. The old pattern
+            # ("[a-z][A-Z]" anywhere plus "_[a-z]") matched every Python
+            # file with a PascalCase class and any snake_case name, i.e.
+            # essentially all of them, making the spec review permanently
+            # PARTIAL. Definitions are what a naming convention governs.
+            has_camel_def = re.search(
+                r"def\s+[a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*\s*\(", content
+            )
+            has_snake_def = re.search(r"def\s+[a-z][a-z0-9_]*_[a-z0-9_]+\s*\(", content)
+            if has_camel_def and has_snake_def:
                 findings.append(
-                    f"Mixed naming conventions (camelCase + snake_case) in "
+                    f"Mixed naming conventions (camelCase + snake_case defs) in "
                     f"{artifact.file_path}"
                 )
 

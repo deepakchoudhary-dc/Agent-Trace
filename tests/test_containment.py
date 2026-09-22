@@ -1,4 +1,4 @@
-"""Tests for the daemon-owned containment lifecycle (plan2.md P0.3).
+"""Tests for the daemon-owned containment lifecycle (plan.md P0.3).
 
 The scripted provider stands in for the kernel unit; the win32 smoke tests
 exercise the real CreateProcessW(CREATE_SUSPENDED) -> assign -> resume path.

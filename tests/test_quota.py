@@ -1,4 +1,4 @@
-"""Tests for storage quotas and evidence-incomplete semantics (plan2.md P0.5)."""
+"""Tests for storage quotas and evidence-incomplete semantics (plan.md P0.5)."""
 
 from __future__ import annotations
 

@@ -77,6 +77,29 @@ def test_classify_event_reads_containment_from_the_payload() -> None:
     assert classify_event(ambient) is ActorClass.SYSTEM
 
 
+def test_user_actor_is_the_operator_not_our_instrumentation() -> None:
+    """actor_id="user" is emitted for the session's task intent (daemon) and
+    for human approvals (security/approval.py) — conduct BY the human, not
+    analysis BY AgentTrace, so it must not count as detector activity."""
+    assert classify_actor("user") is ActorClass.OPERATOR
+
+
+def test_classify_event_unwraps_real_eventtype_members() -> None:
+    """A str-Enum event_type IS an instance of str, so a normalization that
+    only handled non-str values left str(EventType.X) == "EventType.X" on
+    Python 3.10 — matching nothing, so a real ToolRequestEvent object never
+    classified as the agent acting (rule 8 was unreachable)."""
+    from agenttrace.models.events import EventType
+
+    class FakeEvent:
+        actor_id = "mystery"
+        source_adapter = "mystery"
+        payload: dict[str, object] = {}
+        event_type = EventType.TOOL_REQUEST
+
+    assert classify_event(FakeEvent()) is ActorClass.AGENT
+
+
 def test_classify_event_accepts_objects_and_enum_event_types() -> None:
     class FakeEvent:
         actor_id = "codex:abc"

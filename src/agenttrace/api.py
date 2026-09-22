@@ -72,7 +72,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Request body cap (plan2.md P2.3): every accepted body must fit in 1 MiB.
+# Request body cap (plan.md P2.3): every accepted body must fit in 1 MiB.
 # Starlette reads the stream only when a handler consumes it, so without this
 # cap a multi-gigabyte body would be buffered per request by FastAPI's JSON
 # parser before any handler logic could reject it. 413 for oversize bodies.
@@ -227,7 +227,7 @@ class EvaluateRequest(BaseModel):
 
 
 class BrokerChallengeRequest(BaseModel):
-    """Request for a single-use execution challenge (plan2.md P0.2)."""
+    """Request for a single-use execution challenge (plan.md P0.2)."""
 
     finding_id: str = Field(min_length=1, max_length=128)
     argv: list[str] = Field(min_length=1, max_length=64)
@@ -273,7 +273,7 @@ class RescanRequest(BaseModel):
         return value
 
 
-# -- Pagination & collection bounds (plan2.md P2.2/P2.3) -----------------------
+# -- Pagination & collection bounds (plan.md P2.2/P2.3) -----------------------
 
 # Every collection endpoint serves at most this many items per request. The
 # ledger already caps default event queries at 1000 rows; these constants make
@@ -898,7 +898,7 @@ async def revoke_session_approval(session_id: UUID, finding_id: str) -> dict[str
     return {"status": "revoked", "finding_id": finding_id}
 
 
-# -- Brokered execution (plan2.md P0.2) ---------------------------------------
+# -- Brokered execution (plan.md P0.2) ---------------------------------------
 
 _brokers: dict[UUID, ExecutionBroker] = {}
 

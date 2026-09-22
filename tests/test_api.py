@@ -377,7 +377,7 @@ def test_stop_unknown_session_returns_404(client):
     assert res.status_code == 404
 
 
-# -- Brokered execution endpoints (plan2.md P0.2) -----------------------------
+# -- Brokered execution endpoints (plan.md P0.2) -----------------------------
 
 
 

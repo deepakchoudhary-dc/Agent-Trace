@@ -212,6 +212,40 @@ class TestEventLedger:
         assert not is_valid
         assert "Sequence discontinuity" in error
 
+    def test_tamper_detection_on_tail_truncation_with_cleared_anchor(
+        self, ledger: EventLedger, session_id
+    ) -> None:
+        """Adversarial test: deleting the tail events AND clearing
+        sessions.last_event_hash must NOT verify. The remaining rows are
+        internally consistent — seq 0..k links unbroken — so only the
+        missing head anchor exposes the cut. The guard used to be skipped
+        entirely when the column was blank."""
+        ledger.create_session(session_id, "{}", "test", "2024-01-01T00:00:00Z")
+
+        for i in range(3):
+            ledger.append_event(CommandEvent(
+                session_id=session_id,
+                actor_id="agent",
+                source_adapter="terminal",
+                command=f"cmd {i}",
+            ))
+
+        conn = sqlite3.connect(str(ledger._db_path))
+        conn.execute(
+            "DELETE FROM events WHERE session_id = ? AND seq = 2", (str(session_id),)
+        )
+        conn.execute(
+            "UPDATE sessions SET last_event_hash = '', event_count = 2 "
+            "WHERE session_id = ?",
+            (str(session_id),),
+        )
+        conn.commit()
+        conn.close()
+
+        is_valid, error = ledger.verify_chain(session_id)
+        assert not is_valid
+        assert "Session head missing" in error
+
     def test_database_at_rest_encryption(self, ledger: EventLedger, session_id) -> None:
         """Verify that raw database rows store ciphertext and no plaintext secrets."""
         secret_task = "Super secret project description with key API_KEY_999"
@@ -675,7 +709,7 @@ class TestIntegritySurfacing:
         assert ledger.integrity_failure_count == 0
 
 
-# -- AAD row binding (plan2 P1.1): payload replay is structurally impossible -----
+# -- AAD row binding (plan.md P1.1): payload replay is structurally impossible -----
 
 
 def test_payload_ciphertext_cannot_be_moved_to_another_event(tmp_path: Path) -> None:

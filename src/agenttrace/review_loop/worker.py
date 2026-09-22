@@ -244,8 +244,13 @@ class Worker:
 
         # Completion: all its verification commands succeeded (or none were
         # expected), and implementation subtasks also need scope files.
+        # Tolerate a command missing from the cache (skipped run_set,
+        # subtask added mid-loop) instead of raising KeyError — and report
+        # the subtask incomplete, which is what the guard below is for.
         verification_results = [
-            self._verification[cmd] for cmd in subtask.verification_commands
+            self._verification[cmd]
+            for cmd in subtask.verification_commands
+            if cmd in self._verification
         ]
         if subtask.verification_commands and not verification_results:
             return artifacts, False, f"No verification ran for: {subtask.title}"

@@ -1,4 +1,4 @@
-"""Fail-closed isolated execution for replay and review (plan2.md P0.1).
+"""Fail-closed isolated execution for replay and review (plan.md P0.1).
 
 One ``IsolationRunner`` is the only sanctioned way to execute untrusted
 verification commands (allowlisted replay commands, review-loop checks).
